@@ -89,9 +89,10 @@ uninstall` to remove it. BitCI refuses service changes while jobs run.
 
 ## Agents: skill + MCP
 
-The included [BitCI skill](.agents/skills/bitci-ci/SKILL.md) tells agents to
-use MCP first, never use the UI, plan before submit, inspect logs before retry,
-and never send arbitrary commands.
+Read [contributor rules](AGENTS.md) first. The included
+[BitCI skill](.agents/skills/bitci-ci/SKILL.md) tells agents to use MCP first,
+never use the UI, plan before submit, inspect logs before retry, and never send
+arbitrary commands.
 
 Start `serve`, then add this local MCP server to the agent client:
 
