@@ -1,6 +1,7 @@
 package bitci
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"database/sql"
@@ -290,6 +291,86 @@ func (controller *Controller) Jobs() ([]Job, error) {
 		jobs = append(jobs, job)
 	}
 	return jobs, rows.Err()
+}
+
+func (controller *Controller) Cancel(id int64) (bool, error) {
+	result, err := controller.db.Exec(
+		"UPDATE jobs SET state = 'cancelled', finished_at = ? WHERE id = ? AND state = 'queued'",
+		time.Now().UTC().Format(time.RFC3339), id,
+	)
+	if err != nil {
+		return false, err
+	}
+	count, err := result.RowsAffected()
+	return count == 1, err
+}
+
+func (controller *Controller) Retry(id int64) ([]Job, error) {
+	var task, ref string
+	if err := controller.db.QueryRow("SELECT task, ref FROM jobs WHERE id = ?", id).Scan(&task, &ref); err != nil {
+		return nil, err
+	}
+	return controller.Submit([]string{task}, ref)
+}
+
+func (controller *Controller) TailLog(id int64, limit int) ([]string, error) {
+	lines, err := controller.readLog(id)
+	if err != nil {
+		return nil, err
+	}
+	return lastLines(lines, limit), nil
+}
+
+func (controller *Controller) SearchLog(id int64, query string, limit int) ([]string, error) {
+	if query == "" {
+		return nil, fmt.Errorf("search query must not be empty")
+	}
+	lines, err := controller.readLog(id)
+	if err != nil {
+		return nil, err
+	}
+	matches := make([]string, 0, limit)
+	for _, line := range lines {
+		if strings.Contains(line, query) {
+			matches = append(matches, line)
+		}
+	}
+	return lastLines(matches, limit), nil
+}
+
+func (controller *Controller) readLog(id int64) ([]string, error) {
+	var logPath string
+	if err := controller.db.QueryRow("SELECT COALESCE(log_path, '') FROM jobs WHERE id = ?", id).Scan(&logPath); err != nil {
+		return nil, err
+	}
+	if logPath == "" {
+		return nil, fmt.Errorf("job %d has no log", id)
+	}
+	file, err := os.Open(logPath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	var lines []string
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+	return lines, scanner.Err()
+}
+
+func lastLines(lines []string, limit int) []string {
+	if limit < 1 {
+		limit = 80
+	}
+	if limit > 80 {
+		limit = 80
+	}
+	if len(lines) <= limit {
+		return lines
+	}
+	return lines[len(lines)-limit:]
 }
 
 func (controller *Controller) DiskOK() error {

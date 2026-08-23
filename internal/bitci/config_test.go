@@ -114,6 +114,43 @@ func TestConfiguredArgvDoesNotUseShell(t *testing.T) {
 	}
 }
 
+func TestRunControlAndLogs(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["printf","first\\nerror second\\nthird"]}}}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	queued, err := controller.Submit([]string{"unit"}, "old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cancelled, err := controller.Cancel(queued[0].ID); err != nil || !cancelled {
+		t.Fatalf("cancel = %v, %v", cancelled, err)
+	}
+	retried, err := controller.Retry(queued[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	lines, err := controller.TailLog(retried[0].ID, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(lines, ","), "error second,third"; got != want {
+		t.Fatalf("tail = %q, want %q", got, want)
+	}
+	lines, err = controller.SearchLog(retried[0].ID, "error", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(lines, ","), "error second"; got != want {
+		t.Fatalf("search = %q, want %q", got, want)
+	}
+}
+
 func TestHelperProcess(t *testing.T) {
 	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
 		return

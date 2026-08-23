@@ -13,6 +13,10 @@ bitci plan --paths src/main.go
 bitci submit unit
 bitci serve --max-workers 3
 bitci status
+bitci cancel 12
+bitci retry 12
+bitci logs --tail 80 12
+bitci logs --search "error" 12
 bitci doctor
 ```
 
@@ -38,6 +42,9 @@ bitci doctor
 
 The config is strict JSON. Unknown fields fail validation. BitCI does not run
 commands supplied by the CLI or by another process.
+
+`cancel` only cancels queued jobs. `retry` creates a new configured run. Logs
+return at most 80 lines.
 
 ## Development
 
