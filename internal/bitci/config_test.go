@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -148,6 +149,23 @@ func TestRunControlAndLogs(t *testing.T) {
 	}
 	if got, want := strings.Join(lines, ","), "error second"; got != want {
 		t.Fatalf("search = %q, want %q", got, want)
+	}
+}
+
+func TestServicePlist(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("launchd applies on macOS")
+	}
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+	service, err := NewService(configPath, filepath.Join(t.TempDir(), "state"), 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plist := service.plist()
+	for _, value := range []string{"<key>KeepAlive</key><true/>", "<string>serve</string>", service.ConfigPath, service.StateDir} {
+		if !strings.Contains(plist, value) {
+			t.Fatalf("plist missing %q", value)
+		}
 	}
 }
 

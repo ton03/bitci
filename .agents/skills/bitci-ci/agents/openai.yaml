@@ -1,0 +1,3 @@
+interface:
+  display_name: "Bitci CI"
+  short_description: "Help with Bitci CI tasks and workflows"

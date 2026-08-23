@@ -24,7 +24,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("use validate, plan, submit, worker, serve, status, cancel, retry, logs, or doctor")
+		return fmt.Errorf("use validate, plan, submit, worker, serve, service, status, cancel, retry, logs, or doctor")
 	}
 	command := args[0]
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
@@ -44,6 +44,9 @@ func run(args []string) error {
 	if command == "validate" {
 		_, err := bitci.LoadConfig(*configPath)
 		return err
+	}
+	if command == "service" {
+		return runService(flags.Args(), *configPath, *stateDir, *maxWorkers)
 	}
 	controller, err := bitci.Open(*configPath, *stateDir)
 	if err != nil {
@@ -126,6 +129,39 @@ func run(args []string) error {
 		return nil
 	default:
 		return fmt.Errorf("unknown command %q", command)
+	}
+}
+
+func runService(args []string, configPath, stateDir string, maxWorkers int) error {
+	if len(args) != 1 {
+		return fmt.Errorf("service needs install, status, or uninstall")
+	}
+	service, err := bitci.NewService(configPath, stateDir, maxWorkers)
+	if err != nil {
+		return err
+	}
+	switch args[0] {
+	case "install":
+		if err := service.Install(); err != nil {
+			return err
+		}
+		fmt.Println("installed", service.Label)
+		return nil
+	case "status":
+		output, err := service.Status()
+		if err != nil {
+			return err
+		}
+		fmt.Print(output)
+		return nil
+	case "uninstall":
+		if err := service.Uninstall(); err != nil {
+			return err
+		}
+		fmt.Println("uninstalled", service.Label)
+		return nil
+	default:
+		return fmt.Errorf("unknown service command %q", args[0])
 	}
 }
 

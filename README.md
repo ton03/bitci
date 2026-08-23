@@ -5,6 +5,15 @@ BitCI is a small, local-first CI controller for trusted development machines.
 It runs only task IDs from a repository `bitci.json`. It uses argv execution,
 SQLite queue state, FIFO claims, worker limits, and named resource leases.
 
+## Stack
+
+- **Controller and CLI:** one Go binary.
+- **State:** local SQLite through one pure-Go driver.
+- **Runner:** child processes use configured argv only.
+- **Background service:** macOS `launchd` keeps `bitci serve` running.
+- **UI:** next stage uses server HTML, small CSS, and SSE. No frontend framework.
+- **Agents:** the `bitci-ci` skill uses typed CLI operations. MCP follows the local socket.
+
 ## Pilot commands
 
 ```sh
@@ -21,6 +30,31 @@ bitci doctor
 ```
 
 `serve` stays active and starts queued configured tasks. Stop it with `Ctrl-C`.
+
+## Run in the background on macOS
+
+Build a fixed binary path first. Do not use `go run` for a background service.
+
+```sh
+mkdir -p "$HOME/.local/bin"
+go build -o "$HOME/.local/bin/bitci" ./cmd/bitci
+"$HOME/.local/bin/bitci" validate
+"$HOME/.local/bin/bitci" service --max-workers 3 install
+"$HOME/.local/bin/bitci" service status
+```
+
+`launchd` starts `bitci serve` at sign-in and restarts it if it exits. The
+controller waits for queued configured tasks; it does not run CI until you or
+an agent submits a task ID.
+
+```sh
+"$HOME/.local/bin/bitci" submit unit
+"$HOME/.local/bin/bitci" status
+"$HOME/.local/bin/bitci" logs --tail 80 1
+"$HOME/.local/bin/bitci" service uninstall
+```
+
+Run `service install` again after replacing the binary.
 
 ## `bitci.json`
 
