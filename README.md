@@ -101,7 +101,8 @@ an agent submits a task ID.
 
 `service install` saves the resolved directories for configured task commands
 in the launchd plist. Set `BITCI_PATH` before install when task scripts need a
-custom runtime path. Run install again after changing the runtime or binary.
+custom runtime path. Run install again after changing the runtime or binary;
+BitCI refuses the upgrade while jobs are queued or running.
 
 After a controller restart, BitCI marks the active job failed with exit code
 125 and cancels the remaining jobs in that batch. Inspect logs, then retry the

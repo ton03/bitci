@@ -109,6 +109,9 @@ func servicePath(config Config, checkout string) (string, error) {
 }
 
 func (service Service) Install() error {
+	if err := service.ensureNoActiveJobs(); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(service.PlistPath), 0o700); err != nil {
 		return err
 	}
@@ -124,6 +127,22 @@ func (service Service) Install() error {
 	}
 	if output, err := exec.Command("launchctl", "kickstart", "-k", service.Domain+"/"+service.Label).CombinedOutput(); err != nil {
 		return fmt.Errorf("launchctl kickstart: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func (service Service) ensureNoActiveJobs() error {
+	controller, err := OpenState(service.ConfigPath, service.StateDir)
+	if err != nil {
+		return err
+	}
+	defer controller.Close()
+	var active int
+	if err := controller.db.QueryRow("SELECT COUNT(*) FROM jobs WHERE state IN ('queued', 'running')").Scan(&active); err != nil {
+		return err
+	}
+	if active != 0 {
+		return fmt.Errorf("cannot upgrade service while BitCI jobs are queued or running")
 	}
 	return nil
 }

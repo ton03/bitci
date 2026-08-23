@@ -532,6 +532,29 @@ func TestServicePlist(t *testing.T) {
 	}
 }
 
+func TestServiceRefusesActiveJobs(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("launchd applies on macOS")
+	}
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+	stateDir := filepath.Join(t.TempDir(), "state")
+	service, err := NewService(configPath, stateDir, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller, err := Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.ensureNoActiveJobs(); err == nil {
+		t.Fatal("service accepted queued job")
+	}
+}
+
 func TestHelperProcess(t *testing.T) {
 	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
 		return
