@@ -47,6 +47,19 @@ bitci status --state-dir /var/lib/bitci/project
 Keep `--config` and `--state-dir` before task IDs. Existing CI can keep its
 current commands; these commands add an optional BitCI reporting path.
 
+## Trusted pull-request staging
+
+Use `stage-pr` only for a dedicated CI checkout. It requires a
+`BITCI_GITHUB_TOKEN` with read access to pull requests or contents. BitCI
+rejects fork heads, dirty checkouts, queued work, and mismatched fetched SHAs.
+It removes ignored `.next` output before a trusted ref switch, then records the
+verified `HEAD` SHA when you submit the task.
+
+```sh
+BITCI_GITHUB_TOKEN=... bitci stage-pr --config /srv/project-ci/bitci.json --state-dir /var/lib/bitci/project 42
+bitci submit --config /srv/project-ci/bitci.json --state-dir /var/lib/bitci/project unit
+```
+
 ## Agent MCP
 
 Start the controller first. It creates `.bitci/bitci.sock` with owner-only

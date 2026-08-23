@@ -23,6 +23,8 @@ type Controller struct {
 	configPath string
 	stateDir   string
 	db         *sql.DB
+	githubAPI  string
+	githubRepo string
 }
 
 type Job struct {

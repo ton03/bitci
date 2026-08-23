@@ -24,7 +24,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("use validate, plan, submit, worker, serve, service, status, cancel, retry, logs, doctor, or mcp")
+		return fmt.Errorf("use validate, plan, submit, worker, serve, service, status, cancel, retry, logs, doctor, mcp, or stage-pr")
 	}
 	command := args[0]
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
@@ -86,6 +86,16 @@ func run(args []string) error {
 			return err
 		}
 		return printValue(jobs, *jsonOutput)
+	case "stage-pr":
+		number, err := pullRequestNumber(flags.Args())
+		if err != nil {
+			return err
+		}
+		stage, err := controller.StagePR(context.Background(), number, os.Getenv("BITCI_GITHUB_TOKEN"))
+		if err != nil {
+			return err
+		}
+		return printValue(stage, *jsonOutput)
 	case "worker":
 		_, err := controller.RunOnce(context.Background(), *maxWorkers)
 		return err
@@ -187,6 +197,17 @@ func jobID(args []string) (int64, error) {
 		return 0, fmt.Errorf("command needs one job ID")
 	}
 	return strconv.ParseInt(args[0], 10, 64)
+}
+
+func pullRequestNumber(args []string) (int, error) {
+	if len(args) != 1 {
+		return 0, fmt.Errorf("stage-pr needs one pull request number")
+	}
+	number, err := strconv.Atoi(args[0])
+	if err != nil || number < 1 {
+		return 0, fmt.Errorf("stage-pr needs a positive pull request number")
+	}
+	return number, nil
 }
 
 func printValue(value any, jsonOutput bool) error {

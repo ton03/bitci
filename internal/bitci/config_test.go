@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -403,6 +405,89 @@ func TestSubmitRecordsAndVerifiesCheckoutSHA(t *testing.T) {
 	}
 	if got[0].State != "failed" || got[0].ExitCode == nil || *got[0].ExitCode != 126 {
 		t.Fatalf("mismatched checkout job = %#v", got[0])
+	}
+}
+
+func TestStagePRChecksTrustAndCleansNext(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(filepath.Join(checkout, ".gitignore"), []byte(".next/\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "branch", "-M", "main")
+	git(t, checkout, "add", ".")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "main")
+	mainSHA := git(t, checkout, "rev-parse", "HEAD")
+	remote := filepath.Join(t.TempDir(), "remote.git")
+	git(t, t.TempDir(), "init", "--bare", "-q", remote)
+	git(t, checkout, "remote", "add", "origin", remote)
+	git(t, checkout, "push", "-q", "origin", "HEAD:refs/heads/main")
+	if err := os.WriteFile(filepath.Join(checkout, "pr-file"), []byte("trusted"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "add", "pr-file")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "pr")
+	prSHA := git(t, checkout, "rev-parse", "HEAD")
+	git(t, checkout, "push", "-q", "origin", "HEAD:refs/pull/7/head")
+	git(t, checkout, "reset", "--hard", "-q", mainSHA)
+	if err := os.MkdirAll(filepath.Join(checkout, ".next", "types"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, ".next", "types", "stale"), []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Authorization") != "Bearer test-token" {
+			t.Error("missing GitHub token")
+		}
+		fmt.Fprintf(writer, `{"head":{"sha":%q,"repo":{"full_name":"owner/repo"}},"base":{"repo":{"full_name":"owner/repo"}}}`, prSHA)
+	}))
+	defer server.Close()
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	controller.githubAPI = server.URL
+	controller.githubRepo = "owner/repo"
+	stage, err := controller.StagePR(context.Background(), 7, "test-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stage.SHA != prSHA {
+		t.Fatalf("staged SHA = %q, want %q", stage.SHA, prSHA)
+	}
+	if _, err := os.Stat(filepath.Join(checkout, ".next")); !os.IsNotExist(err) {
+		t.Fatalf("stale .next remains: %v", err)
+	}
+}
+
+func TestStagePRRejectsFork(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "main")
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(writer, `{"head":{"sha":"0123456789012345678901234567890123456789","repo":{"full_name":"fork/repo"}},"base":{"repo":{"full_name":"owner/repo"}}}`)
+	}))
+	defer server.Close()
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	controller.githubAPI = server.URL
+	controller.githubRepo = "owner/repo"
+	if _, err := controller.StagePR(context.Background(), 7, "test-token"); err == nil || !strings.Contains(err.Error(), "same-repository") {
+		t.Fatalf("fork stage error = %v", err)
 	}
 }
 
