@@ -24,7 +24,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("use validate, plan, submit, worker, serve, service, status, cancel, retry, logs, or doctor")
+		return fmt.Errorf("use validate, plan, submit, worker, serve, service, status, cancel, retry, logs, doctor, or mcp")
 	}
 	command := args[0]
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
@@ -35,6 +35,8 @@ func run(args []string) error {
 	ref := flags.String("ref", "", "source reference")
 	maxWorkers := flags.Int("max-workers", 1, "maximum running tasks")
 	interval := flags.Duration("interval", time.Second, "queue poll interval")
+	socketPath := flags.String("socket", "", "owner Unix socket path")
+	allowRuns := flags.Bool("allow-runs", false, "enable MCP run-control tools")
 	jsonOutput := flags.Bool("json", false, "JSON output")
 	logLimit := flags.Int("tail", 80, "maximum log lines, capped at 80")
 	search := flags.String("search", "", "log text to search")
@@ -47,6 +49,15 @@ func run(args []string) error {
 	}
 	if command == "service" {
 		return runService(flags.Args(), *configPath, *stateDir, *maxWorkers)
+	}
+	if command == "mcp" {
+		if flags.NArg() != 0 {
+			return fmt.Errorf("mcp takes no arguments")
+		}
+		if *socketPath == "" {
+			*socketPath = bitci.DefaultSocketPath(*configPath, *stateDir)
+		}
+		return bitci.RunMCP(context.Background(), bitci.MCPOptions{SocketPath: *socketPath, AllowRuns: *allowRuns})
 	}
 	controller, err := bitci.Open(*configPath, *stateDir)
 	if err != nil {
@@ -75,7 +86,7 @@ func run(args []string) error {
 	case "serve":
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
-		return controller.Serve(ctx, *maxWorkers, *interval)
+		return controller.Serve(ctx, *maxWorkers, *interval, *socketPath)
 	case "status":
 		jobs, err := controller.Jobs()
 		if err != nil {

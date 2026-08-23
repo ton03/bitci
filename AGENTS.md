@@ -18,8 +18,10 @@ Add a contract test for controller behavior changes.
 ## Agent use
 
 Use `.agents/skills/bitci-ci` when operating a repository with `bitci.json`.
-Plan before submit. Inspect capped logs before retrying. Do not install or stop
-the managed service without the user's request.
+Agents use local MCP tools first, then the CLI only if MCP is unavailable.
+Agents never use the UI; it is for humans. Plan before submit. Inspect capped
+logs before retrying. Do not install or stop the managed service without the
+user's request.
 
 ## Product boundary
 

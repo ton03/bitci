@@ -125,6 +125,9 @@ func (controller *Controller) Submit(taskNames []string, ref string) ([]Job, err
 }
 
 func (controller *Controller) RunOnce(ctx context.Context, maxWorkers int) (bool, error) {
+	if ctx.Err() != nil {
+		return false, nil
+	}
 	if err := controller.DiskOK(); err != nil {
 		return false, err
 	}
@@ -141,22 +144,73 @@ func (controller *Controller) RunOnce(ctx context.Context, maxWorkers int) (bool
 	return true, controller.finish(job, code, output)
 }
 
-func (controller *Controller) Serve(ctx context.Context, maxWorkers int, interval time.Duration) error {
+func (controller *Controller) Serve(ctx context.Context, maxWorkers int, interval time.Duration, socketPath string) error {
+	if maxWorkers < 1 {
+		return fmt.Errorf("max-workers must be positive")
+	}
+	if err := controller.RecoverInterrupted(); err != nil {
+		return err
+	}
+	listener, err := controller.Listen(socketPath)
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
 	if interval <= 0 {
 		interval = time.Second
 	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	errors := make(chan error, maxWorkers+1)
+	go func() { errors <- controller.ServeRPC(ctx, listener) }()
+	for worker := 0; worker < maxWorkers; worker++ {
+		go controller.serveWorker(ctx, maxWorkers, interval, errors)
+	}
 	for {
-		for worker := 0; worker < maxWorkers; worker++ {
-			go controller.RunOnce(ctx, maxWorkers) //nolint:errcheck // job state captures execution errors.
-		}
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-ticker.C:
+		case err := <-errors:
+			if err != nil {
+				return err
+			}
 		}
 	}
+}
+
+func (controller *Controller) serveWorker(ctx context.Context, maxWorkers int, interval time.Duration, errors chan<- error) {
+	for {
+		ran, err := controller.RunOnce(ctx, maxWorkers)
+		if err != nil {
+			errors <- err
+			return
+		}
+		if ran {
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(interval):
+		}
+	}
+}
+
+func (controller *Controller) RecoverInterrupted() error {
+	transaction, err := controller.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer transaction.Rollback()
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err := transaction.Exec("UPDATE jobs SET state = 'cancelled', finished_at = ? WHERE state = 'queued' AND batch IN (SELECT DISTINCT batch FROM jobs WHERE state = 'running')", now); err != nil {
+		return err
+	}
+	if _, err := transaction.Exec("DELETE FROM leases WHERE job_id IN (SELECT id FROM jobs WHERE state = 'running')"); err != nil {
+		return err
+	}
+	if _, err := transaction.Exec("UPDATE jobs SET state = 'failed', finished_at = ?, exit_code = 125 WHERE state = 'running'", now); err != nil {
+		return err
+	}
+	return transaction.Commit()
 }
 
 func (controller *Controller) claim(maxWorkers int) (Job, bool, error) {
@@ -314,31 +368,27 @@ func (controller *Controller) Retry(id int64) ([]Job, error) {
 }
 
 func (controller *Controller) TailLog(id int64, limit int) ([]string, error) {
-	lines, err := controller.readLog(id)
+	file, err := controller.logFile(id)
 	if err != nil {
 		return nil, err
 	}
-	return lastLines(lines, limit), nil
+	defer file.Close()
+	return scanLog(file, limit, func(string) bool { return true })
 }
 
 func (controller *Controller) SearchLog(id int64, query string, limit int) ([]string, error) {
 	if query == "" {
 		return nil, fmt.Errorf("search query must not be empty")
 	}
-	lines, err := controller.readLog(id)
+	file, err := controller.logFile(id)
 	if err != nil {
 		return nil, err
 	}
-	matches := make([]string, 0, limit)
-	for _, line := range lines {
-		if strings.Contains(line, query) {
-			matches = append(matches, line)
-		}
-	}
-	return lastLines(matches, limit), nil
+	defer file.Close()
+	return scanLog(file, limit, func(line string) bool { return strings.Contains(line, query) })
 }
 
-func (controller *Controller) readLog(id int64) ([]string, error) {
+func (controller *Controller) logFile(id int64) (*os.File, error) {
 	var logPath string
 	if err := controller.db.QueryRow("SELECT COALESCE(log_path, '') FROM jobs WHERE id = ?", id).Scan(&logPath); err != nil {
 		return nil, err
@@ -350,27 +400,37 @@ func (controller *Controller) readLog(id int64) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
-	var lines []string
+	return file, nil
+}
+
+func scanLog(file *os.File, limit int, include func(string) bool) ([]string, error) {
+	limit = logLimit(limit)
+	lines := make([]string, 0, limit)
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
+		line := scanner.Text()
+		if !include(line) {
+			continue
+		}
+		if len(lines) == limit {
+			copy(lines, lines[1:])
+			lines[len(lines)-1] = line
+			continue
+		}
+		lines = append(lines, line)
 	}
 	return lines, scanner.Err()
 }
 
-func lastLines(lines []string, limit int) []string {
+func logLimit(limit int) int {
 	if limit < 1 {
-		limit = 80
+		return 80
 	}
 	if limit > 80 {
-		limit = 80
+		return 80
 	}
-	if len(lines) <= limit {
-		return lines
-	}
-	return lines[len(lines)-limit:]
+	return limit
 }
 
 func (controller *Controller) DiskOK() error {

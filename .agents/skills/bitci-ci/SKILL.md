@@ -6,13 +6,17 @@ description: Run and inspect configured BitCI tasks safely when working in a rep
 # BitCI
 
 Use BitCI as the local CI control plane. It runs task IDs from `bitci.json`; it
-does not accept commands from agents.
+does not accept commands from agents. Use local BitCI MCP tools when available.
+Never use the UI. The UI is for humans only. Use the CLI only when MCP is not
+available.
 
-1. Validate first: `bitci validate`.
-2. Plan before submit: `bitci plan --paths <changed-paths>`.
-3. Submit only returned configured task IDs: `bitci submit <task-id>`.
-4. Inspect `bitci status`, then `bitci logs --tail 80 <job-id>` on failure.
-5. Search logs before retrying: `bitci logs --search <text> <job-id>`.
+1. Use `plan` before `submit`.
+2. Submit only returned configured task IDs.
+3. Use `status`, then `tail_logs` on failure.
+4. Use `search_logs` before `retry`.
+
+MCP starts read-only. The user must explicitly enable run-control tools. CLI
+fallback: validate, plan, submit, status, logs, cancel, and retry.
 
 Cancel only queued work. Retry only after inspecting the failure. A retry runs
 the configured task and dependencies again.

@@ -12,7 +12,8 @@ SQLite queue state, FIFO claims, worker limits, and named resource leases.
 - **Runner:** child processes use configured argv only.
 - **Background service:** macOS `launchd` keeps `bitci serve` running.
 - **UI:** next stage uses server HTML, small CSS, and SSE. No frontend framework.
-- **Agents:** the `bitci-ci` skill uses typed CLI operations. MCP follows the local socket.
+- **Agents:** local MCP connects to the controller's owner-only Unix socket.
+- **UI:** reserved for humans. Agents use MCP first and CLI only as a fallback.
 
 ## Pilot commands
 
@@ -27,9 +28,31 @@ bitci retry 12
 bitci logs --tail 80 12
 bitci logs --search "error" 12
 bitci doctor
+bitci mcp --allow-runs
 ```
 
 `serve` stays active and starts queued configured tasks. Stop it with `Ctrl-C`.
+
+## Agent MCP
+
+Start the controller first. It creates `.bitci/bitci.sock` with owner-only
+permissions. `bitci mcp` then exposes stdio MCP tools to an agent client. The
+default tools read status, plans, capped logs, and the disk guard. Add
+`--allow-runs` only when the agent may submit, cancel, or retry work.
+
+```json
+{
+  "mcpServers": {
+    "bitci": {
+      "command": "/Users/me/.local/bin/bitci",
+      "args": ["mcp", "--allow-runs"]
+    }
+  }
+}
+```
+
+Agents never use the UI. They call MCP `plan`, `submit`, `status`,
+`tail_logs`, and `search_logs`; use the typed CLI only if MCP is unavailable.
 
 ## Run in the background on macOS
 
@@ -46,6 +69,10 @@ go build -o "$HOME/.local/bin/bitci" ./cmd/bitci
 `launchd` starts `bitci serve` at sign-in and restarts it if it exits. The
 controller waits for queued configured tasks; it does not run CI until you or
 an agent submits a task ID.
+
+After a controller restart, BitCI marks the active job failed with exit code
+125 and cancels the remaining jobs in that batch. Inspect logs, then retry the
+task when ready.
 
 ```sh
 "$HOME/.local/bin/bitci" submit unit
@@ -78,7 +105,8 @@ The config is strict JSON. Unknown fields fail validation. BitCI does not run
 commands supplied by the CLI or by another process.
 
 `cancel` only cancels queued jobs. `retry` creates a new configured run. Logs
-return at most 80 lines.
+return at most 80 lines. The pilot does not redact logs. Do not print secrets
+from configured tasks or expose logs that contain them.
 
 ## Development
 
