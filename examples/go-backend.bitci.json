@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "tasks": {
+    "test": {
+      "run": ["go", "test", "./..."],
+      "paths": ["**/*.go", "go.mod", "go.sum"]
+    },
+    "vet": {
+      "run": ["go", "vet", "./..."],
+      "needs": ["test"],
+      "paths": ["**/*.go", "go.mod", "go.sum"]
+    }
+  }
+}

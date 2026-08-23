@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "resources": { "browser": 1 },
+  "tasks": {
+    "test": {
+      "run": ["npx", "nx", "run-many", "-t", "test", "--all"],
+      "paths": ["apps/**", "libs/**", "nx.json", "package.json", "package-lock.json"]
+    },
+    "e2e": {
+      "run": ["npx", "nx", "run-many", "-t", "e2e", "--all"],
+      "needs": ["test"],
+      "resources": ["browser"],
+      "paths": ["apps/**", "libs/**", "nx.json", "package.json", "package-lock.json"]
+    }
+  }
+}

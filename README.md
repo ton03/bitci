@@ -136,6 +136,14 @@ Run `service install` again after replacing the binary.
 The config is strict JSON. Unknown fields fail validation. BitCI does not run
 commands supplied by the CLI or by another process.
 
+## Stack examples
+
+BitCI is stack-neutral. It runs configured argv from the repository root; it
+does not detect project types or add presets. Copy and adapt the examples for
+[Go backends](examples/go-backend.bitci.json),
+[Node backends](examples/node-backend.bitci.json), or
+[Nx monorepos](examples/nx-monorepo.bitci.json).
+
 `cancel` only cancels queued jobs. `retry` creates a new configured run. Logs
 return at most 80 lines and are available while a job runs. On a Git checkout,
 BitCI records the verified `HEAD` SHA at submission and refuses a changed

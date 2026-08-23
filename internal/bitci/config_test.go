@@ -42,6 +42,15 @@ func TestConfigContract(t *testing.T) {
 	}
 }
 
+func TestStackExamplesValidate(t *testing.T) {
+	root := filepath.Clean(filepath.Join("..", ".."))
+	for _, name := range []string{"go-backend", "node-backend", "nx-monorepo"} {
+		if _, err := LoadConfig(filepath.Join(root, "examples", name+".bitci.json")); err != nil {
+			t.Fatalf("%s example: %v", name, err)
+		}
+	}
+}
+
 func TestDefaultStateDirStaysOutsideCheckout(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "bitci.json")
 	stateDir := DefaultStateDir(configPath, "")

@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "tasks": {
+    "test": {
+      "run": ["npm", "run", "test"],
+      "paths": ["src/**", "test/**", "package.json", "package-lock.json"]
+    },
+    "typecheck": {
+      "run": ["npm", "run", "typecheck"],
+      "needs": ["test"],
+      "paths": ["src/**", "package.json", "package-lock.json", "tsconfig.json"]
+    }
+  }
+}
