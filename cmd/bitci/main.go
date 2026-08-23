@@ -59,7 +59,13 @@ func run(args []string) error {
 		}
 		return bitci.RunMCP(context.Background(), bitci.MCPOptions{SocketPath: *socketPath, AllowRuns: *allowRuns})
 	}
-	controller, err := bitci.Open(*configPath, *stateDir)
+	var controller *bitci.Controller
+	var err error
+	if command == "status" {
+		controller, err = bitci.OpenState(*configPath, *stateDir)
+	} else {
+		controller, err = bitci.Open(*configPath, *stateDir)
+	}
 	if err != nil {
 		return err
 	}

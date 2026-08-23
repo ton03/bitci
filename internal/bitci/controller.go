@@ -40,9 +40,18 @@ func Open(configPath, stateDir string) (*Controller, error) {
 	if err != nil {
 		return nil, err
 	}
-	if stateDir == "" {
-		stateDir = filepath.Join(filepath.Dir(configPath), ".bitci")
+	controller, err := OpenState(configPath, stateDir)
+	if err != nil {
+		return nil, err
 	}
+	controller.config = config
+	return controller, nil
+}
+
+// OpenState opens only local controller state. It does not read bitci.json.
+// Use it for status from a process outside the configured checkout.
+func OpenState(configPath, stateDir string) (*Controller, error) {
+	stateDir = DefaultStateDir(configPath, stateDir)
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		return nil, err
 	}
@@ -51,12 +60,19 @@ func Open(configPath, stateDir string) (*Controller, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	controller := &Controller{config: config, configPath: configPath, stateDir: stateDir, db: db}
+	controller := &Controller{configPath: configPath, stateDir: stateDir, db: db}
 	if err := controller.migrate(); err != nil {
 		db.Close()
 		return nil, err
 	}
 	return controller, nil
+}
+
+func DefaultStateDir(configPath, stateDir string) string {
+	if stateDir == "" {
+		return filepath.Join(filepath.Dir(configPath), ".bitci")
+	}
+	return stateDir
 }
 
 func (controller *Controller) Close() error { return controller.db.Close() }

@@ -33,6 +33,20 @@ bitci mcp --allow-runs
 
 `serve` stays active and starts queued configured tasks. Stop it with `Ctrl-C`.
 
+## External CI commands
+
+Use absolute paths when a CI process runs outside the configured checkout.
+`submit` reads the fixed config path. `status` reads only the state directory,
+so it works without a checkout or `bitci.json` in the current directory.
+
+```sh
+bitci submit --config /srv/project-ci/bitci.json --state-dir /var/lib/bitci/project unit
+bitci status --state-dir /var/lib/bitci/project
+```
+
+Keep `--config` and `--state-dir` before task IDs. Existing CI can keep its
+current commands; these commands add an optional BitCI reporting path.
+
 ## Agent MCP
 
 Start the controller first. It creates `.bitci/bitci.sock` with owner-only

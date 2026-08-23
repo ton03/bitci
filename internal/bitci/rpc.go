@@ -40,10 +40,7 @@ type SubmitParams struct {
 }
 
 func DefaultSocketPath(configPath, stateDir string) string {
-	if stateDir == "" {
-		stateDir = filepath.Join(filepath.Dir(configPath), ".bitci")
-	}
-	return filepath.Join(stateDir, "bitci.sock")
+	return filepath.Join(DefaultStateDir(configPath, stateDir), "bitci.sock")
 }
 
 func (controller *Controller) Listen(socketPath string) (net.Listener, error) {
