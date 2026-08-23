@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"fmt"
@@ -71,10 +72,19 @@ func OpenState(configPath, stateDir string) (*Controller, error) {
 }
 
 func DefaultStateDir(configPath, stateDir string) string {
-	if stateDir == "" {
-		return filepath.Join(filepath.Dir(configPath), ".bitci")
+	if stateDir != "" {
+		return stateDir
 	}
-	return stateDir
+	absoluteConfig, err := filepath.Abs(configPath)
+	if err != nil {
+		absoluteConfig = configPath
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join(filepath.Dir(absoluteConfig), ".bitci")
+	}
+	digest := sha256.Sum256([]byte(absoluteConfig))
+	return filepath.Join(home, ".local", "state", "bitci", hex.EncodeToString(digest[:6]))
 }
 
 func (controller *Controller) Close() error { return controller.db.Close() }

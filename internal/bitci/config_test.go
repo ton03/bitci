@@ -42,6 +42,14 @@ func TestConfigContract(t *testing.T) {
 	}
 }
 
+func TestDefaultStateDirStaysOutsideCheckout(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "bitci.json")
+	stateDir := DefaultStateDir(configPath, "")
+	if strings.HasPrefix(stateDir, filepath.Dir(configPath)+string(filepath.Separator)) {
+		t.Fatalf("state directory %q is inside checkout", stateDir)
+	}
+}
+
 func TestQueueContract(t *testing.T) {
 	configPath := writeConfig(t, `{
 		"version": 1,

@@ -34,7 +34,7 @@ func NewService(configPath, stateDir string, maxWorkers int) (Service, error) {
 		return Service{}, err
 	}
 	if stateDir == "" {
-		stateDir = filepath.Join(filepath.Dir(absoluteConfig), ".bitci")
+		stateDir = DefaultStateDir(absoluteConfig, "")
 	}
 	absoluteState, err := filepath.Abs(stateDir)
 	if err != nil {

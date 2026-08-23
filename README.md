@@ -62,10 +62,12 @@ bitci submit --config /srv/project-ci/bitci.json --state-dir /var/lib/bitci/proj
 
 ## Agent MCP
 
-Start the controller first. It creates `.bitci/bitci.sock` with owner-only
-permissions. `bitci mcp` then exposes stdio MCP tools to an agent client. The
-default tools read status, plans, capped logs, and the disk guard. Add
-`--allow-runs` only when the agent may submit, cancel, or retry work.
+Start the controller first. It creates an owner-only socket in its state
+directory. By default BitCI uses a per-checkout directory under
+`~/.local/state/bitci`; pass `--state-dir` when CI needs a fixed shared path.
+`bitci mcp` exposes stdio MCP tools to an agent client. The default tools read
+status, plans, capped logs, and the disk guard. Add `--allow-runs` only when
+the agent may submit, cancel, or retry work.
 
 ```json
 {
