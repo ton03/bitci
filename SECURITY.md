@@ -5,7 +5,8 @@ It does not provide a multi-user service, hosted execution, sandboxing, or
 secret redaction.
 
 Private vulnerability reporting is not configured yet. Do not put vulnerability
-details, tokens, logs, or private repository data in a public issue. Enable
-GitHub private vulnerability reporting before making this repository public.
+details, tokens, logs, or private repository data in a public issue. A
+maintainer must enable GitHub private vulnerability reporting during public
+release setup.
 
 Use a supported alpha release only after you understand these limits.
