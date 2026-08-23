@@ -517,6 +517,13 @@ func TestServicePlist(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	truePath, err := exec.LookPath("true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(service.PathEnv, filepath.Dir(truePath)) {
+		t.Fatalf("service PATH %q misses configured command directory", service.PathEnv)
+	}
 	plist := service.plist()
 	for _, value := range []string{"<key>KeepAlive</key><true/>", "<string>serve</string>", service.ConfigPath, service.StateDir, "<key>EnvironmentVariables</key><dict><key>PATH</key>", service.PathEnv} {
 		if !strings.Contains(plist, value) {

@@ -26,7 +26,8 @@ func NewService(configPath, stateDir string, maxWorkers int) (Service, error) {
 	if runtime.GOOS != "darwin" {
 		return Service{}, fmt.Errorf("managed service currently requires macOS")
 	}
-	if _, err := LoadConfig(configPath); err != nil {
+	config, err := LoadConfig(configPath)
+	if err != nil {
 		return Service{}, err
 	}
 	absoluteConfig, err := filepath.Abs(configPath)
@@ -53,23 +54,58 @@ func NewService(configPath, stateDir string, maxWorkers int) (Service, error) {
 	}
 	digest := sha256.Sum256([]byte(absoluteConfig))
 	label := fmt.Sprintf("com.bitci.%x", digest[:6])
-	return Service{
+	service := Service{
 		Label:      label,
 		ConfigPath: absoluteConfig,
 		StateDir:   absoluteState,
 		MaxWorkers: maxWorkers,
 		BinaryPath: binary,
-		PathEnv:    servicePath(),
+		PathEnv:    "",
 		PlistPath:  filepath.Join(home, "Library", "LaunchAgents", label+".plist"),
 		Domain:     fmt.Sprintf("gui/%d", os.Getuid()),
-	}, nil
+	}
+	service.PathEnv, err = servicePath(config, filepath.Dir(absoluteConfig))
+	if err != nil {
+		return Service{}, err
+	}
+	return service, nil
 }
 
-func servicePath() string {
-	if path := os.Getenv("PATH"); path != "" {
-		return path
+func servicePath(config Config, checkout string) (string, error) {
+	if path := os.Getenv("BITCI_PATH"); path != "" {
+		return path, nil
 	}
-	return "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+	directories := make([]string, 0, len(config.Tasks)+5)
+	seen := map[string]bool{}
+	add := func(directory string) {
+		if directory != "" && !seen[directory] {
+			seen[directory] = true
+			directories = append(directories, directory)
+		}
+	}
+	for _, name := range config.TaskNames() {
+		command := config.Tasks[name].Run[0]
+		if strings.ContainsRune(command, filepath.Separator) {
+			if !filepath.IsAbs(command) {
+				command = filepath.Join(checkout, command)
+			}
+			info, err := os.Stat(command)
+			if err != nil || info.IsDir() {
+				return "", fmt.Errorf("resolve configured task command %q", config.Tasks[name].Run[0])
+			}
+			add(filepath.Dir(command))
+			continue
+		}
+		resolved, err := exec.LookPath(command)
+		if err != nil {
+			return "", fmt.Errorf("resolve configured task command %q: %w", command, err)
+		}
+		add(filepath.Dir(resolved))
+	}
+	for _, directory := range []string{"/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"} {
+		add(directory)
+	}
+	return strings.Join(directories, ":"), nil
 }
 
 func (service Service) Install() error {
