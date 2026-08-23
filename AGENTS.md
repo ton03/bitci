@@ -15,6 +15,12 @@ local logs, private repository details, personal paths, or planning notes.
 Run `gofmt`, `go test ./...`, `go test -race ./...`, and `go vet ./...`.
 Add a contract test for controller behavior changes.
 
+## Commits
+
+Every new commit uses Conventional Commits: `type(scope): subject` or
+`type: subject`. Allowed types: `build`, `chore`, `ci`, `docs`, `feat`, `fix`,
+`perf`, `refactor`, `revert`, and `test`. The pull request check enforces this.
+
 ## Agent use
 
 Use `.agents/skills/bitci-ci` when operating a repository with `bitci.json`.

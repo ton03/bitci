@@ -5,6 +5,14 @@ change before `1.0.0`.
 
 ## Before a pull request
 
+Use Conventional Commits for every new commit. For example:
+
+```text
+feat(queue): add paused state
+fix(logs): cap long lines
+docs: clarify agent setup
+```
+
 Run these checks:
 
 ```sh
