@@ -84,6 +84,9 @@ go build -o "$HOME/.local/bin/bitci" ./cmd/bitci
 controller waits for queued configured tasks; it does not run CI until you or
 an agent submits a task ID.
 
+`service install` saves the installer's `PATH` in the launchd plist. Run it
+again after changing the task runtime or replacing the binary.
+
 After a controller restart, BitCI marks the active job failed with exit code
 125 and cancels the remaining jobs in that batch. Inspect logs, then retry the
 task when ready.
@@ -119,8 +122,10 @@ The config is strict JSON. Unknown fields fail validation. BitCI does not run
 commands supplied by the CLI or by another process.
 
 `cancel` only cancels queued jobs. `retry` creates a new configured run. Logs
-return at most 80 lines. The pilot does not redact logs. Do not print secrets
-from configured tasks or expose logs that contain them.
+return at most 80 lines and are available while a job runs. On a Git checkout,
+BitCI records the verified `HEAD` SHA at submission and refuses a changed
+checkout before task start. The pilot does not redact logs. Do not print
+secrets from configured tasks or expose logs that contain them.
 
 ## Development
 

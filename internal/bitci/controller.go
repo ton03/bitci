@@ -110,6 +110,9 @@ func (controller *Controller) Submit(taskNames []string, ref string) ([]Job, err
 	if err != nil {
 		return nil, err
 	}
+	if sha, err := controller.checkoutSHA(); err == nil {
+		ref = sha
+	}
 	batch, err := newBatch()
 	if err != nil {
 		return nil, err
@@ -152,12 +155,48 @@ func (controller *Controller) RunOnce(ctx context.Context, maxWorkers int) (bool
 		return false, err
 	}
 	task := controller.config.Tasks[job.Task]
-	job.LogPath = filepath.Join(controller.stateDir, "logs", fmt.Sprintf("job-%d.log", job.ID))
-	if err := os.MkdirAll(filepath.Dir(job.LogPath), 0o700); err != nil {
-		return true, controller.finish(job, 127, err.Error())
+	logFile, err := controller.startLog(&job)
+	if err != nil {
+		return true, controller.finish(job, 127)
 	}
-	code, output := controller.execute(ctx, task)
-	return true, controller.finish(job, code, output)
+	if isCheckoutSHA(job.Ref) {
+		sha, err := controller.checkoutSHA()
+		if err != nil || sha != job.Ref {
+			fmt.Fprintln(logFile, "BitCI checkout SHA changed before task start")
+			logFile.Close()
+			return true, controller.finish(job, 126)
+		}
+	}
+	code := controller.execute(ctx, task, logFile)
+	if err := logFile.Close(); err != nil && code == 0 {
+		code = 127
+	}
+	return true, controller.finish(job, code)
+}
+
+func (controller *Controller) checkoutSHA() (string, error) {
+	command := exec.Command("git", "-C", filepath.Dir(controller.configPath), "rev-parse", "--verify", "HEAD^{commit}")
+	output, err := command.Output()
+	if err != nil {
+		return "", err
+	}
+	sha := strings.TrimSpace(string(output))
+	if !isCheckoutSHA(sha) {
+		return "", fmt.Errorf("git returned invalid checkout SHA")
+	}
+	return sha, nil
+}
+
+func isCheckoutSHA(value string) bool {
+	if len(value) != 40 {
+		return false
+	}
+	for _, character := range value {
+		if !('0' <= character && character <= '9' || 'a' <= character && character <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func (controller *Controller) Serve(ctx context.Context, maxWorkers int, interval time.Duration, socketPath string) error {
@@ -308,7 +347,23 @@ func (controller *Controller) resourcesFree(transaction *sql.Tx, job Job) (bool,
 	return true, nil
 }
 
-func (controller *Controller) execute(parent context.Context, task Task) (int, string) {
+func (controller *Controller) startLog(job *Job) (*os.File, error) {
+	job.LogPath = filepath.Join(controller.stateDir, "logs", fmt.Sprintf("job-%d.log", job.ID))
+	if err := os.MkdirAll(filepath.Dir(job.LogPath), 0o700); err != nil {
+		return nil, err
+	}
+	file, err := os.OpenFile(job.LogPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := controller.db.Exec("UPDATE jobs SET log_path = ? WHERE id = ?", job.LogPath, job.ID); err != nil {
+		file.Close()
+		return nil, err
+	}
+	return file, nil
+}
+
+func (controller *Controller) execute(parent context.Context, task Task, output io.Writer) int {
 	ctx := parent
 	var cancel context.CancelFunc
 	if task.Timeout > 0 {
@@ -317,20 +372,20 @@ func (controller *Controller) execute(parent context.Context, task Task) (int, s
 	}
 	command := exec.CommandContext(ctx, task.Run[0], task.Run[1:]...)
 	command.Dir = filepath.Dir(controller.configPath)
-	output, err := command.CombinedOutput()
+	command.Stdout = output
+	command.Stderr = output
+	err := command.Run()
 	if err == nil {
-		return 0, string(output)
+		return 0
 	}
 	if exitError, ok := err.(*exec.ExitError); ok {
-		return exitError.ExitCode(), string(output)
+		return exitError.ExitCode()
 	}
-	return 127, fmt.Sprintf("BitCI could not start task: %v\n%s", err, output)
+	fmt.Fprintf(output, "BitCI could not start task: %v\n", err)
+	return 127
 }
 
-func (controller *Controller) finish(job Job, code int, output string) error {
-	if err := os.WriteFile(job.LogPath, []byte(output), 0o600); err != nil {
-		return err
-	}
+func (controller *Controller) finish(job Job, code int) error {
 	state := "passed"
 	if code != 0 {
 		state = "failed"

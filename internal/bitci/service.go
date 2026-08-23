@@ -17,6 +17,7 @@ type Service struct {
 	StateDir   string
 	MaxWorkers int
 	BinaryPath string
+	PathEnv    string
 	PlistPath  string
 	Domain     string
 }
@@ -58,9 +59,17 @@ func NewService(configPath, stateDir string, maxWorkers int) (Service, error) {
 		StateDir:   absoluteState,
 		MaxWorkers: maxWorkers,
 		BinaryPath: binary,
+		PathEnv:    servicePath(),
 		PlistPath:  filepath.Join(home, "Library", "LaunchAgents", label+".plist"),
 		Domain:     fmt.Sprintf("gui/%d", os.Getuid()),
 	}, nil
+}
+
+func servicePath() string {
+	if path := os.Getenv("PATH"); path != "" {
+		return path
+	}
+	return "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 }
 
 func (service Service) Install() error {
@@ -107,6 +116,7 @@ func (service Service) plist() string {
 		"<key>Label</key>" + argument(service.Label) + "\n" +
 		"<key>ProgramArguments</key><array>" + argument(service.BinaryPath) + argument("serve") + argument("--config") + argument(service.ConfigPath) + argument("--state-dir") + argument(service.StateDir) + argument("--max-workers") + argument(fmt.Sprint(service.MaxWorkers)) + "</array>\n" +
 		"<key>WorkingDirectory</key>" + argument(filepath.Dir(service.ConfigPath)) + "\n" +
+		"<key>EnvironmentVariables</key><dict><key>PATH</key>" + argument(service.PathEnv) + "</dict>\n" +
 		"<key>KeepAlive</key><true/>\n" +
 		"<key>RunAtLoad</key><true/>\n" +
 		"<key>ProcessType</key><string>Background</string>\n" +

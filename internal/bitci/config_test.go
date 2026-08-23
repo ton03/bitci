@@ -329,6 +329,83 @@ func TestRunControlAndLogs(t *testing.T) {
 	}
 }
 
+func TestLiveLogAvailableBeforeJobFinishes(t *testing.T) {
+	releasePath := filepath.Join(t.TempDir(), "release")
+	t.Setenv("GO_WANT_HELPER_PROCESS", "1")
+	t.Setenv("GO_WANT_LIVE_LOG_RELEASE", releasePath)
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["`+os.Args[0]+`","-test.run=TestHelperProcess","--"]}}}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	jobs, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := controller.RunOnce(context.Background(), 1)
+		done <- err
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		lines, err := controller.TailLog(jobs[0].ID, 80)
+		if err == nil && strings.Contains(strings.Join(lines, "\n"), "BitCI live log ready") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("live log unavailable: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := os.WriteFile(releasePath, []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSubmitRecordsAndVerifiesCheckoutSHA(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	sha := git(t, checkout, "rev-parse", "HEAD")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	jobs, err := controller.Submit([]string{"unit"}, "untrusted input")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].Ref != sha {
+		t.Fatalf("ref = %q, want verified SHA %q", jobs[0].Ref, sha)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, "marker"), []byte("changed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "add", "marker")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "changed")
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	got, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].State != "failed" || got[0].ExitCode == nil || *got[0].ExitCode != 126 {
+		t.Fatalf("mismatched checkout job = %#v", got[0])
+	}
+}
+
 func TestServicePlist(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("launchd applies on macOS")
@@ -339,7 +416,7 @@ func TestServicePlist(t *testing.T) {
 		t.Fatal(err)
 	}
 	plist := service.plist()
-	for _, value := range []string{"<key>KeepAlive</key><true/>", "<string>serve</string>", service.ConfigPath, service.StateDir} {
+	for _, value := range []string{"<key>KeepAlive</key><true/>", "<string>serve</string>", service.ConfigPath, service.StateDir, "<key>EnvironmentVariables</key><dict><key>PATH</key>", service.PathEnv} {
 		if !strings.Contains(plist, value) {
 			t.Fatalf("plist missing %q", value)
 		}
@@ -349,6 +426,15 @@ func TestServicePlist(t *testing.T) {
 func TestHelperProcess(t *testing.T) {
 	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
 		return
+	}
+	if releasePath := os.Getenv("GO_WANT_LIVE_LOG_RELEASE"); releasePath != "" {
+		fmt.Fprintln(os.Stdout, "BitCI live log ready")
+		for {
+			if _, err := os.Stat(releasePath); err == nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
 	}
 	os.Exit(0)
 }
@@ -371,4 +457,14 @@ func writeConfig(t *testing.T, content string) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func git(t *testing.T, directory string, args ...string) string {
+	t.Helper()
+	command := exec.Command("git", append([]string{"-C", directory}, args...)...)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v: %s", args, err, output)
+	}
+	return strings.TrimSpace(string(output))
 }
