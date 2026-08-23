@@ -24,7 +24,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("use validate, plan, submit, worker, serve, service, status, cancel, retry, logs, doctor, mcp, or stage-pr")
+		return fmt.Errorf("use version, validate, plan, submit, worker, serve, service, status, cancel, retry, logs, doctor, mcp, or stage-pr")
 	}
 	command := args[0]
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
@@ -42,6 +42,13 @@ func run(args []string) error {
 	search := flags.String("search", "", "log text to search")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
+	}
+	if command == "version" {
+		if flags.NArg() != 0 {
+			return fmt.Errorf("version takes no arguments")
+		}
+		fmt.Println(bitci.Version)
+		return nil
 	}
 	if command == "validate" {
 		_, err := bitci.LoadConfig(*configPath)

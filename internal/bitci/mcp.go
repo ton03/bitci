@@ -51,7 +51,7 @@ type MCPJobInput struct {
 }
 
 func RunMCP(ctx context.Context, options MCPOptions) error {
-	server := mcp.NewServer(&mcp.Implementation{Name: "bitci", Version: "0.1.0"}, nil)
+	server := mcp.NewServer(&mcp.Implementation{Name: "bitci", Version: Version}, nil)
 	call := func(method string, params any, output any) error {
 		return Call(options.SocketPath, method, params, output)
 	}

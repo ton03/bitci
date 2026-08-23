@@ -1,0 +1,21 @@
+name: Release alpha
+
+on:
+  push:
+    tags: ["v0.0.1-alpha.*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: scripts/release.sh "$GITHUB_REF_NAME"
+      - run: gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/checksums.txt --prerelease --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

@@ -2,6 +2,9 @@
 
 BitCI is a small, local-first CI controller for trusted development machines.
 
+**Alpha:** BitCI is `0.0.1-alpha.1`. It is not a hosted CI service, a sandbox,
+or a multi-user security boundary. Run it only in a dedicated, trusted checkout.
+
 It runs only task IDs from a repository `bitci.json`. It uses argv execution,
 SQLite queue state, FIFO claims, worker limits, and named resource leases.
 
@@ -29,6 +32,7 @@ bitci logs --tail 80 12
 bitci logs --search "error" 12
 bitci doctor
 bitci mcp --allow-runs
+bitci version
 ```
 
 `serve` stays active and starts queued configured tasks. Stop it with `Ctrl-C`.
@@ -158,6 +162,19 @@ secrets from configured tasks or expose logs that contain them.
 go test ./...
 go build ./cmd/bitci
 ```
+
+## Releases
+
+Alpha releases use tags such as `v0.0.1-alpha.1`. Each alpha tag builds macOS and
+Linux binaries with checksums and creates a GitHub prerelease. Build the same
+artifacts locally with:
+
+```sh
+scripts/release.sh v0.0.1-alpha.1
+```
+
+The release script produces `dist/` only. It never creates a tag or publishes
+anything. Read [SECURITY.md](SECURITY.md) before exposing a controller.
 
 ## License
 

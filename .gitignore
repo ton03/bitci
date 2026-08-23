@@ -1,1 +1,8 @@
 .bitci/
+dist/
+/bitci
+*.db
+*.log
+.env
+.env.*
+!.env.example
