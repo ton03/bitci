@@ -12,17 +12,22 @@ import (
 )
 
 type Service struct {
-	Label      string
-	ConfigPath string
-	StateDir   string
-	MaxWorkers int
-	BinaryPath string
-	PathEnv    string
-	PlistPath  string
-	Domain     string
+	Label       string
+	ConfigPath  string
+	StateDir    string
+	MaxWorkers  int
+	HTTPAddress string
+	BinaryPath  string
+	PathEnv     string
+	PlistPath   string
+	Domain      string
 }
 
 func NewService(configPath, stateDir string, maxWorkers int) (Service, error) {
+	return NewServiceWithHTTP(configPath, stateDir, maxWorkers, "")
+}
+
+func NewServiceWithHTTP(configPath, stateDir string, maxWorkers int, httpAddress string) (Service, error) {
 	if runtime.GOOS != "darwin" {
 		return Service{}, fmt.Errorf("managed service currently requires macOS")
 	}
@@ -52,17 +57,23 @@ func NewService(configPath, stateDir string, maxWorkers int) (Service, error) {
 	if maxWorkers < 1 {
 		return Service{}, fmt.Errorf("max-workers must be positive")
 	}
+	if httpAddress != "" {
+		if err := validateDashboardAddress(httpAddress); err != nil {
+			return Service{}, err
+		}
+	}
 	digest := sha256.Sum256([]byte(absoluteConfig))
 	label := fmt.Sprintf("com.bitci.%x", digest[:6])
 	service := Service{
-		Label:      label,
-		ConfigPath: absoluteConfig,
-		StateDir:   absoluteState,
-		MaxWorkers: maxWorkers,
-		BinaryPath: binary,
-		PathEnv:    "",
-		PlistPath:  filepath.Join(home, "Library", "LaunchAgents", label+".plist"),
-		Domain:     fmt.Sprintf("gui/%d", os.Getuid()),
+		Label:       label,
+		ConfigPath:  absoluteConfig,
+		StateDir:    absoluteState,
+		MaxWorkers:  maxWorkers,
+		HTTPAddress: httpAddress,
+		BinaryPath:  binary,
+		PathEnv:     "",
+		PlistPath:   filepath.Join(home, "Library", "LaunchAgents", label+".plist"),
+		Domain:      fmt.Sprintf("gui/%d", os.Getuid()),
 	}
 	service.PathEnv, err = servicePath(config, filepath.Dir(absoluteConfig))
 	if err != nil {
@@ -187,11 +198,15 @@ func (service Service) Uninstall() error {
 
 func (service Service) plist() string {
 	argument := func(value string) string { return "<string>" + html.EscapeString(value) + "</string>" }
+	arguments := argument(service.BinaryPath) + argument("serve") + argument("--config") + argument(service.ConfigPath) + argument("--state-dir") + argument(service.StateDir) + argument("--max-workers") + argument(fmt.Sprint(service.MaxWorkers))
+	if service.HTTPAddress != "" {
+		arguments += argument("--http") + argument(service.HTTPAddress)
+	}
 	return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
 		"<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n" +
 		"<plist version=\"1.0\"><dict>\n" +
 		"<key>Label</key>" + argument(service.Label) + "\n" +
-		"<key>ProgramArguments</key><array>" + argument(service.BinaryPath) + argument("serve") + argument("--config") + argument(service.ConfigPath) + argument("--state-dir") + argument(service.StateDir) + argument("--max-workers") + argument(fmt.Sprint(service.MaxWorkers)) + "</array>\n" +
+		"<key>ProgramArguments</key><array>" + arguments + "</array>\n" +
 		"<key>WorkingDirectory</key>" + argument(filepath.Dir(service.ConfigPath)) + "\n" +
 		"<key>EnvironmentVariables</key><dict><key>PATH</key>" + argument(service.PathEnv) + "</dict>\n" +
 		"<key>KeepAlive</key><true/>\n" +

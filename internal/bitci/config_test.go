@@ -1221,6 +1221,80 @@ func TestRetryPinsLegacyRecordedSHA(t *testing.T) {
 	}
 }
 
+func TestDashboardContract(t *testing.T) {
+	configPath := writeConfig(t, `{
+		"version":1,
+		"resources":{"browser":1},
+		"min_free_bytes":1048576,
+		"tasks":{"unit":{"run":["true"],"timeout_seconds":30,"resources":["browser"]}}
+	}`)
+	stateDir := filepath.Join(t.TempDir(), "state")
+	controller, err := Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	now := time.Now().UTC().Truncate(time.Second)
+	insert := func(state string, created, started, finished time.Time, sha, logPath string) int64 {
+		t.Helper()
+		result, err := controller.db.Exec(
+			"INSERT INTO jobs(batch, task, ref, tested_sha, state, created_at, started_at, finished_at, log_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			"batch", "unit", sha, sha, state, created.Format(time.RFC3339), started.Format(time.RFC3339), finished.Format(time.RFC3339), logPath,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, err := result.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	logPath := filepath.Join(stateDir, "logs", "job-1.log")
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath, []byte("first\nsecond\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	passedID := insert("passed", now.Add(-4*time.Minute), now.Add(-3*time.Minute), now.Add(-time.Minute), "0123456789012345678901234567890123456789", logPath)
+	insert("failed", now.Add(-3*time.Minute), now.Add(-2*time.Minute), now.Add(-90*time.Second), "abcdefabcdefabcdefabcdefabcdefabcdefabcd", "")
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	response := httptest.NewRecorder()
+	controller.DashboardHandler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("dashboard status = %d", response.Code)
+	}
+	body := response.Body.String()
+	for _, value := range []string{"Recent jobs", "0123456789012345678901234567890123456789", "2m0s", "avg passed · 7d (1)", "1.0 MiB", "0/1"} {
+		if !strings.Contains(body, value) {
+			t.Fatalf("dashboard missing %q: %s", value, body)
+		}
+	}
+	logRequest := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/jobs/%d/logs", passedID), nil)
+	logResponse := httptest.NewRecorder()
+	controller.DashboardHandler().ServeHTTP(logResponse, logRequest)
+	if logResponse.Code != http.StatusOK || logResponse.Body.String() != "first\nsecond" {
+		t.Fatalf("dashboard log = %d %q", logResponse.Code, logResponse.Body.String())
+	}
+}
+
+func TestDashboardBindsLoopbackOnly(t *testing.T) {
+	for _, address := range []string{"localhost:8787", "0.0.0.0:8787", "127.0.0.1:0", "127.0.0.1:not-a-port"} {
+		if listener, err := listenDashboard(address); err == nil {
+			listener.Close()
+			t.Fatalf("dashboard accepted %q", address)
+		}
+	}
+	listener, err := listenDashboard("127.0.0.1:18787")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestLiveLogAvailableBeforeJobFinishes(t *testing.T) {
 	releasePath := filepath.Join(t.TempDir(), "release")
 	t.Setenv("GO_WANT_HELPER_PROCESS", "1")
@@ -2615,7 +2689,7 @@ func TestServicePlist(t *testing.T) {
 		t.Skip("launchd applies on macOS")
 	}
 	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
-	service, err := NewService(configPath, filepath.Join(t.TempDir(), "state"), 3)
+	service, err := NewServiceWithHTTP(configPath, filepath.Join(t.TempDir(), "state"), 3, "127.0.0.1:8787")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2627,7 +2701,7 @@ func TestServicePlist(t *testing.T) {
 		t.Fatalf("service PATH %q misses configured command directory", service.PathEnv)
 	}
 	plist := service.plist()
-	for _, value := range []string{"<key>KeepAlive</key><true/>", "<string>serve</string>", service.ConfigPath, service.StateDir, "<key>EnvironmentVariables</key><dict><key>PATH</key>", service.PathEnv} {
+	for _, value := range []string{"<key>KeepAlive</key><true/>", "<string>serve</string>", "<string>--http</string>", "<string>127.0.0.1:8787</string>", service.ConfigPath, service.StateDir, "<key>EnvironmentVariables</key><dict><key>PATH</key>", service.PathEnv} {
 		if !strings.Contains(plist, value) {
 			t.Fatalf("plist missing %q", value)
 		}
