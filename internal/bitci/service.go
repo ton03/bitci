@@ -97,7 +97,7 @@ func servicePath(config Config, checkout string) (string, error) {
 		commands = append(commands, struct {
 			name          string
 			requireExists bool
-		}{name: config.Tasks[name].Run[0]})
+		}{name: config.Tasks[name].Run[0], requireExists: len(config.Prepare) == 0})
 	}
 	for _, configured := range commands {
 		command := configured.name

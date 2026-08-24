@@ -204,8 +204,8 @@ func (controller *Controller) checkoutStatePath() (string, bool, error) {
 		}
 	}
 	resolvedState := resolvedPathForComparison(state)
-	relative, err := filepath.Rel(checkout, resolvedState)
-	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+	relative, ok := relativeWithin(checkout, resolvedState)
+	if !ok || relative == "." {
 		return "", false, nil
 	}
 	usesSymlink, err := pathUsesSymlink(checkout, relative)
@@ -216,6 +216,20 @@ func (controller *Controller) checkoutStatePath() (string, bool, error) {
 		return "", false, fmt.Errorf("state directory must not use a symlink inside the checkout")
 	}
 	return relative, true, nil
+}
+
+func relativeWithin(root, path string) (string, bool) {
+	relative, err := filepath.Rel(root, path)
+	if err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return relative, true
+	}
+	root = filepath.Clean(root)
+	path = filepath.Clean(path)
+	prefix := root + string(filepath.Separator)
+	if !pathWithin(root, path) || len(path) <= len(prefix) || !strings.EqualFold(path[:len(prefix)], prefix) {
+		return "", false
+	}
+	return path[len(prefix):], true
 }
 
 func (controller *Controller) lexicalCheckoutRoot(checkout string) string {

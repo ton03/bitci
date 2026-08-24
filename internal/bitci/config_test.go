@@ -869,6 +869,50 @@ func TestJobRunsInRecordedCheckoutSHA(t *testing.T) {
 	}
 }
 
+func TestSubmitPinsRecordedCheckoutSHA(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	jobs, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinned := git(t, checkout, "rev-parse", "--verify", "refs/bitci/jobs/"+jobs[0].Batch+"^{commit}")
+	if pinned != jobs[0].Ref {
+		t.Fatalf("pinned SHA = %q, want %q", pinned, jobs[0].Ref)
+	}
+}
+
+func TestPathWithinUsesFilesystemIdentity(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "BitCI")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(parent, "bitci")
+	if _, err := os.Stat(alias); os.IsNotExist(err) {
+		t.Skip("case-sensitive filesystem")
+	} else if err != nil {
+		t.Fatal(err)
+	}
+	if !pathWithin(root, filepath.Join(alias, "missing")) {
+		t.Fatal("case alias should be inside checkout")
+	}
+	if relative, ok := relativeWithin(root, filepath.Join(alias, "state")); !ok || relative != "state" {
+		t.Fatalf("relative case alias = %q, %v", relative, ok)
+	}
+}
+
 func TestRecordedSHAPreparesEachWorktree(t *testing.T) {
 	checkout := t.TempDir()
 	configPath := filepath.Join(checkout, "bitci.json")
@@ -1806,6 +1850,14 @@ func TestServicePathAllowsTaskExecutableCreatedByPrepare(t *testing.T) {
 	checkout := t.TempDir()
 	_, err := servicePath(Config{Prepare: []string{"true"}, Tasks: map[string]Task{"unit": {Run: []string{"./node_modules/.bin/unit"}}}}, checkout)
 	if err != nil {
+		t.Fatalf("service path error = %v", err)
+	}
+}
+
+func TestServicePathRejectsMissingTaskExecutableWithoutPrepare(t *testing.T) {
+	checkout := t.TempDir()
+	_, err := servicePath(Config{Tasks: map[string]Task{"unit": {Run: []string{"./missing"}}}}, checkout)
+	if err == nil || !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("service path error = %v", err)
 	}
 }

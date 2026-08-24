@@ -223,11 +223,29 @@ func (controller *Controller) submit(config Config, taskNames []string, ref, che
 	if err != nil {
 		return nil, err
 	}
+	pinnedRef := ""
+	if checkoutRoot != "" && isCheckoutSHA(ref) {
+		// A commit stored only in SQLite can disappear after a force-push and Git
+		// garbage collection. Keep it reachable for the lifetime of its job records.
+		if _, err := gitAt(context.Background(), checkoutRoot, "update-ref", "refs/bitci/jobs/"+batch, ref); err != nil {
+			return nil, fmt.Errorf("pin recorded checkout SHA: %w", err)
+		}
+		pinnedRef = "refs/bitci/jobs/" + batch
+	}
 	transaction, err := controller.db.Begin()
 	if err != nil {
+		if pinnedRef != "" {
+			_, _ = gitAt(context.Background(), checkoutRoot, "update-ref", "-d", pinnedRef)
+		}
 		return nil, err
 	}
-	defer transaction.Rollback()
+	committed := false
+	defer func() {
+		transaction.Rollback()
+		if !committed && pinnedRef != "" {
+			_, _ = gitAt(context.Background(), checkoutRoot, "update-ref", "-d", pinnedRef)
+		}
+	}()
 	jobs := make([]Job, 0, len(ordered))
 	configJSON, err := json.Marshal(config)
 	if err != nil {
@@ -250,6 +268,7 @@ func (controller *Controller) submit(config Config, taskNames []string, ref, che
 	if err := transaction.Commit(); err != nil {
 		return nil, err
 	}
+	committed = true
 	return jobs, nil
 }
 
@@ -790,7 +809,22 @@ func pathOrAncestorWithin(root, path string) bool {
 
 func pathWithin(root, path string) bool {
 	relative, err := filepath.Rel(root, path)
-	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
+	if err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return true
+	}
+	rootInfo, err := os.Stat(root)
+	if err != nil {
+		return false
+	}
+	for current := filepath.Clean(path); ; current = filepath.Dir(current) {
+		if info, err := os.Stat(current); err == nil && os.SameFile(rootInfo, info) {
+			return true
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return false
+		}
+	}
 }
 
 func (controller *Controller) startLog(job *Job) (*os.File, error) {
