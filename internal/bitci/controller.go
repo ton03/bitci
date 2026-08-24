@@ -339,6 +339,9 @@ func (controller *Controller) submit(config Config, taskNames []string, ref, che
 }
 
 func (controller *Controller) RunOnce(ctx context.Context, maxWorkers int) (bool, error) {
+	if ctx.Err() != nil {
+		return false, nil
+	}
 	release, err := controller.acquireOwner()
 	if err != nil {
 		return false, err
@@ -571,12 +574,8 @@ func (controller *Controller) jobCheckout(ctx context.Context, job Job) (string,
 	if _, err := gitAt(ctx, path, initArgs...); err != nil {
 		return "", cleanup, fmt.Errorf("initialize job worktree: %w", err)
 	}
-	objects, err := alternateObjectDirectories(checkoutRoot)
-	if err != nil {
+	if err := copyRecordedObjects(ctx, checkoutRoot, path, job.Ref); err != nil {
 		return "", cleanup, err
-	}
-	if err := os.WriteFile(filepath.Join(path, ".git", "objects", "info", "alternates"), []byte(strings.Join(objects, "\n")+"\n"), 0o600); err != nil {
-		return "", cleanup, fmt.Errorf("link source objects: %w", err)
 	}
 	if _, err := gitAt(ctx, path, "checkout", "--quiet", "--detach", job.Ref); err != nil {
 		return "", cleanup, fmt.Errorf("create job worktree: %w", err)
@@ -591,46 +590,36 @@ func (controller *Controller) jobCheckout(ctx context.Context, job Job) (string,
 	return filepath.Join(path, configRelative), cleanup, nil
 }
 
-func alternateObjectDirectories(checkoutRoot string) ([]string, error) {
-	primary, err := gitAt(context.Background(), checkoutRoot, "rev-parse", "--path-format=absolute", "--git-path", "objects")
+func copyRecordedObjects(ctx context.Context, checkoutRoot, worktreeRoot, ref string) error {
+	pack := exec.CommandContext(ctx, "git", "-C", checkoutRoot, "pack-objects", "--stdout", "--revs", "--delta-base-offset")
+	pack.Stdin = strings.NewReader(ref + "\n")
+	packOutput, err := pack.StdoutPipe()
 	if err != nil {
-		return nil, fmt.Errorf("find source object directory: %w", err)
+		return fmt.Errorf("prepare recorded checkout objects: %w", err)
 	}
-	var directories []string
-	seen := map[string]bool{}
-	var visit func(string) error
-	visit = func(directory string) error {
-		directory = filepath.Clean(directory)
-		if seen[directory] {
-			return nil
-		}
-		seen[directory] = true
-		directories = append(directories, directory)
-		data, err := os.ReadFile(filepath.Join(directory, "info", "alternates"))
-		if os.IsNotExist(err) {
-			return nil
-		}
-		if err != nil {
-			return fmt.Errorf("read Git alternate object directories: %w", err)
-		}
-		for _, line := range strings.Split(string(data), "\n") {
-			alternate := strings.TrimSpace(line)
-			if alternate == "" {
-				continue
-			}
-			if !filepath.IsAbs(alternate) {
-				alternate = filepath.Join(directory, alternate)
-			}
-			if err := visit(alternate); err != nil {
-				return err
-			}
-		}
-		return nil
+	var packError bytes.Buffer
+	pack.Stderr = &packError
+	index := exec.CommandContext(ctx, "git", "-C", worktreeRoot, "index-pack", "--stdin", "--fix-thin", "--keep")
+	index.Stdin = packOutput
+	var indexError bytes.Buffer
+	index.Stderr = &indexError
+	if err := index.Start(); err != nil {
+		return fmt.Errorf("start recorded checkout object import: %w", err)
 	}
-	if err := visit(strings.TrimSpace(primary)); err != nil {
-		return nil, err
+	if err := pack.Start(); err != nil {
+		_ = packOutput.Close()
+		_ = index.Wait()
+		return fmt.Errorf("start recorded checkout object export: %w", err)
 	}
-	return directories, nil
+	packErr := pack.Wait()
+	indexErr := index.Wait()
+	if packErr != nil {
+		return fmt.Errorf("export recorded checkout objects: %s: %w", strings.TrimSpace(packError.String()), packErr)
+	}
+	if indexErr != nil {
+		return fmt.Errorf("import recorded checkout objects: %s: %w", strings.TrimSpace(indexError.String()), indexErr)
+	}
+	return nil
 }
 
 func jobCheckoutOwner(job Job) []byte {

@@ -110,6 +110,7 @@ func (controller *Controller) ServeRPC(ctx context.Context, listener net.Listene
 		defer close(closerDone)
 		select {
 		case <-ctx.Done():
+			_ = listener.Close()
 			connectionsMu.Lock()
 			for connection := range connections {
 				_ = connection.Close()
@@ -127,7 +128,16 @@ func (controller *Controller) ServeRPC(ctx context.Context, listener net.Listene
 			}
 			return err
 		}
+		if ctx.Err() != nil {
+			_ = connection.Close()
+			return nil
+		}
 		connectionsMu.Lock()
+		if ctx.Err() != nil {
+			connectionsMu.Unlock()
+			_ = connection.Close()
+			return nil
+		}
 		connections[connection] = struct{}{}
 		connectionsMu.Unlock()
 		handlers.Add(1)
@@ -145,6 +155,9 @@ func (controller *Controller) ServeRPC(ctx context.Context, listener net.Listene
 			var request RPCRequest
 			if err := decoder.Decode(&request); err != nil {
 				_ = encoder.Encode(RPCResponse{Error: err.Error()})
+				return
+			}
+			if ctx.Err() != nil {
 				return
 			}
 			_ = encoder.Encode(controller.handleRPC(ctx, request))

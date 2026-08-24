@@ -922,9 +922,6 @@ func TestServeRPCDoesNotBlockOnIdleClient(t *testing.T) {
 		t.Fatalf("status behind idle client: %v", err)
 	}
 	cancel()
-	if err := listener.Close(); err != nil {
-		t.Fatal(err)
-	}
 	select {
 	case err := <-done:
 		if err != nil {
@@ -3689,6 +3686,28 @@ func TestServicePathDoesNotExportCheckoutForRelativeCommands(t *testing.T) {
 	}
 }
 
+func TestServicePathUsesGitRootForNestedConfig(t *testing.T) {
+	repo := t.TempDir()
+	configDir := filepath.Join(repo, "config")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	git(t, repo, "init", "-q")
+	runner := filepath.Join(configDir, "runner")
+	if err := os.WriteFile(runner, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path, err := servicePath(Config{Tasks: map[string]Task{"unit": {Run: []string{"./runner"}}}}, configDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, directory := range filepath.SplitList(path) {
+		if pathWithin(repo, directory) {
+			t.Fatalf("service PATH exports nested Git checkout: %q", path)
+		}
+	}
+}
+
 func TestServicePathAllowsBareTaskExecutableCreatedByPrepare(t *testing.T) {
 	checkout := t.TempDir()
 	_, err := servicePath(Config{Prepare: []string{"true"}, Tasks: map[string]Task{"unit": {Run: []string{"unit"}, Env: map[string]string{"PATH": "."}}}}, checkout)
@@ -3884,6 +3903,9 @@ func TestRecordedSHAScriptCannotMutateSourceRefs(t *testing.T) {
 	}
 	if jobs[0].State != "passed" {
 		t.Fatalf("isolated Git script job = %#v", jobs[0])
+	}
+	if _, err := os.Stat(filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", jobs[0].ID), ".git", "objects", "info", "alternates")); !os.IsNotExist(err) {
+		t.Fatalf("recorded checkout still exposes source alternates: %v", err)
 	}
 	if got := git(t, checkout, "rev-parse", "refs/heads/main"); got != wantMain {
 		t.Fatalf("source main ref = %q, want %q", got, wantMain)

@@ -76,12 +76,21 @@ func servicePath(config Config, checkout string) (string, error) {
 	if path := os.Getenv("BITCI_PATH"); path != "" {
 		return path, nil
 	}
+	gitRoot := ""
+	if output, err := exec.Command("git", "-C", checkout, "rev-parse", "--show-toplevel").Output(); err == nil {
+		gitRoot = filepath.Clean(strings.TrimSpace(string(output)))
+	}
 	directories := make([]string, 0, len(config.Tasks)+6)
 	seen := map[string]bool{}
 	add := func(directory string) {
 		if directory != "" && !seen[directory] {
 			seen[directory] = true
 			directories = append(directories, directory)
+		}
+	}
+	addOutsideCheckout := func(directory string) {
+		if gitRoot == "" || !pathWithin(gitRoot, directory) {
+			add(directory)
 		}
 	}
 	commands := make([]struct {
@@ -121,7 +130,7 @@ func servicePath(config Config, checkout string) (string, error) {
 				return "", fmt.Errorf("configured command %q is a directory", command)
 			}
 			if absolute {
-				add(filepath.Dir(command))
+				addOutsideCheckout(filepath.Dir(command))
 			}
 			continue
 		}
@@ -133,7 +142,7 @@ func servicePath(config Config, checkout string) (string, error) {
 			return "", fmt.Errorf("resolve configured command %q: %w", command, err)
 		}
 		if _, configuredPath := configured.environment["PATH"]; !configuredPath {
-			add(filepath.Dir(resolved))
+			addOutsideCheckout(filepath.Dir(resolved))
 		}
 	}
 	for _, directory := range []string{"/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"} {
