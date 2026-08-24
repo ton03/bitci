@@ -166,6 +166,104 @@ func TestResourceLeaseBlocksSecondClaim(t *testing.T) {
 	}
 }
 
+func TestRecordedSHAJobsOverlapWithMultipleWorkers(t *testing.T) {
+	controller, events := recordedSHAConcurrentController(t, false)
+	defer controller.Close()
+
+	jobs, err := controller.Submit([]string{"first"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstSHA := jobs[0].Ref
+	jobs, err = controller.Submit([]string{"second"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].Ref != firstSHA {
+		t.Fatalf("recorded SHA = %q, want %q", jobs[0].Ref, firstSHA)
+	}
+
+	results := make(chan error, 2)
+	for range 2 {
+		go func() {
+			ran, err := controller.RunOnce(context.Background(), 2)
+			if err == nil && !ran {
+				err = fmt.Errorf("worker did not run a queued job")
+			}
+			results <- err
+		}()
+	}
+	awaitFile(t, filepath.Join(events, "first.started"))
+	awaitFile(t, filepath.Join(events, "second.started"))
+
+	stored, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 2 {
+		t.Fatalf("job count = %d, want 2", len(stored))
+	}
+	for _, job := range stored {
+		if job.State != "running" || job.TestedSHA != firstSHA {
+			t.Fatalf("overlapping recorded SHA job = %#v", job)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(events, "release"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertJobsPassed(t, controller)
+}
+
+func TestRecordedSHAJobsWithSameResourceSerialize(t *testing.T) {
+	controller, events := recordedSHAConcurrentController(t, true)
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"first"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.Submit([]string{"second"}, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		ran, err := controller.RunOnce(context.Background(), 2)
+		if err == nil && !ran {
+			err = fmt.Errorf("worker did not run the first queued job")
+		}
+		result <- err
+	}()
+	awaitFile(t, filepath.Join(events, "first.started"))
+	if ran, err := controller.RunOnce(context.Background(), 2); err != nil || ran {
+		t.Fatalf("same-resource claim = %v, %v", ran, err)
+	}
+	stored, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 2 {
+		t.Fatalf("job count = %d, want 2", len(stored))
+	}
+	if stored[0].State != "running" || stored[1].State != "queued" {
+		t.Fatalf("same-resource jobs = %#v", stored)
+	}
+
+	if err := os.WriteFile(filepath.Join(events, "release"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 2); err != nil || !ran {
+		t.Fatalf("run serialized job = %v, %v", ran, err)
+	}
+	assertJobsPassed(t, controller)
+}
+
 func TestResourceLeaseUsesLowestActiveSnapshotLimit(t *testing.T) {
 	configPath := writeConfig(t, `{
 		"version": 1,
@@ -1661,4 +1759,64 @@ func git(t *testing.T, directory string, args ...string) string {
 		t.Fatalf("git %v: %v: %s", args, err, output)
 	}
 	return strings.TrimSpace(string(output))
+}
+
+func recordedSHAConcurrentController(t *testing.T, sameResource bool) (*Controller, string) {
+	t.Helper()
+	checkout := t.TempDir()
+	events := t.TempDir()
+	t.Cleanup(func() { _ = os.WriteFile(filepath.Join(events, "release"), nil, 0o600) })
+	resources, taskResource := "", ""
+	if sameResource {
+		resources = `,"resources":{"browser":1}`
+		taskResource = `,"resources":["browser"]`
+	}
+	config := fmt.Sprintf(`{"version":1%s,"tasks":{"first":{"run":["sh","runner","first",%q]%s},"second":{"run":["sh","runner","second",%q]%s}}}`,
+		resources, events, taskResource, events, taskResource)
+	if err := os.WriteFile(filepath.Join(checkout, "bitci.json"), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := "#!/bin/sh\nset -eu\nname=$1\nevents=$2\n: > \"$events/$name.started\"\nwhile [ ! -f \"$events/release\" ]; do sleep 0.01; done\n"
+	if err := os.WriteFile(filepath.Join(checkout, "runner"), []byte(runner), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json", "runner")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(filepath.Join(checkout, "bitci.json"), filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return controller, events
+}
+
+func awaitFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		} else if !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", path)
+}
+
+func assertJobsPassed(t *testing.T, controller *Controller) {
+	t.Helper()
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 2 {
+		t.Fatalf("job count = %d, want 2", len(jobs))
+	}
+	for _, job := range jobs {
+		if job.State != "passed" {
+			lines, _ := controller.TailLog(job.ID, 80)
+			t.Fatalf("job = %#v\n%s", job, strings.Join(lines, "\n"))
+		}
+	}
 }
