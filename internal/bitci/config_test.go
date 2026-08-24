@@ -61,6 +61,23 @@ func TestDefaultStateDirStaysOutsideCheckout(t *testing.T) {
 	}
 }
 
+func TestOpenRejectsStateInsideGitMetadata(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	controller, err := Open(configPath, filepath.Join(checkout, ".git"))
+	if err == nil {
+		controller.Close()
+		t.Fatal("opened state inside Git metadata")
+	}
+	if !strings.Contains(err.Error(), "state directory must not overlap Git metadata") {
+		t.Fatalf("Open error = %v", err)
+	}
+}
+
 func TestQueueContract(t *testing.T) {
 	configPath := writeConfig(t, `{
 		"version": 1,
@@ -224,6 +241,53 @@ func TestRecoverInterruptedRemovesJobWorktree(t *testing.T) {
 	}
 	if _, err := os.Lstat(path); !os.IsNotExist(err) {
 		t.Fatalf("interrupted worktree remains: %v", err)
+	}
+}
+
+func TestRecoverInterruptedRemovesWorktreeAfterCheckoutDisappears(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		controller.Close()
+		t.Fatal(err)
+	}
+	if _, claimed, err := controller.claim(1); err != nil || !claimed {
+		controller.Close()
+		t.Fatalf("claim = %v, %v", claimed, err)
+	}
+	path := filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", jobs[0].ID))
+	if _, err := controller.git(context.Background(), "worktree", "add", "--detach", path, jobs[0].Ref); err != nil {
+		controller.Close()
+		t.Fatal(err)
+	}
+	if err := controller.Close(); err != nil {
+		t.Fatal(err)
+	}
+	movedCheckout := checkout + "-moved"
+	if err := os.Rename(checkout, movedCheckout); err != nil {
+		t.Fatal(err)
+	}
+	controller, err = OpenState(configPath, filepath.Join(filepath.Dir(path), ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if err := controller.RecoverInterrupted(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Fatalf("worktree remains after missing checkout: %v", err)
 	}
 }
 

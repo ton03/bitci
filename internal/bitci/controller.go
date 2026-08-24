@@ -51,7 +51,19 @@ func Open(configPath, stateDir string) (*Controller, error) {
 	if err != nil {
 		return nil, err
 	}
-	controller, err := OpenState(configPath, stateDir)
+	absoluteConfig, err := filepath.Abs(configPath)
+	if err != nil {
+		return nil, err
+	}
+	stateDir = DefaultStateDir(absoluteConfig, stateDir)
+	absoluteState, err := filepath.Abs(stateDir)
+	if err != nil {
+		return nil, err
+	}
+	if gitDirectory, err := gitCommonDirectory(absoluteConfig); err == nil && pathsOverlap(absoluteState, gitDirectory) {
+		return nil, fmt.Errorf("state directory must not overlap Git metadata")
+	}
+	controller, err := OpenState(absoluteConfig, absoluteState)
 	if err != nil {
 		return nil, err
 	}
@@ -347,6 +359,27 @@ func checkoutLocation(configPath string) (string, string, error) {
 	return root, relative, nil
 }
 
+func gitCommonDirectory(configPath string) (string, error) {
+	configDirectory, err := filepath.EvalSymlinks(filepath.Dir(configPath))
+	if err != nil {
+		return "", fmt.Errorf("resolve config directory: %w", err)
+	}
+	command := exec.Command("git", "-C", configDirectory, "rev-parse", "--git-common-dir")
+	output, err := command.Output()
+	if err != nil {
+		return "", fmt.Errorf("find Git metadata directory: %w", err)
+	}
+	directory := strings.TrimSpace(string(output))
+	if !filepath.IsAbs(directory) {
+		directory = filepath.Join(configDirectory, directory)
+	}
+	directory, err = filepath.EvalSymlinks(directory)
+	if err != nil {
+		return "", fmt.Errorf("resolve Git metadata directory: %w", err)
+	}
+	return directory, nil
+}
+
 func checkoutSHA(directory string) (string, error) {
 	command := exec.Command("git", "-C", directory, "rev-parse", "--verify", "HEAD^{commit}")
 	output, err := command.Output()
@@ -520,9 +553,17 @@ func (controller *Controller) removeJobWorktree(id int64, checkoutRoot string) e
 		checkoutRoot = controller.gitDirectory()
 	}
 	var failures []error
+	checkoutMissing := false
+	if _, err := os.Stat(checkoutRoot); os.IsNotExist(err) {
+		checkoutMissing = true
+	} else if err != nil {
+		failures = append(failures, err)
+	}
 	if _, err := os.Lstat(path); err == nil {
-		if _, err := gitAt(context.Background(), checkoutRoot, "worktree", "remove", "--force", path); err != nil {
-			failures = append(failures, err)
+		if !checkoutMissing {
+			if _, err := gitAt(context.Background(), checkoutRoot, "worktree", "remove", "--force", path); err != nil {
+				failures = append(failures, err)
+			}
 		}
 	} else if !os.IsNotExist(err) {
 		failures = append(failures, err)
@@ -530,8 +571,10 @@ func (controller *Controller) removeJobWorktree(id int64, checkoutRoot string) e
 	if err := os.RemoveAll(path); err != nil {
 		failures = append(failures, err)
 	}
-	if _, err := gitAt(context.Background(), checkoutRoot, "worktree", "prune"); err != nil {
-		failures = append(failures, err)
+	if !checkoutMissing {
+		if _, err := gitAt(context.Background(), checkoutRoot, "worktree", "prune"); err != nil {
+			failures = append(failures, err)
+		}
 	}
 	return errors.Join(failures...)
 }
