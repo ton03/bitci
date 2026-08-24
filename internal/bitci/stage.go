@@ -82,7 +82,10 @@ func (controller *Controller) StagePR(ctx context.Context, number int, token str
 }
 
 func (controller *Controller) protectStateFromTarget(ctx context.Context, sha string) error {
-	relative, ok := controller.checkoutStatePath()
+	relative, ok, err := controller.checkoutStatePath()
+	if err != nil {
+		return err
+	}
 	if !ok {
 		return nil
 	}
@@ -158,7 +161,11 @@ func resolvedPathForComparison(path string) string {
 
 func (controller *Controller) cleanCheckout(ctx context.Context) error {
 	args := []string{"status", "--porcelain", "--untracked-files=all"}
-	if relative, ok := controller.checkoutStatePath(); ok {
+	relative, ok, err := controller.checkoutStatePath()
+	if err != nil {
+		return err
+	}
+	if ok {
 		tracked, err := controller.git(ctx, "ls-files", "--", ":(top,literal)"+filepath.ToSlash(relative))
 		if err != nil {
 			return err
@@ -178,24 +185,48 @@ func (controller *Controller) cleanCheckout(ctx context.Context) error {
 	return nil
 }
 
-func (controller *Controller) checkoutStatePath() (string, bool) {
-	checkout, err := controller.git(context.Background(), "rev-parse", "--show-toplevel")
-	if err != nil {
-		return "", false
+func (controller *Controller) checkoutStatePath() (string, bool, error) {
+	checkout := controller.gitDirectory()
+	if controller.checkoutRoot != "" {
+		checkout = filepath.Dir(controller.configPath)
+		if controller.configRelative != "" && controller.configRelative != "." {
+			for range strings.Split(controller.configRelative, string(filepath.Separator)) {
+				checkout = filepath.Dir(checkout)
+			}
+		}
 	}
-	checkout, err = filepath.EvalSymlinks(strings.TrimSpace(checkout))
-	if err != nil {
-		return "", false
-	}
-	state, err := filepath.EvalSymlinks(controller.stateDir)
-	if err != nil {
-		return "", false
-	}
+	checkout = filepath.Clean(checkout)
+	state := filepath.Clean(controller.stateDir)
 	relative, err := filepath.Rel(checkout, state)
 	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return "", false
+		return "", false, nil
 	}
-	return relative, true
+	usesSymlink, err := pathUsesSymlink(checkout, relative)
+	if err != nil {
+		return "", false, err
+	}
+	if usesSymlink {
+		return "", false, fmt.Errorf("state directory must not use a symlink inside the checkout")
+	}
+	return relative, true, nil
+}
+
+func pathUsesSymlink(root, relative string) (bool, error) {
+	path := root
+	for _, part := range strings.Split(relative, string(filepath.Separator)) {
+		path = filepath.Join(path, part)
+		info, err := os.Lstat(path)
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (controller *Controller) git(ctx context.Context, args ...string) (string, error) {

@@ -1523,6 +1523,40 @@ func TestCleanGeneratedNextRejectsStateOverlap(t *testing.T) {
 	}
 }
 
+func TestStageRejectsSymlinkedInCheckoutState(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(filepath.Join(checkout, ".gitignore"), []byte(".bitci/\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", ".")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	stateTarget := filepath.Join(t.TempDir(), "state")
+	if err := os.MkdirAll(stateTarget, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stateDir := filepath.Join(checkout, ".bitci")
+	if err := os.Symlink(stateTarget, stateDir); err != nil {
+		t.Fatal(err)
+	}
+	controller, err := Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if err := controller.cleanCheckout(context.Background()); err == nil || !strings.Contains(err.Error(), "must not use a symlink") {
+		t.Fatalf("clean checkout error = %v", err)
+	}
+	sha := git(t, checkout, "rev-parse", "HEAD")
+	if err := controller.protectStateFromTarget(context.Background(), sha); err == nil || !strings.Contains(err.Error(), "must not use a symlink") {
+		t.Fatalf("target state protection error = %v", err)
+	}
+}
+
 func TestStagePRChecksTrustAndCleansNext(t *testing.T) {
 	checkout := t.TempDir()
 	configPath := filepath.Join(checkout, "bitci.json")
