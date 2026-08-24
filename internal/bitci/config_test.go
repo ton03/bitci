@@ -615,6 +615,71 @@ func TestJobRunsFromNestedConfigDirectoryWithRelativeState(t *testing.T) {
 	}
 }
 
+func TestJobCheckoutFailureDoesNotPanicOnCleanup(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	jobs, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", jobs[0].ID)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	stored, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored[0].State != "failed" || stored[0].ExitCode == nil || *stored[0].ExitCode != 126 {
+		t.Fatalf("failed checkout job = %#v", stored[0])
+	}
+}
+
+func TestNestedConfigChecksWholeCheckout(t *testing.T) {
+	checkout := t.TempDir()
+	configDir := filepath.Join(checkout, "ci")
+	configPath := filepath.Join(configDir, "bitci.json")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, ".gitignore"), []byte(".bitci/\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", ".")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(checkout, ".bitci"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if err := controller.cleanCheckout(context.Background()); err != nil {
+		t.Fatalf("clean nested checkout = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, "outside"), []byte("dirty"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.cleanCheckout(context.Background()); err == nil {
+		t.Fatal("nested config missed root-level checkout dirt")
+	}
+}
+
 func TestStagePRChecksTrustAndCleansNext(t *testing.T) {
 	checkout := t.TempDir()
 	configPath := filepath.Join(checkout, "bitci.json")

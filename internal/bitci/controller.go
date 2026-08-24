@@ -236,17 +236,18 @@ func checkoutSHA(directory string) (string, error) {
 }
 
 func (controller *Controller) jobCheckout(ctx context.Context, job Job) (string, func() error, error) {
+	cleanup := func() error { return nil }
 	root := filepath.Join(controller.stateDir, "worktrees")
 	path := filepath.Join(root, fmt.Sprintf("job-%d", job.ID))
 	if err := os.MkdirAll(root, 0o700); err != nil {
-		return "", nil, err
+		return "", cleanup, err
 	}
 	if _, err := os.Lstat(path); err == nil {
-		return "", nil, fmt.Errorf("job worktree already exists")
+		return "", cleanup, fmt.Errorf("job worktree already exists")
 	} else if !os.IsNotExist(err) {
-		return "", nil, err
+		return "", cleanup, err
 	}
-	cleanup := func() error {
+	cleanup = func() error {
 		var failures []error
 		if _, err := os.Lstat(path); err == nil {
 			if _, err := controller.git(context.Background(), "worktree", "remove", "--force", path); err != nil {
@@ -264,20 +265,14 @@ func (controller *Controller) jobCheckout(ctx context.Context, job Job) (string,
 		return errors.Join(failures...)
 	}
 	if _, err := controller.git(ctx, "worktree", "add", "--detach", path, job.Ref); err != nil {
-		return "", nil, fmt.Errorf("create job worktree: %w", errors.Join(err, cleanup()))
+		return "", cleanup, fmt.Errorf("create job worktree: %w", err)
 	}
 	sha, err := checkoutSHA(path)
 	if err != nil || sha != job.Ref {
-		if cleanupErr := cleanup(); cleanupErr != nil {
-			return "", nil, fmt.Errorf("verify job worktree SHA and remove worktree: %w", cleanupErr)
-		}
-		return "", nil, fmt.Errorf("verify job worktree SHA")
+		return "", cleanup, fmt.Errorf("verify job worktree SHA")
 	}
 	if _, err := controller.db.Exec("UPDATE jobs SET tested_sha = ? WHERE id = ?", sha, job.ID); err != nil {
-		if cleanupErr := cleanup(); cleanupErr != nil {
-			return "", nil, fmt.Errorf("record tested SHA and remove worktree: %w", cleanupErr)
-		}
-		return "", nil, err
+		return "", cleanup, err
 	}
 	checkout, err := controller.git(ctx, "rev-parse", "--show-toplevel")
 	if err != nil {
