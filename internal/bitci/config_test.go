@@ -79,6 +79,31 @@ func TestOpenRejectsStateInsideGitMetadata(t *testing.T) {
 	}
 }
 
+func TestOpenRejectsStateInsideGitMetadataThroughUncreatedSymlinkDescendant(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	link := filepath.Join(checkout, "meta")
+	if err := os.Symlink(".git", link); err != nil {
+		t.Fatal(err)
+	}
+	stateDir := filepath.Join(link, "new-state")
+	controller, err := Open(configPath, stateDir)
+	if err == nil {
+		controller.Close()
+		t.Fatal("opened state inside Git metadata through a symlink")
+	}
+	if !strings.Contains(err.Error(), "state directory must not overlap Git metadata") {
+		t.Fatalf("Open error = %v", err)
+	}
+	if _, err := os.Stat(stateDir); !os.IsNotExist(err) {
+		t.Fatalf("created rejected state directory: %v", err)
+	}
+}
+
 func TestQueueContract(t *testing.T) {
 	configPath := writeConfig(t, `{
 		"version": 1,

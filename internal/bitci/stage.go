@@ -130,15 +130,30 @@ func (controller *Controller) cleanGeneratedNext(ctx context.Context) error {
 }
 
 func pathsOverlap(first, second string) bool {
-	first = filepath.Clean(first)
-	second = filepath.Clean(second)
-	if resolved, err := filepath.EvalSymlinks(first); err == nil {
-		first = resolved
-	}
-	if resolved, err := filepath.EvalSymlinks(second); err == nil {
-		second = resolved
-	}
+	first = resolvedPathForComparison(first)
+	second = resolvedPathForComparison(second)
 	return pathWithin(first, second) || pathWithin(second, first)
+}
+
+// resolvedPathForComparison resolves the deepest existing ancestor. It keeps
+// overlap checks safe for paths that do not yet exist below a symlink.
+func resolvedPathForComparison(path string) string {
+	path = filepath.Clean(path)
+	var missing []string
+	for {
+		if resolved, err := filepath.EvalSymlinks(path); err == nil {
+			for index := len(missing) - 1; index >= 0; index-- {
+				resolved = filepath.Join(resolved, missing[index])
+			}
+			return filepath.Clean(resolved)
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			return path
+		}
+		missing = append(missing, filepath.Base(path))
+		path = parent
+	}
 }
 
 func (controller *Controller) cleanCheckout(ctx context.Context) error {
