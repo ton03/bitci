@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -30,14 +31,15 @@ type Controller struct {
 }
 
 type Job struct {
-	ID        int64  `json:"id"`
-	Batch     string `json:"batch"`
-	Task      string `json:"task"`
-	Ref       string `json:"ref"`
-	TestedSHA string `json:"tested_sha,omitempty"`
-	State     string `json:"state"`
-	ExitCode  *int   `json:"exit_code,omitempty"`
-	LogPath   string `json:"log_path,omitempty"`
+	ID         int64  `json:"id"`
+	Batch      string `json:"batch"`
+	Task       string `json:"task"`
+	Ref        string `json:"ref"`
+	TestedSHA  string `json:"tested_sha,omitempty"`
+	State      string `json:"state"`
+	ExitCode   *int   `json:"exit_code,omitempty"`
+	LogPath    string `json:"log_path,omitempty"`
+	configJSON string
 }
 
 func Open(configPath, stateDir string) (*Controller, error) {
@@ -118,7 +120,8 @@ func (controller *Controller) migrate() error {
 			finished_at TEXT,
 			exit_code INTEGER,
 			log_path TEXT,
-			tested_sha TEXT
+			tested_sha TEXT,
+			config_json TEXT
 		);
 		CREATE INDEX IF NOT EXISTS jobs_queue ON jobs(state, id);
 		CREATE TABLE IF NOT EXISTS leases (
@@ -130,19 +133,23 @@ func (controller *Controller) migrate() error {
 	if err != nil {
 		return err
 	}
-	hasColumn, err := controller.hasTestedSHAColumn()
-	if err != nil {
+	if err := controller.addJobColumn("tested_sha", "TEXT"); err != nil {
 		return err
 	}
-	if hasColumn {
-		return nil
+	return controller.addJobColumn("config_json", "TEXT")
+}
+
+func (controller *Controller) addJobColumn(name, definition string) error {
+	hasColumn, err := controller.hasJobColumn(name)
+	if err != nil || hasColumn {
+		return err
 	}
-	if _, alterErr := controller.db.Exec("ALTER TABLE jobs ADD COLUMN tested_sha TEXT"); alterErr == nil {
+	if _, alterErr := controller.db.Exec("ALTER TABLE jobs ADD COLUMN " + name + " " + definition); alterErr == nil {
 		return nil
 	} else {
 		err = alterErr
 	}
-	hasColumn, checkErr := controller.hasTestedSHAColumn()
+	hasColumn, checkErr := controller.hasJobColumn(name)
 	if checkErr != nil {
 		return checkErr
 	}
@@ -152,10 +159,10 @@ func (controller *Controller) migrate() error {
 	return err
 }
 
-func (controller *Controller) hasTestedSHAColumn() (bool, error) {
-	if _, err := controller.db.Exec("SELECT tested_sha FROM jobs LIMIT 0"); err == nil {
+func (controller *Controller) hasJobColumn(name string) (bool, error) {
+	if _, err := controller.db.Exec("SELECT " + name + " FROM jobs LIMIT 0"); err == nil {
 		return true, nil
-	} else if strings.Contains(err.Error(), "no such column: tested_sha") {
+	} else if strings.Contains(err.Error(), "no such column: "+name) {
 		return false, nil
 	} else {
 		return false, err
@@ -180,10 +187,14 @@ func (controller *Controller) Submit(taskNames []string, ref string) ([]Job, err
 	}
 	defer transaction.Rollback()
 	jobs := make([]Job, 0, len(ordered))
+	configJSON, err := json.Marshal(controller.config)
+	if err != nil {
+		return nil, err
+	}
 	for _, taskName := range ordered {
 		result, err := transaction.Exec(
-			"INSERT INTO jobs(batch, task, ref, state, created_at) VALUES (?, ?, ?, 'queued', ?)",
-			batch, taskName, ref, time.Now().UTC().Format(time.RFC3339),
+			"INSERT INTO jobs(batch, task, ref, config_json, state, created_at) VALUES (?, ?, ?, ?, 'queued', ?)",
+			batch, taskName, ref, configJSON, time.Now().UTC().Format(time.RFC3339),
 		)
 		if err != nil {
 			return nil, err
@@ -211,7 +222,10 @@ func (controller *Controller) RunOnce(ctx context.Context, maxWorkers int) (bool
 	if err != nil || !claimed {
 		return false, err
 	}
-	task := controller.config.Tasks[job.Task]
+	_, task, err := controller.jobConfig(job)
+	if err != nil {
+		return true, controller.finish(job, 127)
+	}
 	logFile, err := controller.startLog(&job)
 	if err != nil {
 		return true, controller.finish(job, 127)
@@ -230,7 +244,12 @@ func (controller *Controller) RunOnce(ctx context.Context, maxWorkers int) (bool
 			return true, controller.finish(job, 126)
 		}
 	}
-	code := controller.execute(ctx, task, logFile, workDir)
+	code := 126
+	if isCheckoutSHA(job.Ref) && controller.isCheckoutExecutable(task.Run[0]) {
+		fmt.Fprintln(logFile, "BitCI refuses a checkout-local absolute task executable for a recorded SHA job")
+	} else {
+		code = controller.execute(ctx, task, logFile, workDir)
+	}
 	if err := cleanup(); err != nil {
 		fmt.Fprintln(logFile, "BitCI could not remove job worktree:", err)
 		if code == 0 {
@@ -466,23 +485,27 @@ func (controller *Controller) claim(maxWorkers int) (Job, bool, error) {
 	if active >= maxWorkers {
 		return Job{}, false, nil
 	}
-	rows, err := transaction.Query("SELECT id, batch, task, ref, state FROM jobs WHERE state = 'queued' ORDER BY id")
+	rows, err := transaction.Query("SELECT id, batch, task, ref, COALESCE(config_json, ''), state FROM jobs WHERE state = 'queued' ORDER BY id")
 	if err != nil {
 		return Job{}, false, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Batch, &job.Task, &job.Ref, &job.State); err != nil {
+		if err := rows.Scan(&job.ID, &job.Batch, &job.Task, &job.Ref, &job.configJSON, &job.State); err != nil {
 			return Job{}, false, err
 		}
-		if ready, err := controller.ready(transaction, job); err != nil || !ready {
+		config, task, err := controller.jobConfig(job)
+		if err != nil {
+			return Job{}, false, err
+		}
+		if ready, err := controller.ready(transaction, job, task); err != nil || !ready {
 			if err != nil {
 				return Job{}, false, err
 			}
 			continue
 		}
-		if free, err := controller.resourcesFree(transaction, job); err != nil || !free {
+		if free, err := controller.resourcesFree(transaction, task, config); err != nil || !free {
 			if err != nil {
 				return Job{}, false, err
 			}
@@ -491,7 +514,7 @@ func (controller *Controller) claim(maxWorkers int) (Job, bool, error) {
 		if _, err := transaction.Exec("UPDATE jobs SET state = 'running', started_at = ? WHERE id = ?", time.Now().UTC().Format(time.RFC3339), job.ID); err != nil {
 			return Job{}, false, err
 		}
-		for _, resource := range controller.config.Tasks[job.Task].Resources {
+		for _, resource := range task.Resources {
 			if _, err := transaction.Exec("INSERT INTO leases(resource, job_id) VALUES (?, ?)", resource, job.ID); err != nil {
 				return Job{}, false, err
 			}
@@ -502,8 +525,8 @@ func (controller *Controller) claim(maxWorkers int) (Job, bool, error) {
 	return Job{}, false, rows.Err()
 }
 
-func (controller *Controller) ready(transaction *sql.Tx, job Job) (bool, error) {
-	for _, need := range controller.config.Tasks[job.Task].Needs {
+func (controller *Controller) ready(transaction *sql.Tx, job Job, task Task) (bool, error) {
+	for _, need := range task.Needs {
 		var state string
 		err := transaction.QueryRow("SELECT state FROM jobs WHERE batch = ? AND task = ?", job.Batch, need).Scan(&state)
 		if err != nil {
@@ -516,17 +539,54 @@ func (controller *Controller) ready(transaction *sql.Tx, job Job) (bool, error) 
 	return true, nil
 }
 
-func (controller *Controller) resourcesFree(transaction *sql.Tx, job Job) (bool, error) {
-	for _, resource := range controller.config.Tasks[job.Task].Resources {
+func (controller *Controller) resourcesFree(transaction *sql.Tx, task Task, config Config) (bool, error) {
+	for _, resource := range task.Resources {
 		var held int
 		if err := transaction.QueryRow("SELECT COUNT(*) FROM leases WHERE resource = ?", resource).Scan(&held); err != nil {
 			return false, err
 		}
-		if held >= controller.config.Resources[resource] {
+		if held >= config.Resources[resource] {
 			return false, nil
 		}
 	}
 	return true, nil
+}
+
+func (controller *Controller) jobConfig(job Job) (Config, Task, error) {
+	config := controller.config
+	if job.configJSON != "" {
+		if err := json.Unmarshal([]byte(job.configJSON), &config); err != nil {
+			return Config{}, Task{}, fmt.Errorf("decode queued job configuration: %w", err)
+		}
+		if err := config.Validate(); err != nil {
+			return Config{}, Task{}, fmt.Errorf("validate queued job configuration: %w", err)
+		}
+	}
+	task, ok := config.Tasks[job.Task]
+	if !ok {
+		return Config{}, Task{}, fmt.Errorf("queued job references unknown task %q", job.Task)
+	}
+	return config, task, nil
+}
+
+func (controller *Controller) isCheckoutExecutable(command string) bool {
+	if !filepath.IsAbs(command) {
+		return false
+	}
+	checkout, err := controller.git(context.Background(), "rev-parse", "--show-toplevel")
+	if err != nil {
+		return false
+	}
+	root, err := filepath.EvalSymlinks(strings.TrimSpace(checkout))
+	if err != nil {
+		return false
+	}
+	path, err := filepath.EvalSymlinks(command)
+	if err != nil {
+		path = command
+	}
+	relative, err := filepath.Rel(root, path)
+	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
 }
 
 func (controller *Controller) startLog(job *Job) (*os.File, error) {
@@ -546,6 +606,10 @@ func (controller *Controller) startLog(job *Job) (*os.File, error) {
 }
 
 func (controller *Controller) execute(parent context.Context, task Task, output io.Writer, directory string) int {
+	if len(task.Run) == 0 || task.Run[0] == "" {
+		fmt.Fprintln(output, "BitCI job has no configured command")
+		return 127
+	}
 	ctx := parent
 	var cancel context.CancelFunc
 	if task.Timeout > 0 {
