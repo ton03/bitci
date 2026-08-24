@@ -581,7 +581,7 @@ func (controller *Controller) removeJobWorktree(id int64, checkoutRoot string) e
 		checkoutMissing = true
 	} else if err != nil {
 		failures = append(failures, err)
-	} else if _, err := gitAt(context.Background(), checkoutRoot, "rev-parse", "--git-dir"); err != nil {
+	} else if topLevel, err := gitAt(context.Background(), checkoutRoot, "rev-parse", "--show-toplevel"); err != nil || resolvedPathForComparison(strings.TrimSpace(topLevel)) != resolvedPathForComparison(checkoutRoot) {
 		checkoutMissing = true
 	}
 	if _, err := os.Lstat(path); err == nil {

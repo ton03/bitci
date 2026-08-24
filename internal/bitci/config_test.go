@@ -327,6 +327,7 @@ func TestRecoverInterruptedRemovesWorktreeAfterCheckoutDisappears(t *testing.T) 
 	if err := os.Mkdir(checkout, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	git(t, filepath.Dir(checkout), "init", "-q")
 	controller, err = OpenState(configPath, filepath.Join(filepath.Dir(path), ".."))
 	if err != nil {
 		t.Fatal(err)
