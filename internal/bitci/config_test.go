@@ -2795,9 +2795,12 @@ func TestServiceStartDoesNotReplaceExistingPlist(t *testing.T) {
 	if err := os.WriteFile(service.PlistPath, []byte("existing"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	started, _ := service.Start()
+	started, err := service.Start()
 	if started {
 		t.Fatal("start replaced existing service")
+	}
+	if err == nil || !strings.Contains(err.Error(), "existing service") {
+		t.Fatalf("start error = %v", err)
 	}
 	content, err := os.ReadFile(service.PlistPath)
 	if err != nil {

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 )
 
 type Service struct {
@@ -28,12 +29,38 @@ func NewService(configPath, stateDir string, maxWorkers int) (Service, error) {
 }
 
 func NewServiceWithHTTP(configPath, stateDir string, maxWorkers int, httpAddress string) (Service, error) {
-	if runtime.GOOS != "darwin" {
-		return Service{}, fmt.Errorf("managed service currently requires macOS")
-	}
-	config, err := LoadConfig(configPath)
+	service, err := serviceIdentity(configPath, stateDir)
 	if err != nil {
 		return Service{}, err
+	}
+	config, err := LoadConfig(service.ConfigPath)
+	if err != nil {
+		return Service{}, err
+	}
+	if maxWorkers < 1 {
+		return Service{}, fmt.Errorf("max-workers must be positive")
+	}
+	if httpAddress != "" {
+		if err := validateDashboardAddress(httpAddress); err != nil {
+			return Service{}, err
+		}
+	}
+	service.MaxWorkers = maxWorkers
+	service.HTTPAddress = httpAddress
+	service.PathEnv, err = servicePath(config, filepath.Dir(service.ConfigPath))
+	if err != nil {
+		return Service{}, err
+	}
+	return service, nil
+}
+
+func NewServiceForStop(configPath, stateDir string) (Service, error) {
+	return serviceIdentity(configPath, stateDir)
+}
+
+func serviceIdentity(configPath, stateDir string) (Service, error) {
+	if runtime.GOOS != "darwin" {
+		return Service{}, fmt.Errorf("managed service currently requires macOS")
 	}
 	absoluteConfig, err := filepath.Abs(configPath)
 	if err != nil {
@@ -46,38 +73,24 @@ func NewServiceWithHTTP(configPath, stateDir string, maxWorkers int, httpAddress
 	if err != nil {
 		return Service{}, err
 	}
-	binary, err := os.Executable()
-	if err != nil {
-		return Service{}, err
-	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return Service{}, err
 	}
-	if maxWorkers < 1 {
-		return Service{}, fmt.Errorf("max-workers must be positive")
-	}
-	if httpAddress != "" {
-		if err := validateDashboardAddress(httpAddress); err != nil {
-			return Service{}, err
-		}
+	binary, err := os.Executable()
+	if err != nil {
+		return Service{}, err
 	}
 	digest := sha256.Sum256([]byte(absoluteConfig))
 	label := fmt.Sprintf("com.bitci.%x", digest[:6])
 	service := Service{
-		Label:       label,
-		ConfigPath:  absoluteConfig,
-		StateDir:    absoluteState,
-		MaxWorkers:  maxWorkers,
-		HTTPAddress: httpAddress,
-		BinaryPath:  binary,
-		PathEnv:     "",
-		PlistPath:   filepath.Join(home, "Library", "LaunchAgents", label+".plist"),
-		Domain:      fmt.Sprintf("gui/%d", os.Getuid()),
-	}
-	service.PathEnv, err = servicePath(config, filepath.Dir(absoluteConfig))
-	if err != nil {
-		return Service{}, err
+		Label:      label,
+		ConfigPath: absoluteConfig,
+		StateDir:   absoluteState,
+		BinaryPath: binary,
+		PathEnv:    "",
+		PlistPath:  filepath.Join(home, "Library", "LaunchAgents", label+".plist"),
+		Domain:     fmt.Sprintf("gui/%d", os.Getuid()),
 	}
 	return service, nil
 }
@@ -142,8 +155,14 @@ func servicePath(config Config, checkout string) (string, error) {
 }
 
 func (service Service) Install() error {
-	if err := service.ensureNoActiveJobs(); err != nil {
-		return err
+	return service.install(true)
+}
+
+func (service Service) install(checkActiveJobs bool) error {
+	if checkActiveJobs {
+		if err := service.ensureNoActiveJobs(); err != nil {
+			return err
+		}
 	}
 	if err := os.MkdirAll(filepath.Dir(service.PlistPath), 0o700); err != nil {
 		return err
@@ -167,6 +186,18 @@ func (service Service) Install() error {
 // Start creates the managed service when absent. It does not replace a running
 // service, so repeated project-root starts do not interrupt queued work.
 func (service Service) Start() (bool, error) {
+	if err := os.MkdirAll(service.StateDir, 0o700); err != nil {
+		return false, err
+	}
+	lock, err := os.OpenFile(filepath.Join(service.StateDir, "service.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return false, err
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return false, err
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
 	if _, err := service.Status(); err == nil {
 		return false, nil
 	}
@@ -175,7 +206,7 @@ func (service Service) Start() (bool, error) {
 	} else if !os.IsNotExist(err) {
 		return false, err
 	}
-	if err := service.Install(); err != nil {
+	if err := service.install(false); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -206,14 +237,24 @@ func (service Service) Status() (string, error) {
 }
 
 func (service Service) Uninstall() error {
-	_ = exec.Command("launchctl", "bootout", service.Domain+"/"+service.Label).Run()
+	if output, err := exec.Command("launchctl", "bootout", service.Domain+"/"+service.Label).CombinedOutput(); err != nil {
+		message := strings.ToLower(string(output) + err.Error())
+		if !strings.Contains(message, "no such process") && !strings.Contains(message, "could not find service") {
+			return fmt.Errorf("launchctl bootout: %w: %s", err, strings.TrimSpace(string(output)))
+		}
+	}
 	if err := os.Remove(service.PlistPath); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	return nil
 }
 
-func (service Service) Stop() error { return service.Uninstall() }
+func (service Service) Stop() error {
+	if err := service.ensureNoActiveJobs(); err != nil {
+		return err
+	}
+	return service.Uninstall()
+}
 
 func (service Service) plist() string {
 	argument := func(value string) string { return "<string>" + html.EscapeString(value) + "</string>" }

@@ -191,6 +191,17 @@ func runService(args []string, configPath, stateDir string, maxWorkers int, http
 	if len(args) != 1 {
 		return fmt.Errorf("service needs install, start, stop, status, or uninstall")
 	}
+	if args[0] == "stop" {
+		service, err := bitci.NewServiceForStop(configPath, stateDir)
+		if err != nil {
+			return err
+		}
+		if err := service.Stop(); err != nil {
+			return err
+		}
+		fmt.Println("stopped", service.Label)
+		return nil
+	}
 	service, err := bitci.NewServiceWithHTTP(configPath, stateDir, maxWorkers, httpAddress)
 	if err != nil {
 		return err
@@ -225,12 +236,6 @@ func runService(args []string, configPath, stateDir string, maxWorkers int, http
 			return err
 		}
 		fmt.Println("uninstalled", service.Label)
-		return nil
-	case "stop":
-		if err := service.Stop(); err != nil {
-			return err
-		}
-		fmt.Println("stopped", service.Label)
 		return nil
 	default:
 		return fmt.Errorf("unknown service command %q", args[0])
