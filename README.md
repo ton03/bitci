@@ -81,6 +81,7 @@ human CLI --> local queue and logs
 - `submit` records those task IDs, their config, and the source SHA.
 - `serve` claims FIFO jobs when worker, disk, and resource limits allow them.
 - SHA-backed jobs run in a detached worktree. Each result records `tested_sha`.
+- BitCI keeps each recorded SHA reachable with a private Git ref while it keeps its job record.
 - `status`, `logs`, `cancel`, and `retry` inspect or control the queue.
 
 `cancel` affects queued work only. Retry only after reading logs. Logs are not
