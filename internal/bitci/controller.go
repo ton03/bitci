@@ -645,7 +645,7 @@ func (controller *Controller) RecoverOrphaned() (int, error) {
 	if err := rows.Err(); err != nil {
 		return 0, err
 	}
-	return controller.recoverJobs(orphaned)
+	return controller.recoverJobs(orphaned, true)
 }
 
 // RecoverJob fails one running job only when its recorded task process is gone.
@@ -667,11 +667,11 @@ func (controller *Controller) RecoverJob(id int64) (bool, error) {
 	if alive {
 		return false, fmt.Errorf("job %d task process is still running", id)
 	}
-	recovered, err := controller.recoverJobs([]Job{job})
+	recovered, err := controller.recoverJobs([]Job{job}, false)
 	return recovered == 1, err
 }
 
-func (controller *Controller) recoverJobs(jobs []Job) (int, error) {
+func (controller *Controller) recoverJobs(jobs []Job, skipChanged bool) (int, error) {
 	if len(jobs) == 0 {
 		return 0, nil
 	}
@@ -692,6 +692,9 @@ func (controller *Controller) recoverJobs(jobs []Job) (int, error) {
 			return 0, err
 		}
 		if updated == 0 {
+			if skipChanged {
+				continue
+			}
 			return 0, fmt.Errorf("job %d changed before recovery", job.ID)
 		}
 		if _, err := transaction.Exec("DELETE FROM leases WHERE job_id = ?", job.ID); err != nil {
