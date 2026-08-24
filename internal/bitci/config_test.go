@@ -59,6 +59,9 @@ func TestConfigContract(t *testing.T) {
 	if _, err := LoadConfig(writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["x"],"env":{"VALUE":"bad\u0000value"}}}}`)); err == nil {
 		t.Fatal("NUL environment value passed")
 	}
+	if _, err := LoadConfig(writeConfig(t, `{"version":1,"resources":{"cpu":1},"tasks":{"unit":{"run":["x"],"resources":["cpu","cpu"]}}}`)); err == nil {
+		t.Fatal("duplicate task resource passed")
+	}
 }
 
 func TestLogsRedactConfiguredValues(t *testing.T) {
@@ -1525,6 +1528,37 @@ func TestJobRunsInRecordedCheckoutSHA(t *testing.T) {
 	}
 }
 
+func TestRecordedSHAAllowsInheritedCheckoutPWD(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	t.Setenv("PWD", checkout)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "passed" {
+		lines, _ := controller.TailLog(jobs[0].ID, 80)
+		t.Fatalf("inherited PWD job = %#v\n%s", jobs[0], strings.Join(lines, "\n"))
+	}
+}
+
 func TestJobRunsInRecordedSHA256Checkout(t *testing.T) {
 	checkout := t.TempDir()
 	configPath := filepath.Join(checkout, "bitci.json")
@@ -1869,6 +1903,87 @@ func TestRecordedSHARejectsTaskThatChangesWorktree(t *testing.T) {
 	}
 	if jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 126 {
 		t.Fatalf("mutated task job = %#v", jobs[0])
+	}
+}
+
+func TestRecordedSHARejectsEvaluatorGitMetadataWrite(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["sh","-c","git update-ref refs/heads/main HEAD~1"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "branch", "-M", "main")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	if err := os.WriteFile(filepath.Join(checkout, "marker"), []byte("second"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "add", "marker")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "second")
+	wantRef := git(t, checkout, "rev-parse", "refs/heads/main")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 126 {
+		t.Fatalf("evaluator Git job = %#v", jobs[0])
+	}
+	if got := git(t, checkout, "rev-parse", "refs/heads/main"); got != wantRef {
+		t.Fatalf("main ref = %q, want %q", got, wantRef)
+	}
+}
+
+func TestRecordedSHARejectsSymlinkedPathOperand(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	external := filepath.Join(t.TempDir(), "external")
+	if err := os.WriteFile(external, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, "input"), []byte("changed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(external, filepath.Join(checkout, "destination")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["cp","input","destination"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json", "input", "destination")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 126 {
+		t.Fatalf("symlink operand job = %#v", jobs[0])
+	}
+	if data, err := os.ReadFile(external); err != nil || string(data) != "original" {
+		t.Fatalf("external file = %q, %v", data, err)
 	}
 }
 
@@ -2329,7 +2444,7 @@ func TestUnsafeTaskEnvironmentRejectsGitMetadataPaths(t *testing.T) {
 		"GIT_INDEX_FILE": ".git-index",
 	} {
 		checkout := t.TempDir()
-		if !unsafeTaskEnvironment([]string{name + "=" + value}, checkout, checkout, checkout) {
+		if !unsafeTaskEnvironment([]string{name + "=" + value}, nil, checkout, checkout, checkout) {
 			t.Fatalf("accepted unsafe %s=%q", name, value)
 		}
 	}
@@ -2338,14 +2453,34 @@ func TestUnsafeTaskEnvironmentRejectsGitMetadataPaths(t *testing.T) {
 func TestUnsafeTaskEnvironmentRejectsCheckoutPATH(t *testing.T) {
 	checkout := t.TempDir()
 	worktree := t.TempDir()
-	if !unsafeTaskEnvironment([]string{"PATH=" + checkout}, checkout, worktree, worktree) {
+	if !unsafeTaskEnvironment([]string{"PATH=" + checkout}, nil, checkout, worktree, worktree) {
 		t.Fatal("accepted checkout PATH entry")
+	}
+}
+
+func TestUnsafeTaskEnvironmentAllowsInheritedCheckoutPWD(t *testing.T) {
+	checkout := t.TempDir()
+	worktree := t.TempDir()
+	if unsafeTaskEnvironment([]string{"PWD=" + checkout, "PATH=/usr/bin:/bin"}, nil, checkout, worktree, worktree) {
+		t.Fatal("rejected inherited checkout PWD")
+	}
+	if !unsafeTaskEnvironment([]string{"PROJECT_ROOT=" + checkout, "PATH=/usr/bin:/bin"}, map[string]string{"PROJECT_ROOT": checkout}, checkout, worktree, worktree) {
+		t.Fatal("accepted configured checkout environment path")
 	}
 }
 
 func TestUnsafeGitCommandRejectsMetadataWrites(t *testing.T) {
 	if !unsafeGitCommand([]string{"git", "update-ref", "refs/heads/main", "HEAD"}) {
 		t.Fatal("accepted Git metadata write")
+	}
+	if !unsafeGitCommand([]string{"env", "git", "update-ref", "refs/heads/main", "HEAD"}) {
+		t.Fatal("accepted wrapped Git metadata write")
+	}
+	if !unsafeGitCommand([]string{"git", "remote", "set-url", "origin", "example"}) {
+		t.Fatal("accepted unlisted Git metadata write")
+	}
+	if unsafeGitCommand([]string{"git", "status", "--short"}) {
+		t.Fatal("rejected read-only Git command")
 	}
 }
 

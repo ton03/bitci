@@ -903,14 +903,14 @@ func (controller *Controller) hasUnsafeCheckoutCommand(argv []string, checkoutRo
 		checkoutRoot = controller.gitDirectory()
 	}
 	environment := taskEnvironment(overrides)
-	if unsafeEvaluatorCommand(argv, checkoutRoot) || unsafeTaskEnvironment(environment, checkoutRoot, worktreeRoot, workDir) || unsafeGitCommand(argv) {
+	if unsafeEvaluatorCommand(argv, checkoutRoot) || unsafeTaskEnvironment(environment, overrides, checkoutRoot, worktreeRoot, workDir) || unsafeGitCommand(argv) {
 		return true
 	}
 	if script, ok := interpreterScriptOperand(argv); ok && controller.isCheckoutScript(script, checkoutRoot, worktreeRoot, workDir, environment) {
 		return true
 	}
 	for _, value := range argv {
-		if containsCheckoutPath(value, checkoutRoot) || containsCheckoutPath(value, filepath.Dir(controller.configPath)) || controller.isCheckoutExecutable(value, checkoutRoot, worktreeRoot, workDir, environment) {
+		if containsCheckoutPath(value, checkoutRoot) || containsCheckoutPath(value, filepath.Dir(controller.configPath)) || unsafePathOperand(value, checkoutRoot, worktreeRoot, workDir) || controller.isCheckoutExecutable(value, checkoutRoot, worktreeRoot, workDir, environment) {
 			return true
 		}
 	}
@@ -944,12 +944,44 @@ func unsafeEvaluatorCommand(argv []string, checkoutRoot string) bool {
 				return true
 			}
 			script := argv[index+2]
-			if pathHasParentTraversal(script) || containsCheckoutPath(script, checkoutRoot) {
+			if pathHasParentTraversal(script) || containsCheckoutPath(script, checkoutRoot) || unsafeEvaluatorGitCommand(script) {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+func unsafeEvaluatorGitCommand(script string) bool {
+	fields := strings.FieldsFunc(script, func(character rune) bool {
+		return strings.ContainsRune(" \t\r\n;|&(){}'\"`", character)
+	})
+	return unsafeGitCommand(fields)
+}
+
+func unsafePathOperand(value, checkoutRoot, worktreeRoot, workDir string) bool {
+	if value == "" || strings.HasPrefix(value, "-") {
+		return false
+	}
+	path := value
+	relative := !filepath.IsAbs(path)
+	if relative {
+		path = filepath.Join(workDir, path)
+	}
+	if relative && !strings.ContainsRune(value, filepath.Separator) {
+		if _, err := os.Lstat(path); err != nil {
+			return !os.IsNotExist(err)
+		}
+	}
+	path = filepath.Clean(path)
+	insideWorktree := worktreeRoot != "" && pathWithin(worktreeRoot, path)
+	if relative && worktreeRoot != "" && !insideWorktree {
+		return true
+	}
+	if pathWithin(checkoutRoot, path) && !insideWorktree {
+		return true
+	}
+	return insideWorktree && !pathWithin(resolvedPathForComparison(worktreeRoot), resolvedPathForComparison(path))
 }
 
 func interpreterScriptOperand(argv []string) (string, bool) {
@@ -979,14 +1011,18 @@ func interpreterCommand(argv []string) bool {
 	return interpreters[strings.ToLower(filepath.Base(argv[0]))]
 }
 
-func unsafeTaskEnvironment(environment []string, checkoutRoot, worktreeRoot, workDir string) bool {
+func unsafeTaskEnvironment(environment []string, overrides map[string]string, checkoutRoot, worktreeRoot, workDir string) bool {
 	for _, item := range environment {
 		name, value, ok := strings.Cut(item, "=")
 		if !ok {
 			continue
 		}
 		upper := strings.ToUpper(name)
-		if strings.HasPrefix(upper, "LD_") || strings.HasPrefix(upper, "DYLD_") || unsafeGitEnvironment(upper, value) || containsCheckoutPath(value, checkoutRoot) || upper == "PATH" && unsafeTaskPath(value, checkoutRoot, worktreeRoot, workDir) {
+		_, overridden := overrides[name]
+		unsafeLoader := strings.HasPrefix(upper, "LD_") || strings.HasPrefix(upper, "DYLD_")
+		unsafeConfiguredPath := overridden && containsCheckoutPath(value, checkoutRoot)
+		unsafePath := upper == "PATH" && unsafeTaskPath(value, checkoutRoot, worktreeRoot, workDir)
+		if unsafeLoader || unsafeGitEnvironment(upper, value) || unsafeConfiguredPath || unsafePath {
 			return true
 		}
 	}
@@ -1020,13 +1056,19 @@ func unsafeTaskPath(value, checkoutRoot, worktreeRoot, workDir string) bool {
 }
 
 func unsafeGitCommand(argv []string) bool {
-	if len(argv) < 2 || strings.ToLower(filepath.Base(argv[0])) != "git" {
-		return false
-	}
-	mutating := map[string]bool{"branch": true, "checkout": true, "commit": true, "config": true, "fetch": true, "gc": true, "merge": true, "notes": true, "pack-refs": true, "push": true, "rebase": true, "reset": true, "submodule": true, "tag": true, "update-ref": true, "worktree": true}
-	for _, value := range argv[1:] {
-		if mutating[value] {
-			return true
+	readOnly := map[string]bool{"annotate": true, "blame": true, "cat-file": true, "check-attr": true, "check-ignore": true, "check-mailmap": true, "check-ref-format": true, "count-objects": true, "describe": true, "diff": true, "diff-files": true, "diff-index": true, "diff-tree": true, "for-each-ref": true, "grep": true, "log": true, "ls-files": true, "ls-remote": true, "ls-tree": true, "merge-base": true, "name-rev": true, "rev-list": true, "rev-parse": true, "show": true, "show-ref": true, "status": true, "verify-commit": true, "verify-pack": true, "verify-tag": true, "version": true, "whatchanged": true}
+	for index, value := range argv {
+		if !strings.EqualFold(filepath.Base(value), "git") {
+			continue
+		}
+		for _, argument := range argv[index+1:] {
+			if strings.HasPrefix(argument, "-") {
+				continue
+			}
+			if !readOnly[argument] {
+				return true
+			}
+			break
 		}
 	}
 	return false

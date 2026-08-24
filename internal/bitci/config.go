@@ -100,10 +100,15 @@ func (config Config) Validate() error {
 				return fmt.Errorf("task %q needs unknown task %q", name, need)
 			}
 		}
+		resources := map[string]bool{}
 		for _, resource := range task.Resources {
 			if _, ok := config.Resources[resource]; !ok {
 				return fmt.Errorf("task %q uses unknown resource %q", name, resource)
 			}
+			if resources[resource] {
+				return fmt.Errorf("task %q repeats resource %q", name, resource)
+			}
+			resources[resource] = true
 		}
 	}
 	_, err := config.ordered(config.TaskNames())
