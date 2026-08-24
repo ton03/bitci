@@ -692,7 +692,7 @@ func (controller *Controller) recoverJobs(jobs []Job) (int, error) {
 			return 0, err
 		}
 		if updated == 0 {
-			continue
+			return 0, fmt.Errorf("job %d changed before recovery", job.ID)
 		}
 		if _, err := transaction.Exec("DELETE FROM leases WHERE job_id = ?", job.ID); err != nil {
 			return 0, err
@@ -1106,7 +1106,7 @@ func (controller *Controller) executeCommandWithEnv(parent context.Context, jobI
 	}
 	pid := command.Process.Pid
 	if _, err := controller.db.Exec("UPDATE jobs SET worker_pid = ? WHERE id = ? AND state = 'running'", pid, jobID); err != nil {
-		_ = command.Process.Kill()
+		_ = syscall.Kill(-pid, syscall.SIGKILL)
 		_ = command.Wait()
 		fmt.Fprintf(output, "BitCI could not record task process: %v\n", err)
 		return 127
@@ -1164,8 +1164,10 @@ func (controller *Controller) finish(job Job, code int, cleanupPending bool) err
 	if err != nil {
 		return err
 	}
-	if updated, err := result.RowsAffected(); err != nil || updated == 0 {
+	if updated, err := result.RowsAffected(); err != nil {
 		return err
+	} else if updated == 0 {
+		return fmt.Errorf("job %d is no longer finishable", job.ID)
 	}
 	_, err = controller.db.Exec("DELETE FROM leases WHERE job_id = ?", job.ID)
 	return err
