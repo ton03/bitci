@@ -46,7 +46,7 @@ Validate, then start the controller in one terminal:
 
 ```sh
 bitci validate
-bitci serve --max-workers 2
+bitci serve --max-workers 2 --http 127.0.0.1:8787
 ```
 
 In another terminal, submit configured task IDs:
@@ -60,6 +60,11 @@ bitci logs --tail 80 1
 
 `serve` owns the queue. It starts submitted tasks only. Keep it running in a
 terminal, or use the macOS service below.
+
+Open `http://127.0.0.1:8787` for the local, read-only dashboard. It refreshes
+every three seconds and shows job state, tested SHA, timing, resource leases,
+disk space, capped logs, and the average duration of passing jobs in seven days.
+The dashboard only accepts the loopback address. It has no task controls.
 
 ## How it works
 
@@ -85,7 +90,7 @@ Build or download one fixed binary path. Then let `launchd` own `serve`:
 ```sh
 mkdir -p "$HOME/.local/bin"
 go build -o "$HOME/.local/bin/bitci" ./cmd/bitci
-"$HOME/.local/bin/bitci" service --max-workers 2 install
+"$HOME/.local/bin/bitci" service --max-workers 2 --http 127.0.0.1:8787 install
 "$HOME/.local/bin/bitci" service status
 ```
 

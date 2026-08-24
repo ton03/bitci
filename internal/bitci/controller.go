@@ -9,6 +9,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,14 +31,17 @@ type Controller struct {
 }
 
 type Job struct {
-	ID        int64  `json:"id"`
-	Batch     string `json:"batch"`
-	Task      string `json:"task"`
-	Ref       string `json:"ref"`
-	TestedSHA string `json:"tested_sha,omitempty"`
-	State     string `json:"state"`
-	ExitCode  *int   `json:"exit_code,omitempty"`
-	LogPath   string `json:"log_path,omitempty"`
+	ID         int64  `json:"id"`
+	Batch      string `json:"batch"`
+	Task       string `json:"task"`
+	Ref        string `json:"ref"`
+	TestedSHA  string `json:"tested_sha,omitempty"`
+	State      string `json:"state"`
+	CreatedAt  string `json:"created_at"`
+	StartedAt  string `json:"started_at,omitempty"`
+	FinishedAt string `json:"finished_at,omitempty"`
+	ExitCode   *int   `json:"exit_code,omitempty"`
+	LogPath    string `json:"log_path,omitempty"`
 }
 
 func Open(configPath, stateDir string) (*Controller, error) {
@@ -145,9 +150,10 @@ func (controller *Controller) Submit(taskNames []string, ref string) ([]Job, err
 	defer transaction.Rollback()
 	jobs := make([]Job, 0, len(ordered))
 	for _, taskName := range ordered {
+		createdAt := time.Now().UTC().Format(time.RFC3339)
 		result, err := transaction.Exec(
 			"INSERT INTO jobs(batch, task, ref, state, created_at) VALUES (?, ?, ?, 'queued', ?)",
-			batch, taskName, ref, time.Now().UTC().Format(time.RFC3339),
+			batch, taskName, ref, createdAt,
 		)
 		if err != nil {
 			return nil, err
@@ -156,7 +162,7 @@ func (controller *Controller) Submit(taskNames []string, ref string) ([]Job, err
 		if err != nil {
 			return nil, err
 		}
-		jobs = append(jobs, Job{ID: id, Batch: batch, Task: taskName, Ref: ref, State: "queued"})
+		jobs = append(jobs, Job{ID: id, Batch: batch, Task: taskName, Ref: ref, State: "queued", CreatedAt: createdAt})
 	}
 	if err := transaction.Commit(); err != nil {
 		return nil, err
@@ -255,7 +261,7 @@ func isCheckoutSHA(value string) bool {
 	return true
 }
 
-func (controller *Controller) Serve(ctx context.Context, maxWorkers int, interval time.Duration, socketPath string) error {
+func (controller *Controller) Serve(ctx context.Context, maxWorkers int, interval time.Duration, socketPath, httpAddress string) error {
 	if maxWorkers < 1 {
 		return fmt.Errorf("max-workers must be positive")
 	}
@@ -267,11 +273,32 @@ func (controller *Controller) Serve(ctx context.Context, maxWorkers int, interva
 		return err
 	}
 	defer listener.Close()
+	var dashboard *http.Server
+	var dashboardListener net.Listener
+	if httpAddress != "" {
+		dashboardListener, err = listenDashboard(httpAddress)
+		if err != nil {
+			return err
+		}
+		dashboard = &http.Server{Handler: controller.DashboardHandler(), ReadHeaderTimeout: 5 * time.Second}
+		defer func() {
+			_ = dashboard.Shutdown(context.Background())
+			_ = dashboardListener.Close()
+		}()
+	}
 	if interval <= 0 {
 		interval = time.Second
 	}
-	errors := make(chan error, maxWorkers+1)
+	errors := make(chan error, maxWorkers+2)
 	go func() { errors <- controller.ServeRPC(ctx, listener) }()
+	if dashboard != nil {
+		go func() {
+			err := dashboard.Serve(dashboardListener)
+			if err != nil && err != http.ErrServerClosed {
+				errors <- err
+			}
+		}()
+	}
 	for worker := 0; worker < maxWorkers; worker++ {
 		go controller.serveWorker(ctx, maxWorkers, interval, errors)
 	}
@@ -458,7 +485,7 @@ func (controller *Controller) finish(job Job, code int) error {
 }
 
 func (controller *Controller) Jobs() ([]Job, error) {
-	rows, err := controller.db.Query("SELECT id, batch, task, ref, COALESCE(tested_sha, ''), state, exit_code, COALESCE(log_path, '') FROM jobs ORDER BY id")
+	rows, err := controller.db.Query("SELECT id, batch, task, ref, COALESCE(tested_sha, ''), state, created_at, COALESCE(started_at, ''), COALESCE(finished_at, ''), exit_code, COALESCE(log_path, '') FROM jobs ORDER BY id")
 	if err != nil {
 		return nil, err
 	}
@@ -466,7 +493,7 @@ func (controller *Controller) Jobs() ([]Job, error) {
 	var jobs []Job
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Batch, &job.Task, &job.Ref, &job.TestedSHA, &job.State, &job.ExitCode, &job.LogPath); err != nil {
+		if err := rows.Scan(&job.ID, &job.Batch, &job.Task, &job.Ref, &job.TestedSHA, &job.State, &job.CreatedAt, &job.StartedAt, &job.FinishedAt, &job.ExitCode, &job.LogPath); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, job)
