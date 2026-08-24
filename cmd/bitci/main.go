@@ -39,6 +39,7 @@ func run(args []string) error {
 	allowRuns := flags.Bool("allow-runs", false, "enable MCP run-control tools")
 	jsonOutput := flags.Bool("json", false, "JSON output")
 	logLimit := flags.Int("tail", 80, "maximum log lines, capped at 80")
+	logCursor := flags.Int64("cursor", -1, "read log lines after this byte cursor")
 	search := flags.String("search", "", "log text to search")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
@@ -143,6 +144,19 @@ func run(args []string) error {
 		id, err := jobID(flags.Args())
 		if err != nil {
 			return err
+		}
+		if *logCursor < -1 {
+			return fmt.Errorf("log cursor must not be less than -1")
+		}
+		if *logCursor >= 0 {
+			if *search != "" {
+				return fmt.Errorf("logs --cursor cannot combine with --search")
+			}
+			output, err := controller.ReadLog(id, *logCursor, *logLimit)
+			if err != nil {
+				return err
+			}
+			return printValue(output, *jsonOutput)
 		}
 		var lines []string
 		if *search == "" {

@@ -678,7 +678,7 @@ func TestMCPReadOnlyTools(t *testing.T) {
 	ownerDone := make(chan error, 1)
 	go func() { ownerDone <- controller.ServeRPC(ctx, listener) }()
 	readOnly := mcpToolNames(t, socketPath, false)
-	for _, name := range []string{"status", "plan", "tail_logs", "search_logs", "doctor"} {
+	for _, name := range []string{"status", "plan", "tail_logs", "search_logs", "read_logs", "doctor"} {
 		if !readOnly[name] {
 			t.Fatalf("MCP tool %q missing", name)
 		}
@@ -861,6 +861,65 @@ func TestRunControlAndLogs(t *testing.T) {
 	if got, want := strings.Join(lines, ","), "error second"; got != want {
 		t.Fatalf("search = %q, want %q", got, want)
 	}
+	first, err := controller.ReadLog(retried[0].ID, 0, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(first.Lines, ","), "first,error second"; got != want {
+		t.Fatalf("first log read = %q, want %q", got, want)
+	}
+	if first.Cursor == 0 || first.State != "passed" {
+		t.Fatalf("first log read = %#v", first)
+	}
+	second, err := controller.ReadLog(retried[0].ID, first.Cursor, 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(second.Lines, ","), "third"; got != want {
+		t.Fatalf("second log read = %q, want %q", got, want)
+	}
+	if second.Cursor <= first.Cursor {
+		t.Fatalf("cursor did not advance: %d <= %d", second.Cursor, first.Cursor)
+	}
+}
+
+func TestReadLogDoesNotAdvanceAtReadCap(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+	stateDir := filepath.Join(t.TempDir(), "state")
+	controller, err := Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	logPath := filepath.Join(stateDir, "logs", "capped.log")
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath, []byte(strings.Repeat("x", maxLogReadBytes)+"\nnext\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := controller.db.Exec("INSERT INTO jobs(batch, task, ref, state, created_at, log_path) VALUES ('batch', 'unit', '', 'passed', '2026-01-01T00:00:00Z', ?)", logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs, err := controller.ReadLog(id, 0, 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs.Lines) != 0 || logs.Cursor != 0 || logs.State != "passed" {
+		t.Fatalf("capped log read = %#v", logs)
+	}
+	encoded, err := json.Marshal(logs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"lines":[]`) {
+		t.Fatalf("empty log lines encoded as %s", encoded)
+	}
 }
 
 func TestRetryPreservesRecordedSHAAndConfiguration(t *testing.T) {
@@ -989,6 +1048,69 @@ func TestLiveLogAvailableBeforeJobFinishes(t *testing.T) {
 	}
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLiveLogCursorWaitsForCompleteLine(t *testing.T) {
+	releasePath := filepath.Join(t.TempDir(), "release")
+	t.Setenv("GO_WANT_HELPER_PROCESS", "1")
+	t.Setenv("GO_WANT_LIVE_LOG_PARTIAL", "1")
+	t.Setenv("GO_WANT_LIVE_LOG_RELEASE", releasePath)
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["`+os.Args[0]+`","-test.run=TestHelperProcess","--"]}}}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	jobs, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := controller.RunOnce(context.Background(), 1)
+		done <- err
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		stored, err := controller.Jobs()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(stored) == 1 && stored[0].LogPath != "" {
+			contents, err := os.ReadFile(stored[0].LogPath)
+			if err == nil && strings.Contains(string(contents), "BitCI live log partial") {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("live partial line was not written")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	partial, err := controller.ReadLog(jobs[0].ID, 0, 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if partial.State != "running" || len(partial.Lines) != 0 || partial.Cursor != 0 {
+		t.Fatalf("partial live log = %#v", partial)
+	}
+	if err := os.WriteFile(releasePath, []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	complete, err := controller.ReadLog(jobs[0].ID, partial.Cursor, 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(complete.Lines, ","), "BitCI live log partial line"; got != want {
+		t.Fatalf("complete live log = %q, want %q", got, want)
+	}
+	if complete.State != "passed" || complete.Cursor == 0 {
+		t.Fatalf("complete live log = %#v", complete)
 	}
 }
 
@@ -2375,6 +2497,17 @@ func TestHelperProcess(t *testing.T) {
 		return
 	}
 	if releasePath := os.Getenv("GO_WANT_LIVE_LOG_RELEASE"); releasePath != "" {
+		if os.Getenv("GO_WANT_LIVE_LOG_PARTIAL") == "1" {
+			fmt.Fprint(os.Stdout, "BitCI live log partial")
+			for {
+				if _, err := os.Stat(releasePath); err == nil {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			fmt.Fprintln(os.Stdout, " line")
+			os.Exit(0)
+		}
 		fmt.Fprintln(os.Stdout, "BitCI live log ready")
 		for {
 			if _, err := os.Stat(releasePath); err == nil {

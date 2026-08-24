@@ -147,8 +147,14 @@ Without `--allow-runs`, MCP only reads `status`, `plan`, logs, and disk health.
 With it, agents may submit, cancel, or retry configured tasks. The agent flow is:
 
 ```text
-skill -> plan -> submit configured IDs -> status -> logs -> retry only if needed
+skill -> plan -> submit configured IDs -> status -> read_logs(cursor) -> retry only if needed
 ```
+
+`read_logs` returns capped complete lines and a cursor. Pass that cursor to the
+next call while a job runs. Use `tail_logs` for the final context.
+
+CLI fallback: `bitci logs --cursor 0 <job-id>` returns the same lines, cursor,
+and state.
 
 The UI is for humans only. Agents use MCP; CLI is their fallback.
 
