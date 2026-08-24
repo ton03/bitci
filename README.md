@@ -104,7 +104,7 @@ Do not put secrets in `bitci.json` or task output.
 }
 ```
 
-If a recorded task process disappears, `serve` fails the job after a short
+If a recorded task process group disappears, `serve` fails the job after a short
 grace period and releases its resources. `bitci recover <job-id>` performs the
 same bounded check for one running job. It never kills a process.
 

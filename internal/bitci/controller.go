@@ -36,15 +36,16 @@ type Controller struct {
 }
 
 type Job struct {
-	ID             int64  `json:"id"`
-	Batch          string `json:"batch"`
-	Task           string `json:"task"`
-	Ref            string `json:"ref"`
-	TestedSHA      string `json:"tested_sha,omitempty"`
-	State          string `json:"state"`
-	ExitCode       *int   `json:"exit_code,omitempty"`
-	LogPath        string `json:"log_path,omitempty"`
-	WorkerPID      *int   `json:"worker_pid,omitempty"`
+	ID        int64  `json:"id"`
+	Batch     string `json:"batch"`
+	Task      string `json:"task"`
+	Ref       string `json:"ref"`
+	TestedSHA string `json:"tested_sha,omitempty"`
+	State     string `json:"state"`
+	ExitCode  *int   `json:"exit_code,omitempty"`
+	LogPath   string `json:"log_path,omitempty"`
+	// WorkerPID stores the task process-group ID for status compatibility.
+	WorkerPID      *int `json:"worker_pid,omitempty"`
 	configJSON     string
 	checkoutRoot   string
 	configRelative string
@@ -621,7 +622,7 @@ func (controller *Controller) RecoverInterrupted() error {
 	return errors.Join(failures...)
 }
 
-// RecoverOrphaned fails running jobs whose recorded task process no longer exists.
+// RecoverOrphaned fails running jobs whose recorded task process group no longer exists.
 // It never kills a process and leaves live jobs untouched.
 const orphanRecoveryGrace = 5 * time.Second
 
@@ -655,7 +656,7 @@ func (controller *Controller) RecoverOrphaned() (int, error) {
 	return controller.recoverJobs(orphaned, true)
 }
 
-// RecoverJob fails one running job only when its recorded task process is gone.
+// RecoverJob fails one running job only when its recorded task process group is gone.
 func (controller *Controller) RecoverJob(id int64) (bool, error) {
 	var job Job
 	if err := controller.db.QueryRow("SELECT id, batch, ref, COALESCE(checkout_root, ''), worker_pid FROM jobs WHERE id = ? AND state = 'running'", id).Scan(&job.ID, &job.Batch, &job.Ref, &job.checkoutRoot, &job.WorkerPID); err != nil {
@@ -665,14 +666,14 @@ func (controller *Controller) RecoverJob(id int64) (bool, error) {
 		return false, err
 	}
 	if job.WorkerPID == nil {
-		return false, fmt.Errorf("job %d has no recorded task process", id)
+		return false, fmt.Errorf("job %d has no recorded task process group", id)
 	}
 	alive, err := processAlive(*job.WorkerPID)
 	if err != nil {
 		return false, err
 	}
 	if alive {
-		return false, fmt.Errorf("job %d task process is still running", id)
+		return false, fmt.Errorf("job %d task process group is still running", id)
 	}
 	recovered, err := controller.recoverJobs([]Job{job}, false)
 	return recovered == 1, err
@@ -1118,12 +1119,12 @@ func (controller *Controller) executeCommandWithEnv(parent context.Context, jobI
 	if _, err := controller.db.Exec("UPDATE jobs SET worker_pid = ? WHERE id = ? AND state = 'running'", pid, jobID); err != nil {
 		_ = syscall.Kill(-pid, syscall.SIGKILL)
 		_ = command.Wait()
-		fmt.Fprintf(output, "BitCI could not record task process: %v\n", err)
+		fmt.Fprintf(output, "BitCI could not record task process group: %v\n", err)
 		return 127
 	}
 	err := command.Wait()
 	if _, clearErr := controller.db.Exec("UPDATE jobs SET worker_pid = NULL WHERE id = ? AND worker_pid = ?", jobID, pid); clearErr != nil && err == nil {
-		fmt.Fprintf(output, "BitCI could not clear task process: %v\n", clearErr)
+		fmt.Fprintf(output, "BitCI could not clear task process group: %v\n", clearErr)
 		return 127
 	}
 	if err == nil {
