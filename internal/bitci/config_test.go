@@ -43,11 +43,166 @@ func TestConfigContract(t *testing.T) {
 	if _, err := LoadConfig(writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["x"],"raw":"no"}}}`)); err == nil {
 		t.Fatal("unknown config key passed")
 	}
+	if _, err := LoadConfig(writeConfig(t, `{"version":1,"log_retention":-1,"tasks":{"unit":{"run":["x"]}}}`)); err == nil {
+		t.Fatal("negative log retention passed")
+	}
+	if _, err := LoadConfig(writeConfig(t, `{"version":1,"redact":[""],"tasks":{"unit":{"run":["x"]}}}`)); err == nil {
+		t.Fatal("empty redaction value passed")
+	}
+	if _, err := LoadConfig(writeConfig(t, `{"version":1,"redact":["first\nsecond"],"tasks":{"unit":{"run":["x"]}}}`)); err == nil {
+		t.Fatal("multiline redaction value passed")
+	}
 	if _, err := LoadConfig(writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["x"],"env":{"BAD-NAME":"value"}}}}`)); err == nil {
 		t.Fatal("invalid environment variable passed")
 	}
 	if _, err := LoadConfig(writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["x"],"env":{"VALUE":"bad\u0000value"}}}}`)); err == nil {
 		t.Fatal("NUL environment value passed")
+	}
+}
+
+func TestLogsRedactConfiguredValues(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"redact":["secret-value"],"tasks":{"unit":{"run":["printf","secret-value\\n"]}}}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	jobs, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	lines, err := controller.TailLog(jobs[0].ID, 80)
+	if err != nil || strings.Join(lines, "") != "[REDACTED]" {
+		t.Fatalf("redacted logs = %q, %v", lines, err)
+	}
+}
+
+func TestLogReadsUsePersistedRedaction(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"redact":["stored-secret"],"tasks":{"unit":{"run":["printf","stored-secret marker\\n"]}}}`)
+	stateDir := filepath.Join(t.TempDir(), "state")
+	controller, err := Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	if err := controller.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"redact":["new-secret"],"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	controller, err = Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	lines, err := controller.TailLog(jobs[0].ID, 80)
+	if err != nil || strings.Join(lines, "") != "[REDACTED] marker" {
+		t.Fatalf("tail with persisted redaction = %q, %v", lines, err)
+	}
+	lines, err = controller.SearchLog(jobs[0].ID, "marker", 80)
+	if err != nil || strings.Join(lines, "") != "[REDACTED] marker" {
+		t.Fatalf("search with persisted redaction = %q, %v", lines, err)
+	}
+	lines, err = controller.SearchLog(jobs[0].ID, "stored-secret", 80)
+	if err != nil || strings.Join(lines, "") != "[REDACTED] marker" {
+		t.Fatalf("secret search with persisted redaction = %q, %v", lines, err)
+	}
+	output, err := controller.ReadLog(jobs[0].ID, 0, 80)
+	if err != nil || strings.Join(output.Lines, "") != "[REDACTED] marker" {
+		t.Fatalf("cursor read with persisted redaction = %#v, %v", output, err)
+	}
+}
+
+func TestLogRetentionPrunesFinishedLogs(t *testing.T) {
+	for _, retention := range []int{2, 0} {
+		t.Run(fmt.Sprintf("keeps-%d", retention), func(t *testing.T) {
+			configPath := writeConfig(t, fmt.Sprintf(`{"version":1,"log_retention":%d,"tasks":{"unit":{"run":["true"]}}}`, retention))
+			stateDir := filepath.Join(t.TempDir(), "state")
+			controller, err := Open(configPath, stateDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer controller.Close()
+
+			paths := make([]string, 3)
+			for index := range paths {
+				path := filepath.Join(stateDir, "logs", fmt.Sprintf("retention-%d.log", index))
+				if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte("log"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				paths[index] = path
+				if _, err := controller.db.Exec("INSERT INTO jobs(batch, task, ref, state, created_at, finished_at, log_path) VALUES (?, ?, ?, 'passed', ?, ?, ?)", "batch", "unit", "", fmt.Sprintf("2026-01-01T00:00:0%dZ", index), fmt.Sprintf("2026-01-01T00:00:1%dZ", index), path); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if err := controller.pruneLogs(); err != nil {
+				t.Fatal(err)
+			}
+			jobs, err := controller.Jobs()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for index, job := range jobs {
+				wantRetained := index >= len(jobs)-retention
+				if got := job.LogPath != ""; got != wantRetained {
+					t.Fatalf("job %d retained metadata = %v, want %v", job.ID, got, wantRetained)
+				}
+				_, err := os.Stat(paths[index])
+				if got := err == nil; got != wantRetained {
+					t.Fatalf("job %d retained file = %v, want %v", job.ID, got, wantRetained)
+				}
+			}
+		})
+	}
+}
+
+func TestLogRetentionIgnoresJobsWithoutLogs(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"log_retention":1,"tasks":{"unit":{"run":["true"]}}}`)
+	stateDir := filepath.Join(t.TempDir(), "state")
+	controller, err := Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	path := filepath.Join(stateDir, "logs", "retained.log")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("log"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.db.Exec("INSERT INTO jobs(batch, task, ref, state, created_at, finished_at, log_path) VALUES (?, ?, ?, 'passed', ?, ?, ?)", "batch", "unit", "", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.db.Exec("INSERT INTO jobs(batch, task, ref, state, created_at, finished_at, log_path) VALUES (?, ?, ?, 'failed', ?, ?, ?)", "batch", "unit", "", "2026-01-01T00:00:01Z", "2026-01-01T00:00:01Z", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.pruneLogs(); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := jobs[0].LogPath; got != path {
+		t.Fatalf("retained log path = %q, want %q", got, path)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal(err)
 	}
 }
 
