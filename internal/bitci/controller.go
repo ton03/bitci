@@ -56,7 +56,7 @@ func Open(configPath, stateDir string) (*Controller, error) {
 		return nil, err
 	}
 	controller.config = config
-	if root, relative, err := checkoutLocation(configPath); err == nil {
+	if root, relative, err := checkoutLocation(controller.configPath); err == nil {
 		controller.checkoutRoot = root
 		controller.configRelative = relative
 	}
@@ -699,18 +699,27 @@ func (controller *Controller) isCheckoutExecutable(command, checkoutRoot, worktr
 	}
 	root := filepath.Clean(checkoutRoot)
 	path = filepath.Clean(path)
-	if pathWithin(root, path) {
+	insideWorktree := worktreeRoot != "" && pathWithin(worktreeRoot, path)
+	if pathWithin(root, path) && !insideWorktree {
 		return true
 	}
 	root, err := filepath.EvalSymlinks(root)
 	if err != nil {
 		return false
 	}
-	if pathOrAncestorWithin(root, path) {
+	if pathOrAncestorWithin(root, path) && !insideWorktree {
 		return true
 	}
 	resolvedPath, err := filepath.EvalSymlinks(path)
-	return err == nil && pathWithin(root, resolvedPath)
+	if err != nil {
+		return false
+	}
+	if worktreeRoot != "" {
+		if resolvedWorktree, worktreeErr := filepath.EvalSymlinks(worktreeRoot); worktreeErr == nil && pathWithin(resolvedWorktree, resolvedPath) {
+			return false
+		}
+	}
+	return pathWithin(root, resolvedPath)
 }
 
 func pathOrAncestorWithin(root, path string) bool {
