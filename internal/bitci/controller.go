@@ -517,7 +517,7 @@ func isCheckoutSHA(value string) bool {
 	return true
 }
 
-func (controller *Controller) Serve(ctx context.Context, maxWorkers int, interval time.Duration, socketPath, httpAddress string) error {
+func (controller *Controller) Serve(ctx context.Context, maxWorkers int, interval time.Duration, socketPath string, httpAddresses ...string) error {
 	if maxWorkers < 1 {
 		return fmt.Errorf("max-workers must be positive")
 	}
@@ -528,6 +528,10 @@ func (controller *Controller) Serve(ctx context.Context, maxWorkers int, interva
 	defer listener.Close()
 	if err := controller.RecoverInterrupted(); err != nil {
 		return err
+	}
+	httpAddress := ""
+	if len(httpAddresses) > 0 {
+		httpAddress = httpAddresses[0]
 	}
 	var dashboard *http.Server
 	var dashboardListener net.Listener
