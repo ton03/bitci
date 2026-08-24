@@ -29,13 +29,14 @@ type Controller struct {
 }
 
 type Job struct {
-	ID       int64  `json:"id"`
-	Batch    string `json:"batch"`
-	Task     string `json:"task"`
-	Ref      string `json:"ref"`
-	State    string `json:"state"`
-	ExitCode *int   `json:"exit_code,omitempty"`
-	LogPath  string `json:"log_path,omitempty"`
+	ID        int64  `json:"id"`
+	Batch     string `json:"batch"`
+	Task      string `json:"task"`
+	Ref       string `json:"ref"`
+	TestedSHA string `json:"tested_sha,omitempty"`
+	State     string `json:"state"`
+	ExitCode  *int   `json:"exit_code,omitempty"`
+	LogPath   string `json:"log_path,omitempty"`
 }
 
 func Open(configPath, stateDir string) (*Controller, error) {
@@ -105,7 +106,8 @@ func (controller *Controller) migrate() error {
 			started_at TEXT,
 			finished_at TEXT,
 			exit_code INTEGER,
-			log_path TEXT
+			log_path TEXT,
+			tested_sha TEXT
 		);
 		CREATE INDEX IF NOT EXISTS jobs_queue ON jobs(state, id);
 		CREATE TABLE IF NOT EXISTS leases (
@@ -114,6 +116,13 @@ func (controller *Controller) migrate() error {
 			PRIMARY KEY (resource, job_id)
 		);
 	`)
+	if err != nil {
+		return err
+	}
+	if _, err := controller.db.Exec("SELECT tested_sha FROM jobs LIMIT 0"); err == nil {
+		return nil
+	}
+	_, err = controller.db.Exec("ALTER TABLE jobs ADD COLUMN tested_sha TEXT")
 	return err
 }
 
@@ -171,15 +180,19 @@ func (controller *Controller) RunOnce(ctx context.Context, maxWorkers int) (bool
 	if err != nil {
 		return true, controller.finish(job, 127)
 	}
+	workDir := filepath.Dir(controller.configPath)
+	cleanup := func() {}
 	if isCheckoutSHA(job.Ref) {
-		sha, err := controller.checkoutSHA()
-		if err != nil || sha != job.Ref {
-			fmt.Fprintln(logFile, "BitCI checkout SHA changed before task start")
+		var err error
+		workDir, cleanup, err = controller.jobCheckout(ctx, job)
+		if err != nil {
+			fmt.Fprintln(logFile, "BitCI could not stage recorded checkout SHA:", err)
 			logFile.Close()
 			return true, controller.finish(job, 126)
 		}
 	}
-	code := controller.execute(ctx, task, logFile)
+	defer cleanup()
+	code := controller.execute(ctx, task, logFile, workDir)
 	if err := logFile.Close(); err != nil && code == 0 {
 		code = 127
 	}
@@ -187,7 +200,11 @@ func (controller *Controller) RunOnce(ctx context.Context, maxWorkers int) (bool
 }
 
 func (controller *Controller) checkoutSHA() (string, error) {
-	command := exec.Command("git", "-C", filepath.Dir(controller.configPath), "rev-parse", "--verify", "HEAD^{commit}")
+	return checkoutSHA(filepath.Dir(controller.configPath))
+}
+
+func checkoutSHA(directory string) (string, error) {
+	command := exec.Command("git", "-C", directory, "rev-parse", "--verify", "HEAD^{commit}")
 	output, err := command.Output()
 	if err != nil {
 		return "", err
@@ -197,6 +214,33 @@ func (controller *Controller) checkoutSHA() (string, error) {
 		return "", fmt.Errorf("git returned invalid checkout SHA")
 	}
 	return sha, nil
+}
+
+func (controller *Controller) jobCheckout(ctx context.Context, job Job) (string, func(), error) {
+	root := filepath.Join(controller.stateDir, "worktrees")
+	path := filepath.Join(root, fmt.Sprintf("job-%d", job.ID))
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		return "", nil, err
+	}
+	if _, err := os.Lstat(path); err == nil {
+		return "", nil, fmt.Errorf("job worktree already exists")
+	} else if !os.IsNotExist(err) {
+		return "", nil, err
+	}
+	if _, err := controller.git(ctx, "worktree", "add", "--detach", path, job.Ref); err != nil {
+		return "", nil, fmt.Errorf("create job worktree: %w", err)
+	}
+	cleanup := func() { _, _ = controller.git(context.Background(), "worktree", "remove", "--force", path) }
+	sha, err := checkoutSHA(path)
+	if err != nil || sha != job.Ref {
+		cleanup()
+		return "", nil, fmt.Errorf("verify job worktree SHA")
+	}
+	if _, err := controller.db.Exec("UPDATE jobs SET tested_sha = ? WHERE id = ?", sha, job.ID); err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	return path, cleanup, nil
 }
 
 func isCheckoutSHA(value string) bool {
@@ -375,7 +419,7 @@ func (controller *Controller) startLog(job *Job) (*os.File, error) {
 	return file, nil
 }
 
-func (controller *Controller) execute(parent context.Context, task Task, output io.Writer) int {
+func (controller *Controller) execute(parent context.Context, task Task, output io.Writer, directory string) int {
 	ctx := parent
 	var cancel context.CancelFunc
 	if task.Timeout > 0 {
@@ -383,7 +427,7 @@ func (controller *Controller) execute(parent context.Context, task Task, output 
 		defer cancel()
 	}
 	command := exec.CommandContext(ctx, task.Run[0], task.Run[1:]...)
-	command.Dir = filepath.Dir(controller.configPath)
+	command.Dir = directory
 	command.Stdout = output
 	command.Stderr = output
 	err := command.Run()
@@ -414,7 +458,7 @@ func (controller *Controller) finish(job Job, code int) error {
 }
 
 func (controller *Controller) Jobs() ([]Job, error) {
-	rows, err := controller.db.Query("SELECT id, batch, task, ref, state, exit_code, COALESCE(log_path, '') FROM jobs ORDER BY id")
+	rows, err := controller.db.Query("SELECT id, batch, task, ref, COALESCE(tested_sha, ''), state, exit_code, COALESCE(log_path, '') FROM jobs ORDER BY id")
 	if err != nil {
 		return nil, err
 	}
@@ -422,7 +466,7 @@ func (controller *Controller) Jobs() ([]Job, error) {
 	var jobs []Job
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Batch, &job.Task, &job.Ref, &job.State, &job.ExitCode, &job.LogPath); err != nil {
+		if err := rows.Scan(&job.ID, &job.Batch, &job.Task, &job.Ref, &job.TestedSHA, &job.State, &job.ExitCode, &job.LogPath); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, job)

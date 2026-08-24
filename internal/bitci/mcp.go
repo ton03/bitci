@@ -12,11 +12,12 @@ type MCPOptions struct {
 }
 
 type MCPJob struct {
-	ID       int64  `json:"id"`
-	Task     string `json:"task"`
-	Ref      string `json:"ref"`
-	State    string `json:"state"`
-	ExitCode *int   `json:"exit_code,omitempty"`
+	ID        int64  `json:"id"`
+	Task      string `json:"task"`
+	Ref       string `json:"ref"`
+	TestedSHA string `json:"tested_sha,omitempty"`
+	State     string `json:"state"`
+	ExitCode  *int   `json:"exit_code,omitempty"`
 }
 
 type MCPStatus struct {
@@ -65,7 +66,7 @@ func RunMCP(ctx context.Context, options MCPOptions) error {
 		}
 		result := MCPStatus{Jobs: make([]MCPJob, 0, len(jobs))}
 		for _, job := range jobs {
-			result.Jobs = append(result.Jobs, MCPJob{ID: job.ID, Task: job.Task, Ref: job.Ref, State: job.State, ExitCode: job.ExitCode})
+			result.Jobs = append(result.Jobs, MCPJob{ID: job.ID, Task: job.Task, Ref: job.Ref, TestedSHA: job.TestedSHA, State: job.State, ExitCode: job.ExitCode})
 		}
 		return nil, result, nil
 	})

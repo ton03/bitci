@@ -108,7 +108,11 @@ func (controller *Controller) cleanGeneratedNext(ctx context.Context) error {
 }
 
 func (controller *Controller) cleanCheckout(ctx context.Context) error {
-	output, err := controller.git(ctx, "status", "--porcelain", "--untracked-files=all")
+	args := []string{"status", "--porcelain", "--untracked-files=all"}
+	if relative, ok := controller.checkoutStatePath(); ok {
+		args = append(args, "--", ".", ":(exclude)"+filepath.ToSlash(relative))
+	}
+	output, err := controller.git(ctx, args...)
 	if err != nil {
 		return err
 	}
@@ -116,6 +120,22 @@ func (controller *Controller) cleanCheckout(ctx context.Context) error {
 		return fmt.Errorf("dedicated checkout must be clean before staging")
 	}
 	return nil
+}
+
+func (controller *Controller) checkoutStatePath() (string, bool) {
+	checkout, err := filepath.Abs(filepath.Dir(controller.configPath))
+	if err != nil {
+		return "", false
+	}
+	state, err := filepath.Abs(controller.stateDir)
+	if err != nil {
+		return "", false
+	}
+	relative, err := filepath.Rel(checkout, state)
+	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	return relative, true
 }
 
 func (controller *Controller) git(ctx context.Context, args ...string) (string, error) {

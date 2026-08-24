@@ -386,14 +386,17 @@ func TestLiveLogAvailableBeforeJobFinishes(t *testing.T) {
 	}
 }
 
-func TestSubmitRecordsAndVerifiesCheckoutSHA(t *testing.T) {
+func TestJobRunsInRecordedCheckoutSHA(t *testing.T) {
 	checkout := t.TempDir()
 	configPath := filepath.Join(checkout, "bitci.json")
-	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["sh","-c","test \"$(cat marker)\" = initial"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, "marker"), []byte("initial"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	git(t, checkout, "init", "-q")
-	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "add", "bitci.json", "marker")
 	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
 	sha := git(t, checkout, "rev-parse", "HEAD")
 	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
@@ -420,8 +423,11 @@ func TestSubmitRecordsAndVerifiesCheckoutSHA(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got[0].State != "failed" || got[0].ExitCode == nil || *got[0].ExitCode != 126 {
-		t.Fatalf("mismatched checkout job = %#v", got[0])
+	if got[0].State != "passed" || got[0].TestedSHA != sha {
+		t.Fatalf("recorded checkout job = %#v", got[0])
+	}
+	if _, err := os.Stat(filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", jobs[0].ID))); !os.IsNotExist(err) {
+		t.Fatalf("job worktree remains: %v", err)
 	}
 }
 
@@ -464,7 +470,7 @@ func TestStagePRChecksTrustAndCleansNext(t *testing.T) {
 		fmt.Fprintf(writer, `{"head":{"sha":%q,"repo":{"full_name":"owner/repo"}},"base":{"repo":{"full_name":"owner/repo"}}}`, prSHA)
 	}))
 	defer server.Close()
-	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	controller, err := Open(configPath, filepath.Join(checkout, ".bitci"))
 	if err != nil {
 		t.Fatal(err)
 	}
