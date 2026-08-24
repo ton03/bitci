@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -31,6 +32,7 @@ type Controller struct {
 	db             *sql.DB
 	githubAPI      string
 	githubRepo     string
+	worktreeMu     sync.Mutex
 }
 
 type Job struct {
@@ -418,6 +420,9 @@ func checkoutSHA(directory string) (string, error) {
 }
 
 func (controller *Controller) jobCheckout(ctx context.Context, job Job) (string, func() error, error) {
+	controller.worktreeMu.Lock()
+	defer controller.worktreeMu.Unlock()
+
 	checkoutRoot, configRelative, err := controller.jobLocation(job)
 	if err != nil {
 		return "", func() error { return nil }, err
@@ -572,6 +577,9 @@ func (controller *Controller) RecoverInterrupted() error {
 }
 
 func (controller *Controller) removeJobWorktree(id int64, checkoutRoot string) error {
+	controller.worktreeMu.Lock()
+	defer controller.worktreeMu.Unlock()
+
 	path := filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", id))
 	if checkoutRoot == "" {
 		checkoutRoot = controller.gitDirectory()
