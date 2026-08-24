@@ -84,8 +84,12 @@ human CLI --> local queue and logs
 - BitCI keeps each recorded SHA reachable with a private Git ref while it keeps its job record.
 - `status`, `logs`, `cancel`, and `retry` inspect or control the queue.
 
-`cancel` affects queued work only. Retry only after reading logs. Logs are not
-redacted in this alpha. Never print secrets from tasks.
+`cancel` affects queued work only. Retry only after reading logs. Never print
+secrets from tasks.
+
+Use literal `redact` values to hide known secrets from BitCI log reads. It does
+not change the retained files. Use `log_retention` to keep the newest N
+finished job logs; `0` removes every older log before the next job starts.
 
 ### Task environment
 

@@ -868,6 +868,9 @@ func pathWithin(root, path string) bool {
 }
 
 func (controller *Controller) startLog(job *Job) (*os.File, error) {
+	if err := controller.pruneLogs(); err != nil {
+		return nil, err
+	}
 	job.LogPath = filepath.Join(controller.stateDir, "logs", fmt.Sprintf("job-%d.log", job.ID))
 	if err := os.MkdirAll(filepath.Dir(job.LogPath), 0o700); err != nil {
 		return nil, err
@@ -881,6 +884,42 @@ func (controller *Controller) startLog(job *Job) (*os.File, error) {
 		return nil, err
 	}
 	return file, nil
+}
+
+func (controller *Controller) pruneLogs() error {
+	rows, err := controller.db.Query("SELECT id, COALESCE(log_path, '') FROM jobs WHERE state IN ('passed', 'failed', 'cancelled') AND COALESCE(log_path, '') != '' ORDER BY finished_at DESC, id DESC LIMIT -1 OFFSET ?", controller.config.LogRetention)
+	if err != nil {
+		return err
+	}
+	type logRecord struct {
+		id   int64
+		path string
+	}
+	var records []logRecord
+	for rows.Next() {
+		var record logRecord
+		if err := rows.Scan(&record.id, &record.path); err != nil {
+			rows.Close()
+			return err
+		}
+		records = append(records, record)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, record := range records {
+		if err := os.Remove(record.path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		if _, err := controller.db.Exec("UPDATE jobs SET log_path = NULL WHERE id = ?", record.id); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (controller *Controller) execute(parent context.Context, task Task, output io.Writer, directory string) int {
@@ -1015,24 +1054,24 @@ func (controller *Controller) Retry(id int64) ([]Job, error) {
 }
 
 func (controller *Controller) TailLog(id int64, limit int) ([]string, error) {
-	file, err := controller.logFile(id)
+	file, redact, err := controller.logFile(id)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
-	return scanLog(file, limit, func(string) bool { return true })
+	return scanLog(file, limit, func(string) bool { return true }, redact)
 }
 
 func (controller *Controller) SearchLog(id int64, query string, limit int) ([]string, error) {
 	if query == "" {
 		return nil, fmt.Errorf("search query must not be empty")
 	}
-	file, err := controller.logFile(id)
+	file, redact, err := controller.logFile(id)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
-	return scanLog(file, limit, func(line string) bool { return strings.Contains(line, query) })
+	return scanLog(file, limit, func(line string) bool { return strings.Contains(line, query) }, redact)
 }
 
 const maxLogReadBytes = 1024 * 1024
@@ -1046,8 +1085,8 @@ type LogCursorOutput struct {
 // ReadLog returns complete lines written after cursor. The cursor advances only
 // after a newline, so a later call can safely read a line still being written.
 func (controller *Controller) ReadLog(id, cursor int64, limit int) (LogCursorOutput, error) {
-	var logPath, state string
-	if err := controller.db.QueryRow("SELECT COALESCE(log_path, ''), state FROM jobs WHERE id = ?", id).Scan(&logPath, &state); err != nil {
+	var logPath, state, configJSON string
+	if err := controller.db.QueryRow("SELECT COALESCE(log_path, ''), state, COALESCE(config_json, '') FROM jobs WHERE id = ?", id).Scan(&logPath, &state, &configJSON); err != nil {
 		return LogCursorOutput{}, err
 	}
 	output := LogCursorOutput{Lines: []string{}, Cursor: cursor, State: state}
@@ -1056,6 +1095,10 @@ func (controller *Controller) ReadLog(id, cursor int64, limit int) (LogCursorOut
 	}
 	if logPath == "" {
 		return output, nil
+	}
+	redact, err := controller.logRedaction(configJSON)
+	if err != nil {
+		return LogCursorOutput{}, fmt.Errorf("load job log redaction: %w", err)
 	}
 	file, err := os.Open(logPath)
 	if err != nil {
@@ -1082,10 +1125,10 @@ func (controller *Controller) ReadLog(id, cursor int64, limit int) (LogCursorOut
 		line, err := reader.ReadString('\n')
 		readCursor += int64(len(line))
 		if len(line) > 0 && strings.HasSuffix(line, "\n") {
-			output.Lines = append(output.Lines, strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r"))
+			output.Lines = append(output.Lines, redactLogLine(strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r"), redact))
 			output.Cursor = readCursor
 		} else if len(line) > 0 && err == io.EOF && terminalJobState(state) && readCursor == info.Size() {
-			output.Lines = append(output.Lines, strings.TrimSuffix(line, "\r"))
+			output.Lines = append(output.Lines, redactLogLine(strings.TrimSuffix(line, "\r"), redact))
 			output.Cursor = readCursor
 		}
 		if err != nil {
@@ -1102,22 +1145,35 @@ func terminalJobState(state string) bool {
 	return state == "passed" || state == "failed" || state == "cancelled"
 }
 
-func (controller *Controller) logFile(id int64) (*os.File, error) {
-	var logPath string
-	if err := controller.db.QueryRow("SELECT COALESCE(log_path, '') FROM jobs WHERE id = ?", id).Scan(&logPath); err != nil {
-		return nil, err
+func (controller *Controller) logFile(id int64) (*os.File, []string, error) {
+	var logPath, configJSON string
+	if err := controller.db.QueryRow("SELECT COALESCE(log_path, ''), COALESCE(config_json, '') FROM jobs WHERE id = ?", id).Scan(&logPath, &configJSON); err != nil {
+		return nil, nil, err
 	}
 	if logPath == "" {
-		return nil, fmt.Errorf("job %d has no log", id)
+		return nil, nil, fmt.Errorf("job %d has no log", id)
+	}
+	redact, err := controller.logRedaction(configJSON)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load job log redaction: %w", err)
 	}
 	file, err := os.Open(logPath)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return file, nil
+	return file, redact, nil
 }
 
-func scanLog(file *os.File, limit int, include func(string) bool) ([]string, error) {
+func (controller *Controller) logRedaction(configJSON string) ([]string, error) {
+	config, err := controller.snapshotConfig(configJSON)
+	if err != nil {
+		return nil, err
+	}
+	redact := append([]string{}, config.Redact...)
+	return append(redact, controller.config.Redact...), nil
+}
+
+func scanLog(file *os.File, limit int, include func(string) bool, redact []string) ([]string, error) {
 	limit = logLimit(limit)
 	lines := make([]string, 0, limit)
 	scanner := bufio.NewScanner(file)
@@ -1127,6 +1183,7 @@ func scanLog(file *os.File, limit int, include func(string) bool) ([]string, err
 		if !include(line) {
 			continue
 		}
+		line = redactLogLine(line, redact)
 		if len(lines) == limit {
 			copy(lines, lines[1:])
 			lines[len(lines)-1] = line
@@ -1135,6 +1192,13 @@ func scanLog(file *os.File, limit int, include func(string) bool) ([]string, err
 		lines = append(lines, line)
 	}
 	return lines, scanner.Err()
+}
+
+func redactLogLine(line string, redact []string) string {
+	for _, value := range redact {
+		line = strings.ReplaceAll(line, value, "[REDACTED]")
+	}
+	return line
 }
 
 func logLimit(limit int) int {

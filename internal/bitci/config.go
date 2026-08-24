@@ -16,6 +16,8 @@ type Config struct {
 	Resources    map[string]int  `json:"resources"`
 	MinFreeBytes uint64          `json:"min_free_bytes"`
 	Prepare      []string        `json:"prepare"`
+	LogRetention int             `json:"log_retention"`
+	Redact       []string        `json:"redact"`
 	Tasks        map[string]Task `json:"tasks"`
 }
 
@@ -61,6 +63,17 @@ func (config Config) Validate() error {
 	}
 	if len(config.Prepare) > 0 && config.Prepare[0] == "" {
 		return fmt.Errorf("prepare needs a command argv")
+	}
+	if config.LogRetention < 0 {
+		return fmt.Errorf("log_retention must not be negative")
+	}
+	for _, value := range config.Redact {
+		if value == "" {
+			return fmt.Errorf("redact values must not be empty")
+		}
+		if strings.ContainsAny(value, "\r\n") {
+			return fmt.Errorf("redact values must not contain line breaks")
+		}
 	}
 	for name, limit := range config.Resources {
 		if name == "" || limit < 1 {
