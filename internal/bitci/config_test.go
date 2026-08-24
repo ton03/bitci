@@ -862,6 +862,40 @@ func TestRecordedSHARejectsCheckoutAbsoluteExecutable(t *testing.T) {
 	}
 }
 
+func TestRecordedSHARejectsCheckoutPathExecutable(t *testing.T) {
+	checkout := t.TempDir()
+	runner := filepath.Join(checkout, "runner")
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(runner, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["runner"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json", "runner")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	t.Setenv("PATH", checkout+string(os.PathListSeparator)+os.Getenv("PATH"))
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 126 {
+		t.Fatalf("PATH executable job = %#v", jobs[0])
+	}
+}
+
 func TestNestedConfigChecksWholeCheckout(t *testing.T) {
 	checkout := t.TempDir()
 	configDir := filepath.Join(checkout, "ci")

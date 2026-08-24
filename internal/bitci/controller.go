@@ -603,7 +603,14 @@ func (controller *Controller) jobConfig(job Job) (Config, Task, error) {
 
 func (controller *Controller) isCheckoutExecutable(command string) bool {
 	if !filepath.IsAbs(command) {
-		return false
+		if strings.ContainsRune(command, filepath.Separator) {
+			return false
+		}
+		resolved, err := exec.LookPath(command)
+		if err != nil {
+			return false
+		}
+		command = resolved
 	}
 	checkout, err := controller.git(context.Background(), "rev-parse", "--show-toplevel")
 	if err != nil {
