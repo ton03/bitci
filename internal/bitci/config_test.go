@@ -1118,6 +1118,9 @@ func TestRetryCapRecordsHistory(t *testing.T) {
 	if third[0].Attempt != 3 || third[0].RetryOf == nil || *third[0].RetryOf != retried[0].ID || third[0].PriorExitCode == nil || *third[0].PriorExitCode != 1 {
 		t.Fatalf("third retry history = %#v", third[0])
 	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run third retry = %v, %v", ran, err)
+	}
 	if _, err := controller.Retry(original[0].ID); err == nil || !strings.Contains(err.Error(), "max_retries 2") {
 		t.Fatalf("retry cap error = %v", err)
 	}
@@ -1143,6 +1146,28 @@ func TestRetryRejectsQueuedJob(t *testing.T) {
 	}
 	if len(stored) != 1 || stored[0].State != "queued" {
 		t.Fatalf("queued job changed after retry = %#v", stored)
+	}
+}
+
+func TestRetryRejectsPendingLatestAttempt(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["false"]}}}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	original, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run original = %v, %v", ran, err)
+	}
+	if _, err := controller.Retry(original[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.Retry(original[0].ID); err == nil || !strings.Contains(err.Error(), "pending retry") {
+		t.Fatalf("pending retry error = %v", err)
 	}
 }
 
@@ -1174,7 +1199,7 @@ func TestRetryCapSerializesConcurrentRetries(t *testing.T) {
 	for range 2 {
 		if err := <-results; err == nil {
 			successes++
-		} else if !strings.Contains(err.Error(), "max_retries 1") {
+		} else if !strings.Contains(err.Error(), "max_retries 1") && !strings.Contains(err.Error(), "pending retry") {
 			t.Fatalf("concurrent retry error = %v", err)
 		}
 	}

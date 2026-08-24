@@ -84,7 +84,7 @@ human CLI --> local queue and logs
 - BitCI keeps each recorded SHA reachable with a private Git ref while it keeps its job record.
 - `status`, `logs`, `cancel`, and `retry` inspect or control the queue.
 
-`max_retries` caps manual reruns for that task. Omit it for no cap. BitCI never
+`max_retries` caps manual reruns for that task. Omit it or set `0` for no cap. BitCI never
 retries jobs automatically. Status records each attempt, prior exit code, queue
 wait, duration, and terminal result.
 

@@ -1121,6 +1121,7 @@ func (controller *Controller) Retry(id int64) ([]Job, error) {
 		attempt  int
 		root     int64
 		exitCode *int
+		state    string
 	}
 	historyByTask := map[string]history{}
 	rows, err := controller.db.Query("SELECT id, task, COALESCE(attempt, 1), COALESCE(retry_root, id), exit_code FROM jobs WHERE batch = ?", batch)
@@ -1150,8 +1151,11 @@ func (controller *Controller) Retry(id int64) ([]Job, error) {
 			return nil, fmt.Errorf("retry history lacks task %q", name)
 		}
 		var latest history
-		if err := controller.db.QueryRow("SELECT id, COALESCE(attempt, 1), exit_code FROM jobs WHERE COALESCE(retry_root, id) = ? ORDER BY COALESCE(attempt, 1) DESC, id DESC LIMIT 1", item.root).Scan(&latest.id, &latest.attempt, &latest.exitCode); err != nil {
+		if err := controller.db.QueryRow("SELECT id, COALESCE(attempt, 1), exit_code, state FROM jobs WHERE COALESCE(retry_root, id) = ? ORDER BY COALESCE(attempt, 1) DESC, id DESC LIMIT 1", item.root).Scan(&latest.id, &latest.attempt, &latest.exitCode, &latest.state); err != nil {
 			return nil, err
+		}
+		if latest.state == "queued" || latest.state == "running" {
+			return nil, fmt.Errorf("task %q already has a pending retry", name)
 		}
 		if config.Tasks[name].MaxRetries > 0 && latest.attempt > config.Tasks[name].MaxRetries {
 			return nil, fmt.Errorf("task %q reached max_retries %d", name, config.Tasks[name].MaxRetries)
