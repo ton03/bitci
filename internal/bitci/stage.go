@@ -82,7 +82,10 @@ func (controller *Controller) StagePR(ctx context.Context, number int, token str
 }
 
 func (controller *Controller) protectStateFromTarget(ctx context.Context, sha string) error {
-	relative, ok := controller.checkoutStatePath()
+	relative, ok, err := controller.checkoutStatePath()
+	if err != nil {
+		return err
+	}
 	if !ok {
 		return nil
 	}
@@ -158,7 +161,11 @@ func resolvedPathForComparison(path string) string {
 
 func (controller *Controller) cleanCheckout(ctx context.Context) error {
 	args := []string{"status", "--porcelain", "--untracked-files=all"}
-	if relative, ok := controller.checkoutStatePath(); ok {
+	relative, ok, err := controller.checkoutStatePath()
+	if err != nil {
+		return err
+	}
+	if ok {
 		tracked, err := controller.git(ctx, "ls-files", "--", ":(top,literal)"+filepath.ToSlash(relative))
 		if err != nil {
 			return err
@@ -178,24 +185,83 @@ func (controller *Controller) cleanCheckout(ctx context.Context) error {
 	return nil
 }
 
-func (controller *Controller) checkoutStatePath() (string, bool) {
-	checkout, err := controller.git(context.Background(), "rev-parse", "--show-toplevel")
+func (controller *Controller) checkoutStatePath() (string, bool, error) {
+	checkout := controller.gitDirectory()
+	if controller.checkoutRoot != "" {
+		checkout = controller.checkoutRoot
+	}
+	checkout = filepath.Clean(checkout)
+	state := filepath.Clean(controller.stateDir)
+	if lexicalRoot := controller.lexicalCheckoutRoot(checkout); lexicalRoot != "" {
+		if lexicalRelative, err := filepath.Rel(lexicalRoot, state); err == nil && lexicalRelative != "." && lexicalRelative != ".." && !strings.HasPrefix(lexicalRelative, ".."+string(filepath.Separator)) {
+			usesSymlink, err := pathUsesSymlink(lexicalRoot, lexicalRelative)
+			if err != nil {
+				return "", false, err
+			}
+			if usesSymlink {
+				return "", false, fmt.Errorf("state directory must not use a symlink inside the checkout")
+			}
+		}
+	}
+	resolvedState := resolvedPathForComparison(state)
+	relative, ok := relativeWithin(checkout, resolvedState)
+	if !ok || relative == "." {
+		return "", false, nil
+	}
+	usesSymlink, err := pathUsesSymlink(checkout, relative)
 	if err != nil {
+		return "", false, err
+	}
+	if usesSymlink {
+		return "", false, fmt.Errorf("state directory must not use a symlink inside the checkout")
+	}
+	return relative, true, nil
+}
+
+func relativeWithin(root, path string) (string, bool) {
+	relative, err := filepath.Rel(root, path)
+	if err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return relative, true
+	}
+	root = filepath.Clean(root)
+	path = filepath.Clean(path)
+	prefix := root + string(filepath.Separator)
+	if !pathWithin(root, path) || len(path) <= len(prefix) || !strings.EqualFold(path[:len(prefix)], prefix) {
 		return "", false
 	}
-	checkout, err = filepath.EvalSymlinks(strings.TrimSpace(checkout))
-	if err != nil {
-		return "", false
+	return path[len(prefix):], true
+}
+
+func (controller *Controller) lexicalCheckoutRoot(checkout string) string {
+	path := filepath.Dir(controller.configPath)
+	for {
+		if resolvedPathForComparison(path) == checkout {
+			return path
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			return ""
+		}
+		path = parent
 	}
-	state, err := filepath.EvalSymlinks(controller.stateDir)
-	if err != nil {
-		return "", false
+}
+
+func pathUsesSymlink(root, relative string) (bool, error) {
+	path := root
+	for _, part := range strings.Split(relative, string(filepath.Separator)) {
+		path = filepath.Join(path, part)
+		info, err := os.Lstat(path)
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return true, nil
+		}
 	}
-	relative, err := filepath.Rel(checkout, state)
-	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return "", false
-	}
-	return relative, true
+	return false, nil
 }
 
 func (controller *Controller) git(ctx context.Context, args ...string) (string, error) {

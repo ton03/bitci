@@ -81,10 +81,24 @@ human CLI --> local queue and logs
 - `submit` records those task IDs, their config, and the source SHA.
 - `serve` claims FIFO jobs when worker, disk, and resource limits allow them.
 - SHA-backed jobs run in a detached worktree. Each result records `tested_sha`.
+- BitCI keeps each recorded SHA reachable with a private Git ref while it keeps its job record.
 - `status`, `logs`, `cancel`, and `retry` inspect or control the queue.
 
 `cancel` affects queued work only. Retry only after reading logs. Logs are not
 redacted in this alpha. Never print secrets from tasks.
+
+### Task environment
+
+Use `env` for fixed, task-specific values. BitCI inherits the controller
+environment, then applies these values. Agents cannot supply environment values.
+Do not put secrets in `bitci.json` or task output.
+
+```json
+"unit": {
+  "run": ["go", "test", "./..."],
+  "env": {"CI": "true"}
+}
+```
 
 ## Keep it running on macOS
 

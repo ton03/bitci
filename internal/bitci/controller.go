@@ -14,7 +14,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -30,6 +32,7 @@ type Controller struct {
 	db             *sql.DB
 	githubAPI      string
 	githubRepo     string
+	worktreeMu     sync.Mutex
 }
 
 type Job struct {
@@ -60,9 +63,6 @@ func Open(configPath, stateDir string) (*Controller, error) {
 	if err != nil {
 		return nil, err
 	}
-	if gitDirectory, err := gitCommonDirectory(absoluteConfig); err == nil && pathsOverlap(absoluteState, gitDirectory) {
-		return nil, fmt.Errorf("state directory must not overlap Git metadata")
-	}
 	controller, err := OpenState(absoluteConfig, absoluteState)
 	if err != nil {
 		return nil, err
@@ -89,6 +89,9 @@ func OpenState(configPath, stateDir string) (*Controller, error) {
 		return nil, err
 	}
 	stateDir = absoluteState
+	if gitDirectory, err := gitCommonDirectory(configPath); err == nil && pathsOverlap(stateDir, gitDirectory) {
+		return nil, fmt.Errorf("state directory must not overlap Git metadata")
+	}
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		return nil, err
 	}
@@ -202,10 +205,6 @@ func (controller *Controller) hasJobColumn(name string) (bool, error) {
 }
 
 func (controller *Controller) Submit(taskNames []string, ref string) ([]Job, error) {
-	ordered, err := controller.config.Ordered(taskNames)
-	if err != nil {
-		return nil, err
-	}
 	checkoutRoot, configRelative := "", ""
 	if sha, err := controller.checkoutSHA(); err == nil {
 		if isCheckoutSHA(ref) && ref != sha {
@@ -220,17 +219,43 @@ func (controller *Controller) Submit(taskNames []string, ref string) ([]Job, err
 	} else if isCheckoutSHA(ref) {
 		return nil, fmt.Errorf("cannot submit requested checkout SHA: %w", err)
 	}
+	return controller.submit(controller.config, taskNames, ref, checkoutRoot, configRelative)
+}
+
+func (controller *Controller) submit(config Config, taskNames []string, ref, checkoutRoot, configRelative string) ([]Job, error) {
+	ordered, err := config.Ordered(taskNames)
+	if err != nil {
+		return nil, err
+	}
 	batch, err := newBatch()
 	if err != nil {
 		return nil, err
 	}
+	pinnedRef := ""
+	if checkoutRoot != "" && isCheckoutSHA(ref) {
+		// A commit stored only in SQLite can disappear after a force-push and Git
+		// garbage collection. Keep it reachable for the lifetime of its job records.
+		if _, err := gitAt(context.Background(), checkoutRoot, "update-ref", "refs/bitci/jobs/"+batch, ref); err != nil {
+			return nil, fmt.Errorf("pin recorded checkout SHA: %w", err)
+		}
+		pinnedRef = "refs/bitci/jobs/" + batch
+	}
 	transaction, err := controller.db.Begin()
 	if err != nil {
+		if pinnedRef != "" {
+			_, _ = gitAt(context.Background(), checkoutRoot, "update-ref", "-d", pinnedRef)
+		}
 		return nil, err
 	}
-	defer transaction.Rollback()
+	committed := false
+	defer func() {
+		transaction.Rollback()
+		if !committed && pinnedRef != "" {
+			_, _ = gitAt(context.Background(), checkoutRoot, "update-ref", "-d", pinnedRef)
+		}
+	}()
 	jobs := make([]Job, 0, len(ordered))
-	configJSON, err := json.Marshal(controller.config)
+	configJSON, err := json.Marshal(config)
 	if err != nil {
 		return nil, err
 	}
@@ -251,6 +276,7 @@ func (controller *Controller) Submit(taskNames []string, ref string) ([]Job, err
 	if err := transaction.Commit(); err != nil {
 		return nil, err
 	}
+	committed = true
 	return jobs, nil
 }
 
@@ -289,15 +315,15 @@ func (controller *Controller) RunOnce(ctx context.Context, maxWorkers int) (bool
 		worktreeRoot = filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", job.ID))
 	}
 	code := 0
-	if isCheckoutSHA(job.Ref) && len(config.Prepare) > 0 && controller.isCheckoutExecutable(config.Prepare[0], job.checkoutRoot, worktreeRoot, workDir) {
-		fmt.Fprintln(logFile, "BitCI refuses a checkout-local absolute prepare executable for a recorded SHA job")
+	if isCheckoutSHA(job.Ref) && len(config.Prepare) > 0 && controller.hasUnsafeCheckoutArgument(config.Prepare, job.checkoutRoot, worktreeRoot, workDir) {
+		fmt.Fprintln(logFile, "BitCI refuses an unsafe checkout-local prepare argument for a recorded SHA job")
 		code = 126
 	} else {
 		if isCheckoutSHA(job.Ref) && len(config.Prepare) > 0 {
 			code = controller.executeCommand(ctx, config.Prepare, task.Timeout, logFile, workDir)
 		}
-		if code == 0 && isCheckoutSHA(job.Ref) && controller.isCheckoutExecutable(task.Run[0], job.checkoutRoot, worktreeRoot, workDir) {
-			fmt.Fprintln(logFile, "BitCI refuses a checkout-local absolute task executable for a recorded SHA job")
+		if code == 0 && isCheckoutSHA(job.Ref) && controller.hasUnsafeCheckoutArgument(task.Run, job.checkoutRoot, worktreeRoot, workDir) {
+			fmt.Fprintln(logFile, "BitCI refuses an unsafe checkout-local task argument for a recorded SHA job")
 			code = 126
 		}
 		if code == 0 {
@@ -399,6 +425,9 @@ func checkoutSHA(directory string) (string, error) {
 }
 
 func (controller *Controller) jobCheckout(ctx context.Context, job Job) (string, func() error, error) {
+	controller.worktreeMu.Lock()
+	defer controller.worktreeMu.Unlock()
+
 	checkoutRoot, configRelative, err := controller.jobLocation(job)
 	if err != nil {
 		return "", func() error { return nil }, err
@@ -431,7 +460,7 @@ func (controller *Controller) jobCheckout(ctx context.Context, job Job) (string,
 }
 
 func isCheckoutSHA(value string) bool {
-	if len(value) != 40 {
+	if len(value) != 40 && len(value) != 64 {
 		return false
 	}
 	for _, character := range value {
@@ -446,14 +475,14 @@ func (controller *Controller) Serve(ctx context.Context, maxWorkers int, interva
 	if maxWorkers < 1 {
 		return fmt.Errorf("max-workers must be positive")
 	}
-	if err := controller.RecoverInterrupted(); err != nil {
-		return err
-	}
 	listener, err := controller.Listen(socketPath)
 	if err != nil {
 		return err
 	}
 	defer listener.Close()
+	if err := controller.RecoverInterrupted(); err != nil {
+		return err
+	}
 	if interval <= 0 {
 		interval = time.Second
 	}
@@ -553,6 +582,9 @@ func (controller *Controller) RecoverInterrupted() error {
 }
 
 func (controller *Controller) removeJobWorktree(id int64, checkoutRoot string) error {
+	controller.worktreeMu.Lock()
+	defer controller.worktreeMu.Unlock()
+
 	path := filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", id))
 	if checkoutRoot == "" {
 		checkoutRoot = controller.gitDirectory()
@@ -563,6 +595,8 @@ func (controller *Controller) removeJobWorktree(id int64, checkoutRoot string) e
 		checkoutMissing = true
 	} else if err != nil {
 		failures = append(failures, err)
+	} else if topLevel, err := gitAt(context.Background(), checkoutRoot, "rev-parse", "--show-toplevel"); err != nil || resolvedPathForComparison(strings.TrimSpace(topLevel)) != resolvedPathForComparison(checkoutRoot) {
+		checkoutMissing = true
 	}
 	if _, err := os.Lstat(path); err == nil {
 		if !checkoutMissing {
@@ -777,6 +811,17 @@ func (controller *Controller) isCheckoutExecutable(command, checkoutRoot, worktr
 	return pathWithin(root, resolvedPath)
 }
 
+func (controller *Controller) hasUnsafeCheckoutArgument(argv []string, checkoutRoot, worktreeRoot, workDir string) bool {
+	for index, value := range argv {
+		if index == 0 || filepath.IsAbs(value) || strings.ContainsRune(value, filepath.Separator) {
+			if controller.isCheckoutExecutable(value, checkoutRoot, worktreeRoot, workDir) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func pathOrAncestorWithin(root, path string) bool {
 	for current := path; ; current = filepath.Dir(current) {
 		if resolved, err := filepath.EvalSymlinks(current); err == nil && pathWithin(root, resolved) {
@@ -791,7 +836,22 @@ func pathOrAncestorWithin(root, path string) bool {
 
 func pathWithin(root, path string) bool {
 	relative, err := filepath.Rel(root, path)
-	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
+	if err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return true
+	}
+	rootInfo, err := os.Stat(root)
+	if err != nil {
+		return false
+	}
+	for current := filepath.Clean(path); ; current = filepath.Dir(current) {
+		if info, err := os.Stat(current); err == nil && os.SameFile(rootInfo, info) {
+			return true
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return false
+		}
+	}
 }
 
 func (controller *Controller) startLog(job *Job) (*os.File, error) {
@@ -811,10 +871,14 @@ func (controller *Controller) startLog(job *Job) (*os.File, error) {
 }
 
 func (controller *Controller) execute(parent context.Context, task Task, output io.Writer, directory string) int {
-	return controller.executeCommand(parent, task.Run, task.Timeout, output, directory)
+	return controller.executeCommandWithEnv(parent, task.Run, task.Timeout, output, directory, task.Env)
 }
 
 func (controller *Controller) executeCommand(parent context.Context, argv []string, timeout int, output io.Writer, directory string) int {
+	return controller.executeCommandWithEnv(parent, argv, timeout, output, directory, nil)
+}
+
+func (controller *Controller) executeCommandWithEnv(parent context.Context, argv []string, timeout int, output io.Writer, directory string, environment map[string]string) int {
 	if len(argv) == 0 || argv[0] == "" {
 		fmt.Fprintln(output, "BitCI job has no configured command")
 		return 127
@@ -827,6 +891,7 @@ func (controller *Controller) executeCommand(parent context.Context, argv []stri
 	}
 	command := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	command.Dir = directory
+	command.Env = taskEnvironment(environment)
 	command.Stdout = output
 	command.Stderr = output
 	err := command.Run()
@@ -838,6 +903,32 @@ func (controller *Controller) executeCommand(parent context.Context, argv []stri
 	}
 	fmt.Fprintf(output, "BitCI could not start task: %v\n", err)
 	return 127
+}
+
+func taskEnvironment(overrides map[string]string) []string {
+	if len(overrides) == 0 {
+		return nil
+	}
+	values := map[string]string{}
+	for _, value := range os.Environ() {
+		name, value, ok := strings.Cut(value, "=")
+		if ok {
+			values[name] = value
+		}
+	}
+	for name, value := range overrides {
+		values[name] = value
+	}
+	names := make([]string, 0, len(values))
+	for name := range values {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	environment := make([]string, 0, len(names))
+	for _, name := range names {
+		environment = append(environment, name+"="+values[name])
+	}
+	return environment
 }
 
 func (controller *Controller) finish(job Job, code int, cleanupPending bool) error {
@@ -886,11 +977,28 @@ func (controller *Controller) Cancel(id int64) (bool, error) {
 }
 
 func (controller *Controller) Retry(id int64) ([]Job, error) {
-	var task, ref string
-	if err := controller.db.QueryRow("SELECT task, ref FROM jobs WHERE id = ?", id).Scan(&task, &ref); err != nil {
+	var task, ref, configJSON, checkoutRoot, configRelative string
+	if err := controller.db.QueryRow("SELECT task, ref, COALESCE(config_json, ''), COALESCE(checkout_root, ''), COALESCE(config_relative, '') FROM jobs WHERE id = ?", id).Scan(&task, &ref, &configJSON, &checkoutRoot, &configRelative); err != nil {
 		return nil, err
 	}
-	return controller.Submit([]string{task}, ref)
+	config := controller.config
+	if configJSON != "" {
+		config = Config{}
+		if err := json.Unmarshal([]byte(configJSON), &config); err != nil {
+			return nil, fmt.Errorf("decode retried job configuration: %w", err)
+		}
+		if err := config.Validate(); err != nil {
+			return nil, fmt.Errorf("validate retried job configuration: %w", err)
+		}
+	}
+	if isCheckoutSHA(ref) && checkoutRoot == "" {
+		var err error
+		checkoutRoot, configRelative, err = controller.checkoutLocation()
+		if err != nil {
+			return nil, fmt.Errorf("find checkout for retried SHA: %w", err)
+		}
+	}
+	return controller.submit(config, []string{task}, ref, checkoutRoot, configRelative)
 }
 
 func (controller *Controller) TailLog(id int64, limit int) ([]string, error) {

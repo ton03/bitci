@@ -83,15 +83,28 @@ func servicePath(config Config, checkout string) (string, error) {
 			directories = append(directories, directory)
 		}
 	}
-	commands := make([]string, 0, len(config.Tasks)+1)
+	commands := make([]struct {
+		name          string
+		requireExists bool
+	}, 0, len(config.Tasks)+1)
 	if len(config.Prepare) > 0 {
-		commands = append(commands, config.Prepare[0])
+		commands = append(commands, struct {
+			name          string
+			requireExists bool
+		}{name: config.Prepare[0], requireExists: true})
 	}
 	for _, name := range config.TaskNames() {
-		commands = append(commands, config.Tasks[name].Run[0])
+		commands = append(commands, struct {
+			name          string
+			requireExists bool
+		}{name: config.Tasks[name].Run[0], requireExists: len(config.Prepare) == 0})
 	}
-	for _, command := range commands {
+	for _, configured := range commands {
+		command := configured.name
 		if strings.ContainsRune(command, filepath.Separator) {
+			if !configured.requireExists {
+				continue
+			}
 			if !filepath.IsAbs(command) {
 				command = filepath.Join(checkout, command)
 			}
