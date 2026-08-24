@@ -599,14 +599,20 @@ func (controller *Controller) isCheckoutExecutable(command string) bool {
 	if err != nil {
 		return false
 	}
-	root, err := filepath.EvalSymlinks(strings.TrimSpace(checkout))
+	root, err := filepath.EvalSymlinks(filepath.Clean(strings.TrimSpace(checkout)))
 	if err != nil {
 		return false
 	}
-	path, err := filepath.EvalSymlinks(command)
-	if err != nil {
-		path = command
+	path := filepath.Clean(command)
+	parent, err := filepath.EvalSymlinks(filepath.Dir(path))
+	if err == nil && pathWithin(root, filepath.Join(parent, filepath.Base(path))) {
+		return true
 	}
+	resolvedPath, err := filepath.EvalSymlinks(path)
+	return err == nil && pathWithin(root, resolvedPath)
+}
+
+func pathWithin(root, path string) bool {
 	relative, err := filepath.Rel(root, path)
 	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
 }
