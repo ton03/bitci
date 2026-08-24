@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -806,10 +807,14 @@ func (controller *Controller) startLog(job *Job) (*os.File, error) {
 }
 
 func (controller *Controller) execute(parent context.Context, task Task, output io.Writer, directory string) int {
-	return controller.executeCommand(parent, task.Run, task.Timeout, output, directory)
+	return controller.executeCommandWithEnv(parent, task.Run, task.Timeout, output, directory, task.Env)
 }
 
 func (controller *Controller) executeCommand(parent context.Context, argv []string, timeout int, output io.Writer, directory string) int {
+	return controller.executeCommandWithEnv(parent, argv, timeout, output, directory, nil)
+}
+
+func (controller *Controller) executeCommandWithEnv(parent context.Context, argv []string, timeout int, output io.Writer, directory string, environment map[string]string) int {
 	if len(argv) == 0 || argv[0] == "" {
 		fmt.Fprintln(output, "BitCI job has no configured command")
 		return 127
@@ -822,6 +827,7 @@ func (controller *Controller) executeCommand(parent context.Context, argv []stri
 	}
 	command := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	command.Dir = directory
+	command.Env = taskEnvironment(environment)
 	command.Stdout = output
 	command.Stderr = output
 	err := command.Run()
@@ -833,6 +839,32 @@ func (controller *Controller) executeCommand(parent context.Context, argv []stri
 	}
 	fmt.Fprintf(output, "BitCI could not start task: %v\n", err)
 	return 127
+}
+
+func taskEnvironment(overrides map[string]string) []string {
+	if len(overrides) == 0 {
+		return nil
+	}
+	values := map[string]string{}
+	for _, value := range os.Environ() {
+		name, value, ok := strings.Cut(value, "=")
+		if ok {
+			values[name] = value
+		}
+	}
+	for name, value := range overrides {
+		values[name] = value
+	}
+	names := make([]string, 0, len(values))
+	for name := range values {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	environment := make([]string, 0, len(names))
+	for _, name := range names {
+		environment = append(environment, name+"="+values[name])
+	}
+	return environment
 }
 
 func (controller *Controller) finish(job Job, code int, cleanupPending bool) error {

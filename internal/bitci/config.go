@@ -20,11 +20,12 @@ type Config struct {
 }
 
 type Task struct {
-	Run       []string `json:"run"`
-	Needs     []string `json:"needs"`
-	Resources []string `json:"resources"`
-	Paths     []string `json:"paths"`
-	Timeout   int      `json:"timeout_seconds"`
+	Run       []string          `json:"run"`
+	Env       map[string]string `json:"env"`
+	Needs     []string          `json:"needs"`
+	Resources []string          `json:"resources"`
+	Paths     []string          `json:"paths"`
+	Timeout   int               `json:"timeout_seconds"`
 }
 
 func LoadConfig(filename string) (Config, error) {
@@ -73,6 +74,14 @@ func (config Config) Validate() error {
 		if task.Timeout < 0 {
 			return fmt.Errorf("task %q timeout_seconds must not be negative", name)
 		}
+		for variable, value := range task.Env {
+			if !validEnvironmentName(variable) {
+				return fmt.Errorf("task %q has invalid environment variable %q", name, variable)
+			}
+			if strings.ContainsRune(value, '\x00') {
+				return fmt.Errorf("task %q environment variable %q contains NUL", name, variable)
+			}
+		}
 		for _, need := range task.Needs {
 			if _, ok := config.Tasks[need]; !ok {
 				return fmt.Errorf("task %q needs unknown task %q", name, need)
@@ -86,6 +95,19 @@ func (config Config) Validate() error {
 	}
 	_, err := config.ordered(config.TaskNames())
 	return err
+}
+
+func validEnvironmentName(value string) bool {
+	if value == "" {
+		return false
+	}
+	for index, character := range value {
+		if character == '_' || 'A' <= character && character <= 'Z' || 'a' <= character && character <= 'z' || index > 0 && '0' <= character && character <= '9' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func (config Config) TaskNames() []string {
