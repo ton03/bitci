@@ -44,6 +44,9 @@ func TestConfigContract(t *testing.T) {
 
 func TestStackExamplesValidate(t *testing.T) {
 	root := filepath.Clean(filepath.Join("..", ".."))
+	if _, err := LoadConfig(filepath.Join(root, "bitci.json")); err != nil {
+		t.Fatalf("dogfood pipeline: %v", err)
+	}
 	for _, name := range []string{"go-backend", "node-backend", "nx-monorepo"} {
 		if _, err := LoadConfig(filepath.Join(root, "examples", name+".bitci.json")); err != nil {
 			t.Fatalf("%s example: %v", name, err)
