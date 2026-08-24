@@ -424,10 +424,60 @@ func TestJobRunsInRecordedCheckoutSHA(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got[0].State != "passed" || got[0].TestedSHA != sha {
-		t.Fatalf("recorded checkout job = %#v", got[0])
+		lines, _ := controller.TailLog(got[0].ID, 80)
+		t.Fatalf("recorded checkout job = %#v\n%s", got[0], strings.Join(lines, "\n"))
 	}
 	if _, err := os.Stat(filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", jobs[0].ID))); !os.IsNotExist(err) {
 		t.Fatalf("job worktree remains: %v", err)
+	}
+}
+
+func TestJobRunsFromNestedConfigDirectoryWithRelativeState(t *testing.T) {
+	checkout := t.TempDir()
+	configDir := filepath.Join(checkout, "ci")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(configDir, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["sh","-c","test \"$(cat marker)\" = nested"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "marker"), []byte("nested"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "ci")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "nested")
+	originalDirectory, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateParent := t.TempDir()
+	if err := os.Chdir(stateParent); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(originalDirectory) })
+	controller, err := Open(configPath, "state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if !filepath.IsAbs(controller.stateDir) {
+		t.Fatalf("state directory is relative: %q", controller.stateDir)
+	}
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "passed" {
+		lines, _ := controller.TailLog(jobs[0].ID, 80)
+		t.Fatalf("nested config job = %#v\n%s", jobs[0], strings.Join(lines, "\n"))
 	}
 }
 

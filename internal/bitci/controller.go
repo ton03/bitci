@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -55,7 +56,17 @@ func Open(configPath, stateDir string) (*Controller, error) {
 // OpenState opens only local controller state. It does not read bitci.json.
 // Use it for status from a process outside the configured checkout.
 func OpenState(configPath, stateDir string) (*Controller, error) {
+	absoluteConfig, err := filepath.Abs(configPath)
+	if err != nil {
+		return nil, err
+	}
+	configPath = absoluteConfig
 	stateDir = DefaultStateDir(configPath, stateDir)
+	absoluteState, err := filepath.Abs(stateDir)
+	if err != nil {
+		return nil, err
+	}
+	stateDir = absoluteState
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		return nil, err
 	}
@@ -181,18 +192,26 @@ func (controller *Controller) RunOnce(ctx context.Context, maxWorkers int) (bool
 		return true, controller.finish(job, 127)
 	}
 	workDir := filepath.Dir(controller.configPath)
-	cleanup := func() {}
+	cleanup := func() error { return nil }
 	if isCheckoutSHA(job.Ref) {
 		var err error
 		workDir, cleanup, err = controller.jobCheckout(ctx, job)
 		if err != nil {
 			fmt.Fprintln(logFile, "BitCI could not stage recorded checkout SHA:", err)
+			if cleanupErr := cleanup(); cleanupErr != nil {
+				fmt.Fprintln(logFile, "BitCI could not remove job worktree:", cleanupErr)
+			}
 			logFile.Close()
 			return true, controller.finish(job, 126)
 		}
 	}
-	defer cleanup()
 	code := controller.execute(ctx, task, logFile, workDir)
+	if err := cleanup(); err != nil {
+		fmt.Fprintln(logFile, "BitCI could not remove job worktree:", err)
+		if code == 0 {
+			code = 125
+		}
+	}
 	if err := logFile.Close(); err != nil && code == 0 {
 		code = 127
 	}
@@ -216,7 +235,7 @@ func checkoutSHA(directory string) (string, error) {
 	return sha, nil
 }
 
-func (controller *Controller) jobCheckout(ctx context.Context, job Job) (string, func(), error) {
+func (controller *Controller) jobCheckout(ctx context.Context, job Job) (string, func() error, error) {
 	root := filepath.Join(controller.stateDir, "worktrees")
 	path := filepath.Join(root, fmt.Sprintf("job-%d", job.ID))
 	if err := os.MkdirAll(root, 0o700); err != nil {
@@ -227,20 +246,56 @@ func (controller *Controller) jobCheckout(ctx context.Context, job Job) (string,
 	} else if !os.IsNotExist(err) {
 		return "", nil, err
 	}
-	if _, err := controller.git(ctx, "worktree", "add", "--detach", path, job.Ref); err != nil {
-		return "", nil, fmt.Errorf("create job worktree: %w", err)
+	cleanup := func() error {
+		var failures []error
+		if _, err := os.Lstat(path); err == nil {
+			if _, err := controller.git(context.Background(), "worktree", "remove", "--force", path); err != nil {
+				failures = append(failures, err)
+			}
+		} else if !os.IsNotExist(err) {
+			failures = append(failures, err)
+		}
+		if err := os.RemoveAll(path); err != nil {
+			failures = append(failures, err)
+		}
+		if _, err := controller.git(context.Background(), "worktree", "prune"); err != nil {
+			failures = append(failures, err)
+		}
+		return errors.Join(failures...)
 	}
-	cleanup := func() { _, _ = controller.git(context.Background(), "worktree", "remove", "--force", path) }
+	if _, err := controller.git(ctx, "worktree", "add", "--detach", path, job.Ref); err != nil {
+		return "", nil, fmt.Errorf("create job worktree: %w", errors.Join(err, cleanup()))
+	}
 	sha, err := checkoutSHA(path)
 	if err != nil || sha != job.Ref {
-		cleanup()
+		if cleanupErr := cleanup(); cleanupErr != nil {
+			return "", nil, fmt.Errorf("verify job worktree SHA and remove worktree: %w", cleanupErr)
+		}
 		return "", nil, fmt.Errorf("verify job worktree SHA")
 	}
 	if _, err := controller.db.Exec("UPDATE jobs SET tested_sha = ? WHERE id = ?", sha, job.ID); err != nil {
-		cleanup()
+		if cleanupErr := cleanup(); cleanupErr != nil {
+			return "", nil, fmt.Errorf("record tested SHA and remove worktree: %w", cleanupErr)
+		}
 		return "", nil, err
 	}
-	return path, cleanup, nil
+	checkout, err := controller.git(ctx, "rev-parse", "--show-toplevel")
+	if err != nil {
+		return "", cleanup, fmt.Errorf("find checkout root: %w", err)
+	}
+	checkoutRoot, err := filepath.EvalSymlinks(strings.TrimSpace(checkout))
+	if err != nil {
+		return "", cleanup, fmt.Errorf("resolve checkout root: %w", err)
+	}
+	configDirectory, err := filepath.EvalSymlinks(filepath.Dir(controller.configPath))
+	if err != nil {
+		return "", cleanup, fmt.Errorf("resolve config directory: %w", err)
+	}
+	relative, err := filepath.Rel(checkoutRoot, configDirectory)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", cleanup, fmt.Errorf("config must be inside its Git checkout")
+	}
+	return filepath.Join(path, relative), cleanup, nil
 }
 
 func isCheckoutSHA(value string) bool {
