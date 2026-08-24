@@ -67,7 +67,7 @@ below when this project needs an always-on controller.
 bitci.json --plan/submit--> SQLite queue --claim--> serve
                                                |       |
                                                |       +--> resource leases
-                                               |       +--> recorded-SHA worktree
+                                               |       +--> recorded-SHA checkout
                                                |       +--> configured argv
                                                |       +--> capped local log
                                                v
@@ -80,7 +80,10 @@ human CLI --> local queue and logs
 - `plan` selects task IDs from changed paths.
 - `submit` records those task IDs, their config, and the source SHA.
 - `serve` claims FIFO jobs when worker, disk, and resource limits allow them.
-- SHA-backed jobs run in a detached worktree. Each result records `tested_sha`.
+- SHA-backed jobs run in a detached checkout with independent Git metadata.
+  The checkout reads source objects through Git alternates.
+  Its Git commands cannot change source refs or config.
+  Each result records `tested_sha`.
 - BitCI keeps each recorded SHA reachable with a private Git ref until its batch finishes.
 - `status`, `logs`, `cancel`, and `retry` inspect or control the queue.
 
@@ -192,7 +195,7 @@ Copy an example for a [Go backend](examples/go-backend.bitci.json),
 [Nx monorepo](examples/nx-monorepo.bitci.json). BitCI runs configured argv; it
 does not require a framework preset. SHA-isolated jobs start with tracked files
 only. Use `prepare` for a safe, configured bootstrap that BitCI runs in each
-job worktree before its task; the Node and Nx examples use `npm ci`.
+job checkout before its task; the Node and Nx examples use `npm ci`.
 
 Alpha tags use `v0.0.1-alpha.N`. Each tag builds macOS and Linux archives with
 checksums. See [SECURITY.md](SECURITY.md) before exposing a controller.

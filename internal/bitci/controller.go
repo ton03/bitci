@@ -55,13 +55,9 @@ func Open(configPath, stateDir string) (*Controller, error) {
 	if err != nil {
 		return nil, err
 	}
-	absoluteConfig, err := filepath.Abs(configPath)
+	absoluteConfig, err := canonicalConfigPath(configPath, true)
 	if err != nil {
 		return nil, err
-	}
-	absoluteConfig, err = filepath.EvalSymlinks(absoluteConfig)
-	if err != nil {
-		return nil, fmt.Errorf("resolve config file: %w", err)
 	}
 	stateDir = DefaultStateDir(absoluteConfig, stateDir)
 	absoluteState, err := filepath.Abs(stateDir)
@@ -83,15 +79,9 @@ func Open(configPath, stateDir string) (*Controller, error) {
 // OpenState opens only local controller state. It does not read bitci.json.
 // Use it for status from a process outside the configured checkout.
 func OpenState(configPath, stateDir string) (*Controller, error) {
-	absoluteConfig, err := filepath.Abs(configPath)
+	configPath, err := canonicalConfigPath(configPath, false)
 	if err != nil {
 		return nil, err
-	}
-	configPath = absoluteConfig
-	if resolvedConfig, resolveErr := filepath.EvalSymlinks(configPath); resolveErr == nil {
-		configPath = resolvedConfig
-	} else if !os.IsNotExist(resolveErr) {
-		return nil, fmt.Errorf("resolve config file: %w", resolveErr)
 	}
 	stateDir = DefaultStateDir(configPath, stateDir)
 	absoluteState, err := filepath.Abs(stateDir)
@@ -125,7 +115,7 @@ func DefaultStateDir(configPath, stateDir string) string {
 	if stateDir != "" {
 		return stateDir
 	}
-	absoluteConfig, err := filepath.Abs(configPath)
+	absoluteConfig, err := canonicalConfigPath(configPath, false)
 	if err != nil {
 		absoluteConfig = configPath
 	}
@@ -135,6 +125,21 @@ func DefaultStateDir(configPath, stateDir string) string {
 	}
 	digest := sha256.Sum256([]byte(absoluteConfig))
 	return filepath.Join(home, ".local", "state", "bitci", hex.EncodeToString(digest[:6]))
+}
+
+func canonicalConfigPath(configPath string, requireExists bool) (string, error) {
+	absolute, err := filepath.Abs(configPath)
+	if err != nil {
+		return "", err
+	}
+	resolved, err := filepath.EvalSymlinks(absolute)
+	if err == nil {
+		return resolved, nil
+	}
+	if requireExists || !os.IsNotExist(err) {
+		return "", fmt.Errorf("resolve config file: %w", err)
+	}
+	return resolvedPathForComparison(absolute), nil
 }
 
 func stateInsideGitMetadata(path string) bool {
@@ -323,6 +328,9 @@ func (controller *Controller) submit(config Config, taskNames []string, ref, che
 			_, _ = controller.db.Exec("DELETE FROM jobs WHERE batch = ? AND state = 'queued'", batch)
 			return nil, fmt.Errorf("pin recorded checkout SHA: %w", err)
 		}
+		if err := controller.releaseBatchRef(batch, checkoutRoot); err != nil {
+			return nil, err
+		}
 	}
 	return jobs, nil
 }
@@ -345,7 +353,7 @@ func (controller *Controller) RunOnce(ctx context.Context, maxWorkers int) (bool
 	}
 	workDir := filepath.Dir(controller.configPath)
 	worktreeRoot := ""
-	var expectedGitFile []byte
+	var expectedOwner []byte
 	cleanup := func() error { return nil }
 	if isCheckoutSHA(job.Ref) {
 		var err error
@@ -361,9 +369,9 @@ func (controller *Controller) RunOnce(ctx context.Context, maxWorkers int) (bool
 			return true, controller.finish(job, 126, cleanupPending)
 		}
 		worktreeRoot = filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", job.ID))
-		expectedGitFile, err = os.ReadFile(filepath.Join(worktreeRoot, ".git"))
-		if err != nil {
-			fmt.Fprintln(logFile, "BitCI could not record job worktree identity:", err)
+		expectedOwner = jobCheckoutOwner(job)
+		if owner, readErr := os.ReadFile(jobCheckoutOwnerPath(worktreeRoot)); readErr != nil || !bytes.Equal(owner, expectedOwner) {
+			fmt.Fprintln(logFile, "BitCI could not record job worktree identity")
 			cleanupPending := cleanup() != nil
 			logFile.Close()
 			return true, controller.finish(job, 126, cleanupPending)
@@ -381,7 +389,7 @@ func (controller *Controller) RunOnce(ctx context.Context, maxWorkers int) (bool
 			code = controller.executeCommand(ctx, config.Prepare, task.Timeout, logFile, workDir)
 		}
 		if code == 0 && isCheckoutSHA(job.Ref) {
-			if err := controller.verifyJobWorktree(worktreeRoot, job.Ref, expectedGitFile); err != nil {
+			if err := controller.verifyJobWorktree(worktreeRoot, job.Ref, expectedOwner); err != nil {
 				fmt.Fprintln(logFile, "BitCI worktree changed after prepare:", err)
 				code = 126
 			}
@@ -398,7 +406,7 @@ func (controller *Controller) RunOnce(ctx context.Context, maxWorkers int) (bool
 			code = controller.execute(ctx, task, logFile, workDir)
 		}
 		if code == 0 && isCheckoutSHA(job.Ref) {
-			if err := controller.verifyJobWorktree(worktreeRoot, job.Ref, expectedGitFile); err != nil {
+			if err := controller.verifyJobWorktree(worktreeRoot, job.Ref, expectedOwner); err != nil {
 				fmt.Fprintln(logFile, "BitCI worktree changed after task:", err)
 				code = 126
 			}
@@ -531,7 +539,32 @@ func (controller *Controller) jobCheckout(ctx context.Context, job Job) (string,
 		return "", cleanup, err
 	}
 	cleanup = func() error { return controller.removeJobWorktree(job.ID, checkoutRoot) }
-	if _, err := gitAt(ctx, checkoutRoot, "worktree", "add", "--detach", path, job.Ref); err != nil {
+	if err := os.MkdirAll(filepath.Join(path, ".git"), 0o700); err != nil {
+		return "", cleanup, err
+	}
+	if err := os.WriteFile(jobCheckoutOwnerPath(path), jobCheckoutOwner(job), 0o600); err != nil {
+		return "", cleanup, err
+	}
+	objectFormat, err := gitAt(ctx, checkoutRoot, "rev-parse", "--show-object-format")
+	if err != nil {
+		return "", cleanup, fmt.Errorf("find source object format: %w", err)
+	}
+	initArgs := []string{"init", "--quiet"}
+	if format := strings.TrimSpace(objectFormat); format != "" && format != "sha1" {
+		initArgs = append(initArgs, "--object-format="+format)
+	}
+	if _, err := gitAt(ctx, path, initArgs...); err != nil {
+		return "", cleanup, fmt.Errorf("initialize job worktree: %w", err)
+	}
+	objects, err := gitAt(ctx, checkoutRoot, "rev-parse", "--path-format=absolute", "--git-path", "objects")
+	if err != nil {
+		return "", cleanup, fmt.Errorf("find source object directory: %w", err)
+	}
+	objects = strings.TrimSpace(objects)
+	if err := os.WriteFile(filepath.Join(path, ".git", "objects", "info", "alternates"), []byte(objects+"\n"), 0o600); err != nil {
+		return "", cleanup, fmt.Errorf("link source objects: %w", err)
+	}
+	if _, err := gitAt(ctx, path, "checkout", "--quiet", "--detach", job.Ref); err != nil {
 		return "", cleanup, fmt.Errorf("create job worktree: %w", err)
 	}
 	sha, err := checkoutSHA(path)
@@ -544,22 +577,40 @@ func (controller *Controller) jobCheckout(ctx context.Context, job Job) (string,
 	return filepath.Join(path, configRelative), cleanup, nil
 }
 
-func (controller *Controller) verifyJobWorktree(worktreeRoot, ref string, expectedGitFile []byte) error {
-	gitFile := filepath.Join(worktreeRoot, ".git")
-	info, err := os.Lstat(gitFile)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("worktree Git file changed")
+func jobCheckoutOwner(job Job) []byte {
+	return []byte(fmt.Sprintf("%d\n%s\n", job.ID, strings.ToLower(job.Ref)))
+}
+
+func jobCheckoutOwnerPath(worktreeRoot string) string {
+	return filepath.Join(worktreeRoot, ".git", "bitci-owner")
+}
+
+func (controller *Controller) verifyJobWorktree(worktreeRoot, ref string, expectedOwner []byte) error {
+	gitDirectory := filepath.Join(worktreeRoot, ".git")
+	info, err := os.Lstat(gitDirectory)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("worktree Git directory changed")
 	}
-	contents, err := os.ReadFile(gitFile)
-	if err != nil || !bytes.Equal(contents, expectedGitFile) {
-		return fmt.Errorf("worktree Git file changed")
+	owner, err := os.ReadFile(jobCheckoutOwnerPath(worktreeRoot))
+	if err != nil || !bytes.Equal(owner, expectedOwner) {
+		return fmt.Errorf("worktree owner changed")
 	}
 	root, err := gitAt(context.Background(), worktreeRoot, "rev-parse", "--show-toplevel")
 	if err != nil || !samePath(strings.TrimSpace(root), worktreeRoot) {
 		return fmt.Errorf("worktree root changed")
 	}
-	if _, err := gitAt(context.Background(), worktreeRoot, "update-index", "--no-assume-unchanged", "--no-skip-worktree", "--", "."); err != nil {
-		return fmt.Errorf("refresh worktree index: %w", err)
+	common, err := gitAt(context.Background(), worktreeRoot, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil || !samePath(strings.TrimSpace(common), gitDirectory) {
+		return fmt.Errorf("worktree Git directory escaped job")
+	}
+	flags, err := gitAt(context.Background(), worktreeRoot, "ls-files", "-v", "-z")
+	if err != nil {
+		return fmt.Errorf("read worktree index flags: %w", err)
+	}
+	for _, entry := range strings.Split(flags, "\x00") {
+		if entry != "" && (entry[0] == 'S' || 'a' <= entry[0] && entry[0] <= 'z') {
+			return fmt.Errorf("worktree index flags changed")
+		}
 	}
 	status, err := gitAt(context.Background(), worktreeRoot, "status", "--porcelain", "--untracked-files=no")
 	if err != nil || status != "" {
@@ -608,17 +659,37 @@ func (controller *Controller) Serve(ctx context.Context, maxWorkers int, interva
 	if interval <= 0 {
 		interval = time.Second
 	}
+	runContext, cancel := context.WithCancel(ctx)
+	defer cancel()
 	errors := make(chan error, maxWorkers+1)
-	go func() { errors <- controller.ServeRPC(ctx, listener) }()
+	var workers sync.WaitGroup
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		if err := controller.ServeRPC(runContext, listener); err != nil {
+			errors <- err
+		}
+	}()
 	for worker := 0; worker < maxWorkers; worker++ {
-		go controller.serveWorker(ctx, maxWorkers, interval, errors)
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			controller.serveWorker(runContext, maxWorkers, interval, errors)
+		}()
+	}
+	shutdown := func() {
+		cancel()
+		_ = listener.Close()
+		workers.Wait()
 	}
 	for {
 		select {
 		case <-ctx.Done():
+			shutdown()
 			return nil
 		case err := <-errors:
 			if err != nil {
+				shutdown()
 				return err
 			}
 		}
@@ -787,7 +858,7 @@ func (controller *Controller) releaseFinishedBatchRefs() error {
 	return nil
 }
 
-func (controller *Controller) removeJobWorktree(id int64, checkoutRoot string) error {
+func (controller *Controller) removeJobWorktree(id int64, _ string) error {
 	controller.worktreeMu.Lock()
 	defer controller.worktreeMu.Unlock()
 
@@ -796,68 +867,20 @@ func (controller *Controller) removeJobWorktree(id int64, checkoutRoot string) e
 	if err := controller.db.QueryRow("SELECT ref FROM jobs WHERE id = ?", id).Scan(&ref); err != nil {
 		return err
 	}
-	if checkoutRoot == "" {
-		checkoutRoot = controller.gitDirectory()
-	}
-	var failures []error
-	checkoutMissing := false
-	if _, err := os.Stat(checkoutRoot); os.IsNotExist(err) {
-		checkoutMissing = true
+	if _, err := os.Lstat(path); os.IsNotExist(err) {
+		return nil
 	} else if err != nil {
-		failures = append(failures, err)
-	} else if topLevel, err := gitAt(context.Background(), checkoutRoot, "rev-parse", "--show-toplevel"); err != nil || !samePath(strings.TrimSpace(topLevel), checkoutRoot) {
-		checkoutMissing = true
+		return err
 	}
-	if _, err := os.Lstat(path); err != nil && !os.IsNotExist(err) {
-		failures = append(failures, err)
+	owner, err := os.ReadFile(jobCheckoutOwnerPath(path))
+	if err != nil || !bytes.Equal(owner, jobCheckoutOwner(Job{ID: id, Ref: ref})) {
+		return fmt.Errorf("refuse to remove unverified job worktree")
 	}
-	if !checkoutMissing {
-		registered, err := registeredWorktree(checkoutRoot, path, ref)
-		if err != nil {
-			failures = append(failures, err)
-		} else if registered {
-			if _, err := gitAt(context.Background(), checkoutRoot, "worktree", "remove", "--force", path); err != nil {
-				failures = append(failures, err)
-			}
-		}
+	info, err := os.Lstat(filepath.Join(path, ".git"))
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refuse to remove job worktree with changed Git directory")
 	}
-	if err := os.RemoveAll(path); err != nil {
-		failures = append(failures, err)
-	}
-	return errors.Join(failures...)
-}
-
-func registeredWorktree(checkoutRoot, path, ref string) (bool, error) {
-	output, err := gitAt(context.Background(), checkoutRoot, "worktree", "list", "--porcelain", "-z")
-	if err != nil {
-		return false, err
-	}
-	fields := strings.Split(output, "\x00")
-	worktree, head := "", ""
-	for _, field := range append(fields, "") {
-		if field == "" {
-			if worktree != "" && sameWorktreePath(worktree, path) && (head == "" || strings.EqualFold(head, ref)) {
-				return true, nil
-			}
-			worktree, head = "", ""
-			continue
-		}
-		if value, ok := strings.CutPrefix(field, "worktree "); ok {
-			worktree = value
-		} else if value, ok := strings.CutPrefix(field, "HEAD "); ok {
-			head = value
-		}
-	}
-	return false, nil
-}
-
-func sameWorktreePath(first, second string) bool {
-	if _, err := os.Stat(first); err == nil {
-		if _, err := os.Stat(second); err == nil {
-			return samePath(first, second)
-		}
-	}
-	return filepath.Clean(first) == filepath.Clean(second)
+	return os.RemoveAll(path)
 }
 
 func (controller *Controller) claim(maxWorkers int) (Job, bool, error) {
@@ -1144,7 +1167,7 @@ func unsafeEvaluatorCommand(argv []string) bool {
 	for index, value := range argv {
 		if strings.EqualFold(filepath.Base(value), "env") {
 			for _, argument := range argv[index+1:] {
-				if argument == "-S" || argument == "--split-string" {
+				if argument == "-S" || argument == "--split-string" || argument == "-C" || argument == "--chdir" || strings.HasPrefix(argument, "-C") || strings.HasPrefix(argument, "--chdir=") {
 					return true
 				}
 			}
@@ -1186,7 +1209,18 @@ func unsafePathOperand(value, checkoutRoot, worktreeRoot, workDir string) bool {
 	}
 	if strings.HasPrefix(value, "-") {
 		_, optionValue, ok := strings.Cut(value, "=")
-		if !ok || optionValue == "" {
+		if !ok {
+			if strings.ContainsAny(value, `/\\`) {
+				return true
+			}
+			for index := 2; index < len(value); index++ {
+				if unsafePathOperand(value[index:], checkoutRoot, worktreeRoot, workDir) {
+					return true
+				}
+			}
+			return false
+		}
+		if optionValue == "" {
 			return false
 		}
 		value = optionValue
@@ -1507,7 +1541,19 @@ func (controller *Controller) executeCommandWithEnv(parent context.Context, argv
 	command.Env = env
 	command.Stdout = output
 	command.Stderr = output
-	err := command.Run()
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := command.Start(); err != nil {
+		fmt.Fprintf(output, "BitCI could not start task: %v\n", err)
+		return 127
+	}
+	err := command.Wait()
+	groupErr := syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
+	if groupErr != nil && !errors.Is(groupErr, syscall.ESRCH) {
+		fmt.Fprintf(output, "BitCI could not stop task descendants: %v\n", groupErr)
+		if err == nil {
+			return 127
+		}
+	}
 	if err == nil {
 		return 0
 	}
@@ -1581,6 +1627,9 @@ func (controller *Controller) Jobs() ([]Job, error) {
 func (controller *Controller) Cancel(id int64) (bool, error) {
 	var batch, checkoutRoot string
 	if err := controller.db.QueryRow("SELECT batch, COALESCE(checkout_root, '') FROM jobs WHERE id = ?", id).Scan(&batch, &checkoutRoot); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
 		return false, err
 	}
 	result, err := controller.db.Exec(
@@ -1720,7 +1769,7 @@ func (controller *Controller) ReadLog(id, cursor int64, limit int) (LogCursorOut
 		if complete {
 			output.Lines = append(output.Lines, redactLogLine(strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r"), redact))
 			output.Cursor = readCursor
-		} else if len(line) > 0 && err == io.EOF && terminalJobState(state) && readCursor == info.Size() {
+		} else if len(line) > 0 && terminalJobState(state) && readCursor == info.Size() {
 			if consumed <= remaining {
 				output.Lines = append(output.Lines, redactLogLine(strings.TrimSuffix(line, "\r"), redact))
 			}

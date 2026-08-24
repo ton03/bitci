@@ -89,26 +89,17 @@ func (controller *Controller) protectStateFromTarget(ctx context.Context, sha st
 	if !ok {
 		return nil
 	}
-	output, err := controller.git(ctx, "ls-tree", "-r", "-z", "--name-only", sha, "--", ":(top,literal)"+filepath.ToSlash(relative))
+	conflict, err := controller.gitTreeContainsStateConflict(ctx, sha, relative, caseInsensitiveFilesystem(controller.gitDirectory()))
 	if err != nil {
 		return err
 	}
-	if output != "" {
+	if conflict {
 		return fmt.Errorf("staged pull request must not contain tracked BitCI state files")
-	}
-	if caseInsensitiveFilesystem(controller.gitDirectory()) {
-		contains, err := controller.gitTreeContainsCaseFoldedPath(ctx, sha, relative)
-		if err != nil {
-			return err
-		}
-		if contains {
-			return fmt.Errorf("staged pull request must not contain tracked BitCI state files")
-		}
 	}
 	return nil
 }
 
-func (controller *Controller) gitTreeContainsCaseFoldedPath(ctx context.Context, sha, relative string) (bool, error) {
+func (controller *Controller) gitTreeContainsStateConflict(ctx context.Context, sha, relative string, foldCase bool) (bool, error) {
 	tree := sha + "^{tree}"
 	parts := strings.Split(filepath.ToSlash(relative), "/")
 	for index, part := range parts {
@@ -120,14 +111,15 @@ func (controller *Controller) gitTreeContainsCaseFoldedPath(ctx context.Context,
 		for _, record := range strings.Split(output, "\x00") {
 			metadata, name, ok := strings.Cut(record, "\t")
 			fields := strings.Fields(metadata)
-			if !ok || len(fields) != 3 || !strings.EqualFold(name, part) {
+			matches := name == part || foldCase && strings.EqualFold(name, part)
+			if !ok || len(fields) != 3 || !matches {
 				continue
 			}
 			if index == len(parts)-1 {
 				return true, nil
 			}
 			if fields[1] != "tree" {
-				return false, nil
+				return true, nil
 			}
 			tree = fields[2]
 			matched = true

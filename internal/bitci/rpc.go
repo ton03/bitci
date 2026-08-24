@@ -104,19 +104,18 @@ func (controller *Controller) ServeRPC(ctx context.Context, listener net.Listene
 			}
 			return err
 		}
-		go func() {
-			defer connection.Close()
-			_ = connection.SetDeadline(time.Now().Add(10 * time.Second))
-			decoder := json.NewDecoder(connection)
-			encoder := json.NewEncoder(connection)
-			var request RPCRequest
-			if err := decoder.Decode(&request); err != nil {
-				_ = encoder.Encode(RPCResponse{Error: err.Error()})
-				return
-			}
-			response := controller.handleRPC(ctx, request)
-			_ = encoder.Encode(response)
-		}()
+		_ = connection.SetDeadline(time.Now().Add(10 * time.Second))
+		decoder := json.NewDecoder(connection)
+		encoder := json.NewEncoder(connection)
+		var request RPCRequest
+		if err := decoder.Decode(&request); err != nil {
+			_ = encoder.Encode(RPCResponse{Error: err.Error()})
+			connection.Close()
+			continue
+		}
+		response := controller.handleRPC(ctx, request)
+		_ = encoder.Encode(response)
+		connection.Close()
 	}
 }
 

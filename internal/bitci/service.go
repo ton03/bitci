@@ -31,13 +31,9 @@ func NewService(configPath, stateDir string, maxWorkers int) (Service, error) {
 	if err != nil {
 		return Service{}, err
 	}
-	absoluteConfig, err := filepath.Abs(configPath)
+	absoluteConfig, err := canonicalConfigPath(configPath, true)
 	if err != nil {
 		return Service{}, err
-	}
-	absoluteConfig, err = filepath.EvalSymlinks(absoluteConfig)
-	if err != nil {
-		return Service{}, fmt.Errorf("resolve config file: %w", err)
 	}
 	if stateDir == "" {
 		stateDir = DefaultStateDir(absoluteConfig, "")
