@@ -123,6 +123,32 @@ func TestResourceLeaseBlocksSecondClaim(t *testing.T) {
 	}
 }
 
+func TestResourceLeaseUsesLowestActiveSnapshotLimit(t *testing.T) {
+	configPath := writeConfig(t, `{
+		"version": 1,
+		"resources": {"browser": 1},
+		"tasks": {"browser": {"run": ["true"], "resources": ["browser"]}}
+	}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"browser"}, "one"); err != nil {
+		t.Fatal(err)
+	}
+	if _, claimed, err := controller.claim(2); err != nil || !claimed {
+		t.Fatalf("first claim = %v, %v", claimed, err)
+	}
+	newer := `{"version":1,"resources":{"browser":2},"tasks":{"browser":{"run":["true"],"resources":["browser"]}}}`
+	if _, err := controller.db.Exec("INSERT INTO jobs(batch, task, ref, config_json, state, created_at) VALUES ('newer', 'browser', 'two', ?, 'queued', ?)", newer, time.Now().UTC().Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	if _, claimed, err := controller.claim(2); err != nil || claimed {
+		t.Fatalf("newer snapshot bypassed held limit = %v, %v", claimed, err)
+	}
+}
+
 func TestRecoverInterruptedReleasesLease(t *testing.T) {
 	configPath := writeConfig(t, `{
 		"version": 1,
@@ -700,6 +726,45 @@ func TestJobRunsFromNestedConfigDirectoryWithRelativeState(t *testing.T) {
 	}
 }
 
+func TestRecordedSHAUsesSubmittedCheckoutLocation(t *testing.T) {
+	checkout := t.TempDir()
+	configDir := filepath.Join(checkout, "ci")
+	configPath := filepath.Join(configDir, "bitci.json")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["sh","-c","test \"$(cat marker)\" = initial"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "marker"), []byte("initial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "ci")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "rm", "-qr", "ci")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=BitCI@example.test", "commit", "-qm", "remove config")
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "passed" {
+		lines, _ := controller.TailLog(jobs[0].ID, 80)
+		t.Fatalf("captured checkout job = %#v\n%s", jobs[0], strings.Join(lines, "\n"))
+	}
+}
+
 func TestJobCheckoutFailureDoesNotPanicOnCleanup(t *testing.T) {
 	checkout := t.TempDir()
 	configPath := filepath.Join(checkout, "bitci.json")
@@ -995,6 +1060,37 @@ func TestCleanCheckoutRejectsTrackedStateFiles(t *testing.T) {
 	defer controller.Close()
 	if err := controller.cleanCheckout(context.Background()); err == nil || !strings.Contains(err.Error(), "tracked files") {
 		t.Fatalf("tracked state checkout error = %v", err)
+	}
+}
+
+func TestStageProtectsStateFromTargetTree(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(filepath.Join(checkout, ".gitignore"), []byte(".bitci/\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", ".")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(checkout, ".bitci"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if err := os.WriteFile(filepath.Join(checkout, ".bitci", "poison"), []byte("tracked target"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "add", "-f", ".bitci/poison")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "target state")
+	sha := git(t, checkout, "rev-parse", "HEAD")
+	if err := controller.protectStateFromTarget(context.Background(), sha); err == nil || !strings.Contains(err.Error(), "state files") {
+		t.Fatalf("target state protection error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(checkout, ".bitci", "bitci.db")); err != nil {
+		t.Fatalf("BitCI state was replaced: %v", err)
 	}
 }
 

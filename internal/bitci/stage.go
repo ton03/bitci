@@ -68,7 +68,10 @@ func (controller *Controller) StagePR(ctx context.Context, number int, token str
 	if err != nil || strings.TrimSpace(fetched) != pull.Head.SHA {
 		return Stage{}, fmt.Errorf("fetched pull request SHA does not match GitHub")
 	}
-	if _, err := controller.git(ctx, "checkout", "--detach", pull.Head.SHA); err != nil {
+	if err := controller.protectStateFromTarget(ctx, pull.Head.SHA); err != nil {
+		return Stage{}, err
+	}
+	if _, err := controller.git(ctx, "checkout", "--detach", "--no-overwrite-ignore", pull.Head.SHA); err != nil {
 		return Stage{}, fmt.Errorf("checkout trusted pull request: %w", err)
 	}
 	sha, err := controller.checkoutSHA()
@@ -76,6 +79,21 @@ func (controller *Controller) StagePR(ctx context.Context, number int, token str
 		return Stage{}, fmt.Errorf("checked out SHA does not match GitHub")
 	}
 	return Stage{PR: number, SHA: sha}, nil
+}
+
+func (controller *Controller) protectStateFromTarget(ctx context.Context, sha string) error {
+	relative, ok := controller.checkoutStatePath()
+	if !ok {
+		return nil
+	}
+	output, err := controller.git(ctx, "ls-tree", "-r", "--name-only", sha, "--", relative)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(output) != "" {
+		return fmt.Errorf("staged pull request must not contain tracked BitCI state files")
+	}
+	return nil
 }
 
 func (controller *Controller) noActiveJobs() error {
@@ -150,7 +168,11 @@ func (controller *Controller) checkoutStatePath() (string, bool) {
 }
 
 func (controller *Controller) git(ctx context.Context, args ...string) (string, error) {
-	command := exec.CommandContext(ctx, "git", append([]string{"-C", filepath.Dir(controller.configPath)}, args...)...)
+	return gitAt(ctx, controller.gitDirectory(), args...)
+}
+
+func gitAt(ctx context.Context, directory string, args ...string) (string, error) {
+	command := exec.CommandContext(ctx, "git", append([]string{"-C", directory}, args...)...)
 	output, err := command.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("git %s: %w", args[0], err)

@@ -22,24 +22,28 @@ import (
 )
 
 type Controller struct {
-	config     Config
-	configPath string
-	stateDir   string
-	db         *sql.DB
-	githubAPI  string
-	githubRepo string
+	config         Config
+	configPath     string
+	checkoutRoot   string
+	configRelative string
+	stateDir       string
+	db             *sql.DB
+	githubAPI      string
+	githubRepo     string
 }
 
 type Job struct {
-	ID         int64  `json:"id"`
-	Batch      string `json:"batch"`
-	Task       string `json:"task"`
-	Ref        string `json:"ref"`
-	TestedSHA  string `json:"tested_sha,omitempty"`
-	State      string `json:"state"`
-	ExitCode   *int   `json:"exit_code,omitempty"`
-	LogPath    string `json:"log_path,omitempty"`
-	configJSON string
+	ID             int64  `json:"id"`
+	Batch          string `json:"batch"`
+	Task           string `json:"task"`
+	Ref            string `json:"ref"`
+	TestedSHA      string `json:"tested_sha,omitempty"`
+	State          string `json:"state"`
+	ExitCode       *int   `json:"exit_code,omitempty"`
+	LogPath        string `json:"log_path,omitempty"`
+	configJSON     string
+	checkoutRoot   string
+	configRelative string
 }
 
 func Open(configPath, stateDir string) (*Controller, error) {
@@ -52,6 +56,10 @@ func Open(configPath, stateDir string) (*Controller, error) {
 		return nil, err
 	}
 	controller.config = config
+	if root, relative, err := checkoutLocation(configPath); err == nil {
+		controller.checkoutRoot = root
+		controller.configRelative = relative
+	}
 	return controller, nil
 }
 
@@ -122,6 +130,8 @@ func (controller *Controller) migrate() error {
 			log_path TEXT,
 			tested_sha TEXT,
 			config_json TEXT,
+			checkout_root TEXT,
+			config_relative TEXT,
 			cleanup_pending INTEGER NOT NULL DEFAULT 0
 		);
 		CREATE INDEX IF NOT EXISTS jobs_queue ON jobs(state, id);
@@ -138,6 +148,12 @@ func (controller *Controller) migrate() error {
 		return err
 	}
 	if err := controller.addJobColumn("config_json", "TEXT"); err != nil {
+		return err
+	}
+	if err := controller.addJobColumn("checkout_root", "TEXT"); err != nil {
+		return err
+	}
+	if err := controller.addJobColumn("config_relative", "TEXT"); err != nil {
 		return err
 	}
 	return controller.addJobColumn("cleanup_pending", "INTEGER NOT NULL DEFAULT 0")
@@ -178,8 +194,14 @@ func (controller *Controller) Submit(taskNames []string, ref string) ([]Job, err
 	if err != nil {
 		return nil, err
 	}
+	checkoutRoot, configRelative := "", ""
 	if sha, err := controller.checkoutSHA(); err == nil {
 		ref = sha
+		var locationErr error
+		checkoutRoot, configRelative, locationErr = controller.checkoutLocation()
+		if locationErr != nil {
+			return nil, locationErr
+		}
 	}
 	batch, err := newBatch()
 	if err != nil {
@@ -197,8 +219,8 @@ func (controller *Controller) Submit(taskNames []string, ref string) ([]Job, err
 	}
 	for _, taskName := range ordered {
 		result, err := transaction.Exec(
-			"INSERT INTO jobs(batch, task, ref, config_json, state, created_at) VALUES (?, ?, ?, ?, 'queued', ?)",
-			batch, taskName, ref, configJSON, time.Now().UTC().Format(time.RFC3339),
+			"INSERT INTO jobs(batch, task, ref, config_json, checkout_root, config_relative, state, created_at) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)",
+			batch, taskName, ref, configJSON, checkoutRoot, configRelative, time.Now().UTC().Format(time.RFC3339),
 		)
 		if err != nil {
 			return nil, err
@@ -207,7 +229,7 @@ func (controller *Controller) Submit(taskNames []string, ref string) ([]Job, err
 		if err != nil {
 			return nil, err
 		}
-		jobs = append(jobs, Job{ID: id, Batch: batch, Task: taskName, Ref: ref, State: "queued"})
+		jobs = append(jobs, Job{ID: id, Batch: batch, Task: taskName, Ref: ref, State: "queued", checkoutRoot: checkoutRoot, configRelative: configRelative})
 	}
 	if err := transaction.Commit(); err != nil {
 		return nil, err
@@ -277,7 +299,49 @@ func (controller *Controller) RunOnce(ctx context.Context, maxWorkers int) (bool
 }
 
 func (controller *Controller) checkoutSHA() (string, error) {
-	return checkoutSHA(filepath.Dir(controller.configPath))
+	return checkoutSHA(controller.gitDirectory())
+}
+
+func (controller *Controller) gitDirectory() string {
+	if controller.checkoutRoot != "" {
+		return controller.checkoutRoot
+	}
+	return filepath.Dir(controller.configPath)
+}
+
+func (controller *Controller) checkoutLocation() (string, string, error) {
+	if controller.checkoutRoot != "" {
+		return controller.checkoutRoot, controller.configRelative, nil
+	}
+	return checkoutLocation(controller.configPath)
+}
+
+func (controller *Controller) jobLocation(job Job) (string, string, error) {
+	if job.checkoutRoot != "" {
+		return job.checkoutRoot, job.configRelative, nil
+	}
+	return controller.checkoutLocation()
+}
+
+func checkoutLocation(configPath string) (string, string, error) {
+	configDirectory, err := filepath.EvalSymlinks(filepath.Dir(configPath))
+	if err != nil {
+		return "", "", fmt.Errorf("resolve config directory: %w", err)
+	}
+	command := exec.Command("git", "-C", configDirectory, "rev-parse", "--show-toplevel")
+	output, err := command.Output()
+	if err != nil {
+		return "", "", fmt.Errorf("find checkout root: %w", err)
+	}
+	root, err := filepath.EvalSymlinks(strings.TrimSpace(string(output)))
+	if err != nil {
+		return "", "", fmt.Errorf("resolve checkout root: %w", err)
+	}
+	relative, err := filepath.Rel(root, configDirectory)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", "", fmt.Errorf("config must be inside its Git checkout")
+	}
+	return root, relative, nil
 }
 
 func checkoutSHA(directory string) (string, error) {
@@ -294,7 +358,11 @@ func checkoutSHA(directory string) (string, error) {
 }
 
 func (controller *Controller) jobCheckout(ctx context.Context, job Job) (string, func() error, error) {
-	cleanup := func() error { return controller.removeJobWorktree(job.ID) }
+	checkoutRoot, configRelative, err := controller.jobLocation(job)
+	if err != nil {
+		return "", func() error { return nil }, err
+	}
+	cleanup := func() error { return controller.removeJobWorktree(job.ID, checkoutRoot) }
 	root := filepath.Join(controller.stateDir, "worktrees")
 	path := filepath.Join(root, fmt.Sprintf("job-%d", job.ID))
 	if err := os.MkdirAll(root, 0o700); err != nil {
@@ -308,7 +376,7 @@ func (controller *Controller) jobCheckout(ctx context.Context, job Job) (string,
 	if _, err := controller.db.Exec("UPDATE jobs SET cleanup_pending = 1 WHERE id = ?", job.ID); err != nil {
 		return "", cleanup, err
 	}
-	if _, err := controller.git(ctx, "worktree", "add", "--detach", path, job.Ref); err != nil {
+	if _, err := gitAt(ctx, checkoutRoot, "worktree", "add", "--detach", path, job.Ref); err != nil {
 		return "", cleanup, fmt.Errorf("create job worktree: %w", err)
 	}
 	sha, err := checkoutSHA(path)
@@ -318,23 +386,7 @@ func (controller *Controller) jobCheckout(ctx context.Context, job Job) (string,
 	if _, err := controller.db.Exec("UPDATE jobs SET tested_sha = ? WHERE id = ?", sha, job.ID); err != nil {
 		return "", cleanup, err
 	}
-	checkout, err := controller.git(ctx, "rev-parse", "--show-toplevel")
-	if err != nil {
-		return "", cleanup, fmt.Errorf("find checkout root: %w", err)
-	}
-	checkoutRoot, err := filepath.EvalSymlinks(strings.TrimSpace(checkout))
-	if err != nil {
-		return "", cleanup, fmt.Errorf("resolve checkout root: %w", err)
-	}
-	configDirectory, err := filepath.EvalSymlinks(filepath.Dir(controller.configPath))
-	if err != nil {
-		return "", cleanup, fmt.Errorf("resolve config directory: %w", err)
-	}
-	relative, err := filepath.Rel(checkoutRoot, configDirectory)
-	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return "", cleanup, fmt.Errorf("config must be inside its Git checkout")
-	}
-	return filepath.Join(path, relative), cleanup, nil
+	return filepath.Join(path, configRelative), cleanup, nil
 }
 
 func isCheckoutSHA(value string) bool {
@@ -405,21 +457,20 @@ func (controller *Controller) RecoverInterrupted() error {
 		return err
 	}
 	defer transaction.Rollback()
-	rows, err := transaction.Query("SELECT id, ref, state, cleanup_pending FROM jobs WHERE state = 'running' OR cleanup_pending = 1")
+	rows, err := transaction.Query("SELECT id, ref, COALESCE(checkout_root, ''), state, cleanup_pending FROM jobs WHERE state = 'running' OR cleanup_pending = 1")
 	if err != nil {
 		return err
 	}
-	var interrupted []int64
+	interrupted := make([]Job, 0)
 	for rows.Next() {
-		var id int64
-		var ref, state string
+		var job Job
 		var cleanupPending int
-		if err := rows.Scan(&id, &ref, &state, &cleanupPending); err != nil {
+		if err := rows.Scan(&job.ID, &job.Ref, &job.checkoutRoot, &job.State, &cleanupPending); err != nil {
 			rows.Close()
 			return err
 		}
-		if isCheckoutSHA(ref) && (state == "running" || cleanupPending != 0) {
-			interrupted = append(interrupted, id)
+		if isCheckoutSHA(job.Ref) && (job.State == "running" || cleanupPending != 0) {
+			interrupted = append(interrupted, job)
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -439,8 +490,8 @@ func (controller *Controller) RecoverInterrupted() error {
 	if _, err := transaction.Exec("UPDATE jobs SET state = 'failed', finished_at = ?, exit_code = 125 WHERE state = 'running'", now); err != nil {
 		return err
 	}
-	for _, id := range interrupted {
-		if _, err := transaction.Exec("UPDATE jobs SET cleanup_pending = 1 WHERE id = ?", id); err != nil {
+	for _, job := range interrupted {
+		if _, err := transaction.Exec("UPDATE jobs SET cleanup_pending = 1 WHERE id = ?", job.ID); err != nil {
 			return err
 		}
 	}
@@ -448,23 +499,26 @@ func (controller *Controller) RecoverInterrupted() error {
 		return err
 	}
 	var failures []error
-	for _, id := range interrupted {
-		if err := controller.removeJobWorktree(id); err != nil {
+	for _, job := range interrupted {
+		if err := controller.removeJobWorktree(job.ID, job.checkoutRoot); err != nil {
 			failures = append(failures, err)
 			continue
 		}
-		if _, err := controller.db.Exec("UPDATE jobs SET cleanup_pending = 0 WHERE id = ?", id); err != nil {
+		if _, err := controller.db.Exec("UPDATE jobs SET cleanup_pending = 0 WHERE id = ?", job.ID); err != nil {
 			failures = append(failures, err)
 		}
 	}
 	return errors.Join(failures...)
 }
 
-func (controller *Controller) removeJobWorktree(id int64) error {
+func (controller *Controller) removeJobWorktree(id int64, checkoutRoot string) error {
 	path := filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", id))
+	if checkoutRoot == "" {
+		checkoutRoot = controller.gitDirectory()
+	}
 	var failures []error
 	if _, err := os.Lstat(path); err == nil {
-		if _, err := controller.git(context.Background(), "worktree", "remove", "--force", path); err != nil {
+		if _, err := gitAt(context.Background(), checkoutRoot, "worktree", "remove", "--force", path); err != nil {
 			failures = append(failures, err)
 		}
 	} else if !os.IsNotExist(err) {
@@ -473,7 +527,7 @@ func (controller *Controller) removeJobWorktree(id int64) error {
 	if err := os.RemoveAll(path); err != nil {
 		failures = append(failures, err)
 	}
-	if _, err := controller.git(context.Background(), "worktree", "prune"); err != nil {
+	if _, err := gitAt(context.Background(), checkoutRoot, "worktree", "prune"); err != nil {
 		failures = append(failures, err)
 	}
 	return errors.Join(failures...)
@@ -495,14 +549,14 @@ func (controller *Controller) claim(maxWorkers int) (Job, bool, error) {
 	if active >= maxWorkers {
 		return Job{}, false, nil
 	}
-	rows, err := transaction.Query("SELECT id, batch, task, ref, COALESCE(config_json, ''), state FROM jobs WHERE state = 'queued' ORDER BY id")
+	rows, err := transaction.Query("SELECT id, batch, task, ref, COALESCE(config_json, ''), COALESCE(checkout_root, ''), COALESCE(config_relative, ''), state FROM jobs WHERE state = 'queued' ORDER BY id")
 	if err != nil {
 		return Job{}, false, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Batch, &job.Task, &job.Ref, &job.configJSON, &job.State); err != nil {
+		if err := rows.Scan(&job.ID, &job.Batch, &job.Task, &job.Ref, &job.configJSON, &job.checkoutRoot, &job.configRelative, &job.State); err != nil {
 			return Job{}, false, err
 		}
 		config, task, err := controller.jobConfig(job)
@@ -554,11 +608,36 @@ func (controller *Controller) ready(transaction *sql.Tx, job Job, task Task) (bo
 
 func (controller *Controller) resourcesFree(transaction *sql.Tx, task Task, config Config) (bool, error) {
 	for _, resource := range task.Resources {
-		var held int
-		if err := transaction.QueryRow("SELECT COUNT(*) FROM leases WHERE resource = ?", resource).Scan(&held); err != nil {
+		rows, err := transaction.Query("SELECT COALESCE(jobs.config_json, '') FROM leases JOIN jobs ON jobs.id = leases.job_id WHERE leases.resource = ?", resource)
+		if err != nil {
 			return false, err
 		}
-		if held >= config.Resources[resource] {
+		limit := config.Resources[resource]
+		held := 0
+		for rows.Next() {
+			var snapshot string
+			if err := rows.Scan(&snapshot); err != nil {
+				rows.Close()
+				return false, err
+			}
+			held++
+			leaseConfig, err := controller.snapshotConfig(snapshot)
+			if err != nil {
+				rows.Close()
+				return false, err
+			}
+			if leaseConfig.Resources[resource] < limit {
+				limit = leaseConfig.Resources[resource]
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return false, err
+		}
+		if err := rows.Close(); err != nil {
+			return false, err
+		}
+		if held >= limit {
 			return false, nil
 		}
 	}
@@ -566,22 +645,29 @@ func (controller *Controller) resourcesFree(transaction *sql.Tx, task Task, conf
 }
 
 func (controller *Controller) jobConfig(job Job) (Config, Task, error) {
-	var config Config
-	if job.configJSON == "" {
-		config = controller.config
-	} else {
-		if err := json.Unmarshal([]byte(job.configJSON), &config); err != nil {
-			return Config{}, Task{}, fmt.Errorf("decode queued job configuration: %w", err)
-		}
-		if err := config.Validate(); err != nil {
-			return Config{}, Task{}, fmt.Errorf("validate queued job configuration: %w", err)
-		}
+	config, err := controller.snapshotConfig(job.configJSON)
+	if err != nil {
+		return Config{}, Task{}, err
 	}
 	task, ok := config.Tasks[job.Task]
 	if !ok {
 		return Config{}, Task{}, fmt.Errorf("queued job references unknown task %q", job.Task)
 	}
 	return config, task, nil
+}
+
+func (controller *Controller) snapshotConfig(snapshot string) (Config, error) {
+	if snapshot == "" {
+		return controller.config, nil
+	}
+	var config Config
+	if err := json.Unmarshal([]byte(snapshot), &config); err != nil {
+		return Config{}, fmt.Errorf("decode queued job configuration: %w", err)
+	}
+	if err := config.Validate(); err != nil {
+		return Config{}, fmt.Errorf("validate queued job configuration: %w", err)
+	}
+	return config, nil
 }
 
 func (controller *Controller) isCheckoutExecutable(command string) bool {
