@@ -1169,7 +1169,7 @@ func (controller *Controller) finish(job Job, code int, cleanupPending bool) err
 }
 
 func (controller *Controller) Jobs() ([]Job, error) {
-	rows, err := controller.db.Query("SELECT id, batch, task, ref, COALESCE(tested_sha, ''), state, created_at, COALESCE(started_at, ''), COALESCE(finished_at, ''), exit_code, COALESCE(log_path, '') FROM jobs ORDER BY id")
+	rows, err := controller.db.Query("SELECT id, batch, task, ref, COALESCE(tested_sha, ''), state, created_at, COALESCE(started_at, ''), COALESCE(finished_at, ''), exit_code, COALESCE(log_path, ''), COALESCE(config_json, '') FROM jobs ORDER BY id")
 	if err != nil {
 		return nil, err
 	}
@@ -1177,7 +1177,7 @@ func (controller *Controller) Jobs() ([]Job, error) {
 	var jobs []Job
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Batch, &job.Task, &job.Ref, &job.TestedSHA, &job.State, &job.CreatedAt, &job.StartedAt, &job.FinishedAt, &job.ExitCode, &job.LogPath); err != nil {
+		if err := rows.Scan(&job.ID, &job.Batch, &job.Task, &job.Ref, &job.TestedSHA, &job.State, &job.CreatedAt, &job.StartedAt, &job.FinishedAt, &job.ExitCode, &job.LogPath, &job.configJSON); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, job)

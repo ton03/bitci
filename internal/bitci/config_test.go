@@ -1279,6 +1279,65 @@ func TestDashboardContract(t *testing.T) {
 	}
 }
 
+func TestDashboardUsesJobConfigSnapshot(t *testing.T) {
+	configPath := writeConfig(t, `{
+		"version":1,
+		"resources":{"current":1},
+		"tasks":{"unit":{"run":["true"],"timeout_seconds":60,"resources":["current"]}}
+	}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+
+	oldConfig := Config{
+		Version:   1,
+		Resources: map[string]int{"previous": 2},
+		Tasks: map[string]Task{
+			"unit": {Run: []string{"true"}, Timeout: 30, Resources: []string{"previous"}},
+		},
+	}
+	oldJSON, err := json.Marshal(oldConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknownConfig := Config{
+		Version: 1,
+		Tasks: map[string]Task{
+			"other": {Run: []string{"true"}},
+		},
+	}
+	unknownJSON, err := json.Marshal(unknownConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, configJSON := range []string{string(oldJSON), string(unknownJSON)} {
+		if _, err := controller.db.Exec(
+			"INSERT INTO jobs(batch, task, ref, config_json, state, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+			"batch", "unit", "ref", configJSON, "queued", time.Now().UTC().Format(time.RFC3339),
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	page, err := controller.dashboardData(time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := page.Jobs[0].Timeout, "30s"; got != want {
+		t.Fatalf("snapshot timeout = %q, want %q", got, want)
+	}
+	if got, want := page.Jobs[0].Resources, "previous"; got != want {
+		t.Fatalf("snapshot resources = %q, want %q", got, want)
+	}
+	if got, want := page.Jobs[1].Timeout, "unavailable"; got != want {
+		t.Fatalf("unknown task timeout = %q, want %q", got, want)
+	}
+	if got, want := page.Jobs[1].Resources, "unavailable"; got != want {
+		t.Fatalf("unknown task resources = %q, want %q", got, want)
+	}
+}
+
 func TestDashboardBindsLoopbackOnly(t *testing.T) {
 	for _, address := range []string{"localhost:8787", "0.0.0.0:8787", "127.0.0.1:0", "127.0.0.1:not-a-port"} {
 		if listener, err := listenDashboard(address); err == nil {

@@ -120,11 +120,15 @@ func (controller *Controller) dashboardData(now time.Time) (dashboardPage, error
 			Job:           job,
 			QueueWait:     elapsed(created, started, now),
 			StageDuration: elapsed(started, finished, now),
-			Timeout:       timeout(controller.config.Tasks[job.Task].Timeout),
-			Resources:     strings.Join(controller.config.Tasks[job.Task].Resources, ", "),
+			Timeout:       "unavailable",
+			Resources:     "unavailable",
 		}
-		if jobView.Resources == "" {
-			jobView.Resources = "—"
+		if _, task, err := controller.jobConfig(job); err == nil {
+			jobView.Timeout = timeout(task.Timeout)
+			jobView.Resources = strings.Join(task.Resources, ", ")
+			if jobView.Resources == "" {
+				jobView.Resources = "—"
+			}
 		}
 		page.Jobs = append(page.Jobs, jobView)
 		if job.State == "passed" && !finished.IsZero() && !started.IsZero() && finished.After(now.Add(-7*24*time.Hour)) {
@@ -155,13 +159,26 @@ func (controller *Controller) resourceUsage() ([]resourceUsage, error) {
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	usage := make([]resourceUsage, 0, len(names))
-	for _, name := range names {
-		var inUse int
-		if err := controller.db.QueryRow("SELECT COUNT(*) FROM leases WHERE resource = ?", name).Scan(&inUse); err != nil {
+	rows, err := controller.db.Query("SELECT resource, COUNT(*) FROM leases GROUP BY resource")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	inUse := make(map[string]int, len(names))
+	for rows.Next() {
+		var name string
+		var count int
+		if err := rows.Scan(&name, &count); err != nil {
 			return nil, err
 		}
-		usage = append(usage, resourceUsage{Name: name, InUse: inUse, Limit: controller.config.Resources[name]})
+		inUse[name] = count
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	usage := make([]resourceUsage, 0, len(names))
+	for _, name := range names {
+		usage = append(usage, resourceUsage{Name: name, InUse: inUse[name], Limit: controller.config.Resources[name]})
 	}
 	return usage, nil
 }

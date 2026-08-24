@@ -36,7 +36,7 @@ func run(args []string) error {
 	maxWorkers := flags.Int("max-workers", 1, "maximum running tasks")
 	interval := flags.Duration("interval", time.Second, "queue poll interval")
 	socketPath := flags.String("socket", "", "owner Unix socket path")
-	httpAddress := flags.String("http", "", "loopback dashboard address")
+	httpAddress := flags.String("http", "", "dashboard address (must be 127.0.0.1:PORT)")
 	allowRuns := flags.Bool("allow-runs", false, "enable MCP run-control tools")
 	jsonOutput := flags.Bool("json", false, "JSON output")
 	logLimit := flags.Int("tail", 80, "maximum log lines, capped at 80")
