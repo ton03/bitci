@@ -207,12 +207,17 @@ func (controller *Controller) hasJobColumn(name string) (bool, error) {
 func (controller *Controller) Submit(taskNames []string, ref string) ([]Job, error) {
 	checkoutRoot, configRelative := "", ""
 	if sha, err := controller.checkoutSHA(); err == nil {
+		if isCheckoutSHA(ref) && ref != sha {
+			return nil, fmt.Errorf("requested checkout SHA does not match checkout HEAD")
+		}
 		ref = sha
 		var locationErr error
 		checkoutRoot, configRelative, locationErr = controller.checkoutLocation()
 		if locationErr != nil {
 			return nil, locationErr
 		}
+	} else if isCheckoutSHA(ref) {
+		return nil, fmt.Errorf("cannot submit requested checkout SHA: %w", err)
 	}
 	return controller.submit(controller.config, taskNames, ref, checkoutRoot, configRelative)
 }
