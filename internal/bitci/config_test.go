@@ -704,6 +704,66 @@ func TestRunControlAndLogs(t *testing.T) {
 	}
 }
 
+func TestRetryPreservesRecordedSHAAndConfiguration(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	initialConfig := `{"version":1,"tasks":{"unit":{"run":["sh","-c","test \"$(cat marker)\" = initial"]}}}`
+	if err := os.WriteFile(configPath, []byte(initialConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, "marker"), []byte("initial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", ".")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	stateDir := filepath.Join(t.TempDir(), "state")
+	controller, err := Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["false"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, "marker"), []byte("changed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "add", ".")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "changed")
+	controller, err = Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	retried, err := controller.Retry(original[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retried[0].Ref != original[0].Ref || retried[0].checkoutRoot != original[0].checkoutRoot || retried[0].configRelative != original[0].configRelative {
+		t.Fatalf("retry changed recorded checkout: %#v", retried[0])
+	}
+	if cancelled, err := controller.Cancel(original[0].ID); err != nil || !cancelled {
+		t.Fatalf("cancel original = %v, %v", cancelled, err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run retry = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[1].State != "passed" {
+		t.Fatalf("retried job = %#v", jobs[1])
+	}
+}
+
 func TestLiveLogAvailableBeforeJobFinishes(t *testing.T) {
 	releasePath := filepath.Join(t.TempDir(), "release")
 	t.Setenv("GO_WANT_HELPER_PROCESS", "1")

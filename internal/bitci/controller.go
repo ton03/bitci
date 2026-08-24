@@ -202,10 +202,6 @@ func (controller *Controller) hasJobColumn(name string) (bool, error) {
 }
 
 func (controller *Controller) Submit(taskNames []string, ref string) ([]Job, error) {
-	ordered, err := controller.config.Ordered(taskNames)
-	if err != nil {
-		return nil, err
-	}
 	checkoutRoot, configRelative := "", ""
 	if sha, err := controller.checkoutSHA(); err == nil {
 		ref = sha
@@ -214,6 +210,14 @@ func (controller *Controller) Submit(taskNames []string, ref string) ([]Job, err
 		if locationErr != nil {
 			return nil, locationErr
 		}
+	}
+	return controller.submit(controller.config, taskNames, ref, checkoutRoot, configRelative)
+}
+
+func (controller *Controller) submit(config Config, taskNames []string, ref, checkoutRoot, configRelative string) ([]Job, error) {
+	ordered, err := config.Ordered(taskNames)
+	if err != nil {
+		return nil, err
 	}
 	batch, err := newBatch()
 	if err != nil {
@@ -225,7 +229,7 @@ func (controller *Controller) Submit(taskNames []string, ref string) ([]Job, err
 	}
 	defer transaction.Rollback()
 	jobs := make([]Job, 0, len(ordered))
-	configJSON, err := json.Marshal(controller.config)
+	configJSON, err := json.Marshal(config)
 	if err != nil {
 		return nil, err
 	}
@@ -285,14 +289,14 @@ func (controller *Controller) RunOnce(ctx context.Context, maxWorkers int) (bool
 	}
 	code := 0
 	if isCheckoutSHA(job.Ref) && len(config.Prepare) > 0 && controller.isCheckoutExecutable(config.Prepare[0], job.checkoutRoot, worktreeRoot, workDir) {
-		fmt.Fprintln(logFile, "BitCI refuses a checkout-local absolute prepare executable for a recorded SHA job")
+		fmt.Fprintln(logFile, "BitCI refuses an unsafe checkout-local prepare command for a recorded SHA job")
 		code = 126
 	} else {
 		if isCheckoutSHA(job.Ref) && len(config.Prepare) > 0 {
 			code = controller.executeCommand(ctx, config.Prepare, task.Timeout, logFile, workDir)
 		}
 		if code == 0 && isCheckoutSHA(job.Ref) && controller.isCheckoutExecutable(task.Run[0], job.checkoutRoot, worktreeRoot, workDir) {
-			fmt.Fprintln(logFile, "BitCI refuses a checkout-local absolute task executable for a recorded SHA job")
+			fmt.Fprintln(logFile, "BitCI refuses an unsafe checkout-local task command for a recorded SHA job")
 			code = 126
 		}
 		if code == 0 {
@@ -881,11 +885,21 @@ func (controller *Controller) Cancel(id int64) (bool, error) {
 }
 
 func (controller *Controller) Retry(id int64) ([]Job, error) {
-	var task, ref string
-	if err := controller.db.QueryRow("SELECT task, ref FROM jobs WHERE id = ?", id).Scan(&task, &ref); err != nil {
+	var task, ref, configJSON, checkoutRoot, configRelative string
+	if err := controller.db.QueryRow("SELECT task, ref, COALESCE(config_json, ''), COALESCE(checkout_root, ''), COALESCE(config_relative, '') FROM jobs WHERE id = ?", id).Scan(&task, &ref, &configJSON, &checkoutRoot, &configRelative); err != nil {
 		return nil, err
 	}
-	return controller.Submit([]string{task}, ref)
+	config := controller.config
+	if configJSON != "" {
+		config = Config{}
+		if err := json.Unmarshal([]byte(configJSON), &config); err != nil {
+			return nil, fmt.Errorf("decode retried job configuration: %w", err)
+		}
+		if err := config.Validate(); err != nil {
+			return nil, fmt.Errorf("validate retried job configuration: %w", err)
+		}
+	}
+	return controller.submit(config, []string{task}, ref, checkoutRoot, configRelative)
 }
 
 func (controller *Controller) TailLog(id int64, limit int) ([]string, error) {
