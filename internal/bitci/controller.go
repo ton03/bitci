@@ -121,7 +121,8 @@ func (controller *Controller) migrate() error {
 			exit_code INTEGER,
 			log_path TEXT,
 			tested_sha TEXT,
-			config_json TEXT
+			config_json TEXT,
+			cleanup_pending INTEGER NOT NULL DEFAULT 0
 		);
 		CREATE INDEX IF NOT EXISTS jobs_queue ON jobs(state, id);
 		CREATE TABLE IF NOT EXISTS leases (
@@ -136,7 +137,10 @@ func (controller *Controller) migrate() error {
 	if err := controller.addJobColumn("tested_sha", "TEXT"); err != nil {
 		return err
 	}
-	return controller.addJobColumn("config_json", "TEXT")
+	if err := controller.addJobColumn("config_json", "TEXT"); err != nil {
+		return err
+	}
+	return controller.addJobColumn("cleanup_pending", "INTEGER NOT NULL DEFAULT 0")
 }
 
 func (controller *Controller) addJobColumn(name, definition string) error {
@@ -215,20 +219,17 @@ func (controller *Controller) RunOnce(ctx context.Context, maxWorkers int) (bool
 	if ctx.Err() != nil {
 		return false, nil
 	}
-	if err := controller.DiskOK(); err != nil {
-		return false, err
-	}
 	job, claimed, err := controller.claim(maxWorkers)
 	if err != nil || !claimed {
 		return false, err
 	}
 	config, task, err := controller.jobConfig(job)
 	if err != nil {
-		return true, controller.finish(job, 127)
+		return true, controller.finish(job, 127, false)
 	}
 	logFile, err := controller.startLog(&job)
 	if err != nil {
-		return true, controller.finish(job, 127)
+		return true, controller.finish(job, 127, false)
 	}
 	workDir := filepath.Dir(controller.configPath)
 	cleanup := func() error { return nil }
@@ -237,11 +238,13 @@ func (controller *Controller) RunOnce(ctx context.Context, maxWorkers int) (bool
 		workDir, cleanup, err = controller.jobCheckout(ctx, job)
 		if err != nil {
 			fmt.Fprintln(logFile, "BitCI could not stage recorded checkout SHA:", err)
+			cleanupPending := false
 			if cleanupErr := cleanup(); cleanupErr != nil {
 				fmt.Fprintln(logFile, "BitCI could not remove job worktree:", cleanupErr)
+				cleanupPending = true
 			}
 			logFile.Close()
-			return true, controller.finish(job, 126)
+			return true, controller.finish(job, 126, cleanupPending)
 		}
 	}
 	code := 0
@@ -259,8 +262,10 @@ func (controller *Controller) RunOnce(ctx context.Context, maxWorkers int) (bool
 			code = controller.execute(ctx, task, logFile, workDir)
 		}
 	}
+	cleanupPending := false
 	if err := cleanup(); err != nil {
 		fmt.Fprintln(logFile, "BitCI could not remove job worktree:", err)
+		cleanupPending = true
 		if code == 0 {
 			code = 125
 		}
@@ -268,7 +273,7 @@ func (controller *Controller) RunOnce(ctx context.Context, maxWorkers int) (bool
 	if err := logFile.Close(); err != nil && code == 0 {
 		code = 127
 	}
-	return true, controller.finish(job, code)
+	return true, controller.finish(job, code, cleanupPending)
 }
 
 func (controller *Controller) checkoutSHA() (string, error) {
@@ -298,6 +303,9 @@ func (controller *Controller) jobCheckout(ctx context.Context, job Job) (string,
 	if _, err := os.Lstat(path); err == nil {
 		return "", cleanup, fmt.Errorf("job worktree already exists")
 	} else if !os.IsNotExist(err) {
+		return "", cleanup, err
+	}
+	if _, err := controller.db.Exec("UPDATE jobs SET cleanup_pending = 1 WHERE id = ?", job.ID); err != nil {
 		return "", cleanup, err
 	}
 	cleanup = func() error {
@@ -414,19 +422,20 @@ func (controller *Controller) RecoverInterrupted() error {
 		return err
 	}
 	defer transaction.Rollback()
-	rows, err := transaction.Query("SELECT id, ref FROM jobs WHERE state = 'running'")
+	rows, err := transaction.Query("SELECT id, ref, state, cleanup_pending FROM jobs WHERE state = 'running' OR cleanup_pending = 1")
 	if err != nil {
 		return err
 	}
 	var interrupted []int64
 	for rows.Next() {
 		var id int64
-		var ref string
-		if err := rows.Scan(&id, &ref); err != nil {
+		var ref, state string
+		var cleanupPending int
+		if err := rows.Scan(&id, &ref, &state, &cleanupPending); err != nil {
 			rows.Close()
 			return err
 		}
-		if isCheckoutSHA(ref) {
+		if isCheckoutSHA(ref) && (state == "running" || cleanupPending != 0) {
 			interrupted = append(interrupted, id)
 		}
 	}
@@ -447,12 +456,21 @@ func (controller *Controller) RecoverInterrupted() error {
 	if _, err := transaction.Exec("UPDATE jobs SET state = 'failed', finished_at = ?, exit_code = 125 WHERE state = 'running'", now); err != nil {
 		return err
 	}
+	for _, id := range interrupted {
+		if _, err := transaction.Exec("UPDATE jobs SET cleanup_pending = 1 WHERE id = ?", id); err != nil {
+			return err
+		}
+	}
 	if err := transaction.Commit(); err != nil {
 		return err
 	}
 	var failures []error
 	for _, id := range interrupted {
 		if err := controller.removeJobWorktree(id); err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		if _, err := controller.db.Exec("UPDATE jobs SET cleanup_pending = 0 WHERE id = ?", id); err != nil {
 			failures = append(failures, err)
 		}
 	}
@@ -506,6 +524,9 @@ func (controller *Controller) claim(maxWorkers int) (Job, bool, error) {
 		}
 		config, task, err := controller.jobConfig(job)
 		if err != nil {
+			return Job{}, false, err
+		}
+		if err := controller.diskOK(config.MinFreeBytes); err != nil {
 			return Job{}, false, err
 		}
 		if ready, err := controller.ready(transaction, job, task); err != nil || !ready {
@@ -646,14 +667,14 @@ func (controller *Controller) executeCommand(parent context.Context, argv []stri
 	return 127
 }
 
-func (controller *Controller) finish(job Job, code int) error {
+func (controller *Controller) finish(job Job, code int, cleanupPending bool) error {
 	state := "passed"
 	if code != 0 {
 		state = "failed"
 	}
 	_, err := controller.db.Exec(
-		"UPDATE jobs SET state = ?, finished_at = ?, exit_code = ?, log_path = ? WHERE id = ?",
-		state, time.Now().UTC().Format(time.RFC3339), code, job.LogPath, job.ID,
+		"UPDATE jobs SET state = ?, finished_at = ?, exit_code = ?, log_path = ?, cleanup_pending = ? WHERE id = ?",
+		state, time.Now().UTC().Format(time.RFC3339), code, job.LogPath, cleanupPending, job.ID,
 	)
 	if err != nil {
 		return err
@@ -766,7 +787,11 @@ func logLimit(limit int) int {
 }
 
 func (controller *Controller) DiskOK() error {
-	if controller.config.MinFreeBytes == 0 {
+	return controller.diskOK(controller.config.MinFreeBytes)
+}
+
+func (controller *Controller) diskOK(minFreeBytes uint64) error {
+	if minFreeBytes == 0 {
 		return nil
 	}
 	var stat syscall.Statfs_t
@@ -774,8 +799,8 @@ func (controller *Controller) DiskOK() error {
 		return err
 	}
 	free := uint64(stat.Bavail) * uint64(stat.Bsize)
-	if free < controller.config.MinFreeBytes {
-		return fmt.Errorf("disk guard: %d bytes free, need %d", free, controller.config.MinFreeBytes)
+	if free < minFreeBytes {
+		return fmt.Errorf("disk guard: %d bytes free, need %d", free, minFreeBytes)
 	}
 	return nil
 }

@@ -201,6 +201,49 @@ func TestRecoverInterruptedRemovesJobWorktree(t *testing.T) {
 	}
 }
 
+func TestRecoverInterruptedRemovesPendingWorktree(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	jobs, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", jobs[0].ID))
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.git(context.Background(), "worktree", "add", "--detach", path, jobs[0].Ref); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.finish(jobs[0], 125, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.RecoverInterrupted(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Fatalf("pending worktree remains: %v", err)
+	}
+	var pending int
+	if err := controller.db.QueryRow("SELECT cleanup_pending FROM jobs WHERE id = ?", jobs[0].ID).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	if pending != 0 {
+		t.Fatalf("cleanup pending = %d, want 0", pending)
+	}
+}
+
 func TestOpenStateMigratesLegacyJobs(t *testing.T) {
 	stateDir := filepath.Join(t.TempDir(), "state")
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
@@ -745,6 +788,44 @@ func TestQueuedJobUsesSubmittedConfiguration(t *testing.T) {
 	}
 	if jobs[1].State != "failed" {
 		t.Fatalf("current configuration job = %#v", jobs[1])
+	}
+}
+
+func TestQueuedJobUsesSubmittedDiskGuard(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"min_free_bytes":18446744073709551615,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		controller.Close()
+		t.Fatal(err)
+	}
+	stateDir := controller.stateDir
+	if err := controller.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	controller, err = Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if ran, err := controller.RunOnce(context.Background(), 1); ran || err == nil || !strings.Contains(err.Error(), "disk guard") {
+		t.Fatalf("run with submitted disk guard = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "queued" {
+		t.Fatalf("disk-guarded job = %#v", jobs[0])
 	}
 }
 
