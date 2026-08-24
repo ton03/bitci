@@ -142,6 +142,23 @@ func (service Service) Install() error {
 	return nil
 }
 
+// Start creates the managed service when absent. It does not replace a running
+// service, so repeated project-root starts do not interrupt queued work.
+func (service Service) Start() (bool, error) {
+	if _, err := service.Status(); err == nil {
+		return false, nil
+	}
+	if _, err := os.Stat(service.PlistPath); err == nil {
+		return false, fmt.Errorf("existing service needs inspection: run bitci service status")
+	} else if !os.IsNotExist(err) {
+		return false, err
+	}
+	if err := service.Install(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (service Service) ensureNoActiveJobs() error {
 	controller, err := OpenState(service.ConfigPath, service.StateDir)
 	if err != nil {
@@ -173,6 +190,8 @@ func (service Service) Uninstall() error {
 	}
 	return nil
 }
+
+func (service Service) Stop() error { return service.Uninstall() }
 
 func (service Service) plist() string {
 	argument := func(value string) string { return "<string>" + html.EscapeString(value) + "</string>" }

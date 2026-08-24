@@ -638,6 +638,32 @@ func TestServiceRefusesActiveJobs(t *testing.T) {
 	}
 }
 
+func TestServiceStartDoesNotReplaceExistingPlist(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("launchd applies on macOS")
+	}
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+	service, err := NewService(configPath, filepath.Join(t.TempDir(), "state"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.PlistPath = filepath.Join(t.TempDir(), "existing.plist")
+	if err := os.WriteFile(service.PlistPath, []byte("existing"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	started, _ := service.Start()
+	if started {
+		t.Fatal("start replaced existing service")
+	}
+	content, err := os.ReadFile(service.PlistPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "existing" {
+		t.Fatalf("plist changed: %q", content)
+	}
+}
+
 func TestHelperProcess(t *testing.T) {
 	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
 		return

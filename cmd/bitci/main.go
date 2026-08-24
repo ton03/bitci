@@ -24,7 +24,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("use version, validate, plan, submit, worker, serve, service, status, cancel, retry, logs, doctor, mcp, or stage-pr")
+		return fmt.Errorf("use version, validate, plan, submit, worker, serve, start, stop, service, status, cancel, retry, logs, doctor, mcp, or stage-pr")
 	}
 	command := args[0]
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
@@ -57,6 +57,12 @@ func run(args []string) error {
 	}
 	if command == "service" {
 		return runService(flags.Args(), *configPath, *stateDir, *maxWorkers, *httpAddress)
+	}
+	if command == "start" || command == "stop" {
+		if flags.NArg() != 0 {
+			return fmt.Errorf("%s takes no arguments", command)
+		}
+		return runService([]string{command}, *configPath, *stateDir, *maxWorkers, *httpAddress)
 	}
 	if command == "mcp" {
 		if flags.NArg() != 0 {
@@ -169,7 +175,7 @@ func run(args []string) error {
 
 func runService(args []string, configPath, stateDir string, maxWorkers int, httpAddress string) error {
 	if len(args) != 1 {
-		return fmt.Errorf("service needs install, status, or uninstall")
+		return fmt.Errorf("service needs install, start, stop, status, or uninstall")
 	}
 	service, err := bitci.NewServiceWithHTTP(configPath, stateDir, maxWorkers, httpAddress)
 	if err != nil {
@@ -181,6 +187,17 @@ func runService(args []string, configPath, stateDir string, maxWorkers int, http
 			return err
 		}
 		fmt.Println("installed", service.Label)
+		return nil
+	case "start":
+		started, err := service.Start()
+		if err != nil {
+			return err
+		}
+		if started {
+			fmt.Println("started", service.Label)
+		} else {
+			fmt.Println("already running", service.Label)
+		}
 		return nil
 	case "status":
 		output, err := service.Status()
@@ -194,6 +211,12 @@ func runService(args []string, configPath, stateDir string, maxWorkers int, http
 			return err
 		}
 		fmt.Println("uninstalled", service.Label)
+		return nil
+	case "stop":
+		if err := service.Stop(); err != nil {
+			return err
+		}
+		fmt.Println("stopped", service.Label)
 		return nil
 	default:
 		return fmt.Errorf("unknown service command %q", args[0])

@@ -90,12 +90,14 @@ Build or download one fixed binary path. Then let `launchd` own `serve`:
 ```sh
 mkdir -p "$HOME/.local/bin"
 go build -o "$HOME/.local/bin/bitci" ./cmd/bitci
-"$HOME/.local/bin/bitci" service --max-workers 2 --http 127.0.0.1:8787 install
+"$HOME/.local/bin/bitci" start --max-workers 2 --http 127.0.0.1:8787
 "$HOME/.local/bin/bitci" service status
 ```
 
-`launchd` starts BitCI at sign-in and restarts it after exit. Run `service
-uninstall` to remove it. BitCI refuses service changes while jobs run.
+`start` creates one `launchd` job per absolute config path. Run it again and it
+reports the existing job without starting another controller. `launchd` starts
+BitCI at sign-in and restarts it after exit. Run `bitci stop` to remove it.
+BitCI refuses service changes while jobs run.
 
 ## Agents: skill + MCP
 
