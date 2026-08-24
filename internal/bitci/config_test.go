@@ -658,13 +658,13 @@ func TestNestedConfigChecksWholeCheckout(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(checkout, ".gitignore"), []byte(".bitci/\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(checkout, ".gitignore"), []byte(".bitci[[]local]/\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	git(t, checkout, "init", "-q")
 	git(t, checkout, "add", ".")
 	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
-	controller, err := Open(configPath, filepath.Join(checkout, ".bitci"))
+	controller, err := Open(configPath, filepath.Join(checkout, ".bitci[local]"))
 	if err != nil {
 		t.Fatal(err)
 	}

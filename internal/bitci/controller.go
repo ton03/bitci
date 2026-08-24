@@ -130,11 +130,36 @@ func (controller *Controller) migrate() error {
 	if err != nil {
 		return err
 	}
-	if _, err := controller.db.Exec("SELECT tested_sha FROM jobs LIMIT 0"); err == nil {
+	hasColumn, err := controller.hasTestedSHAColumn()
+	if err != nil {
+		return err
+	}
+	if hasColumn {
 		return nil
 	}
-	_, err = controller.db.Exec("ALTER TABLE jobs ADD COLUMN tested_sha TEXT")
+	if _, alterErr := controller.db.Exec("ALTER TABLE jobs ADD COLUMN tested_sha TEXT"); alterErr == nil {
+		return nil
+	} else {
+		err = alterErr
+	}
+	hasColumn, checkErr := controller.hasTestedSHAColumn()
+	if checkErr != nil {
+		return checkErr
+	}
+	if hasColumn {
+		return nil
+	}
 	return err
+}
+
+func (controller *Controller) hasTestedSHAColumn() (bool, error) {
+	if _, err := controller.db.Exec("SELECT tested_sha FROM jobs LIMIT 0"); err == nil {
+		return true, nil
+	} else if strings.Contains(err.Error(), "no such column: tested_sha") {
+		return false, nil
+	} else {
+		return false, err
+	}
 }
 
 func (controller *Controller) Submit(taskNames []string, ref string) ([]Job, error) {
@@ -376,6 +401,10 @@ func (controller *Controller) RecoverInterrupted() error {
 		if isCheckoutSHA(ref) {
 			interrupted = append(interrupted, id)
 		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
 	}
 	if err := rows.Close(); err != nil {
 		return err

@@ -110,7 +110,7 @@ func (controller *Controller) cleanGeneratedNext(ctx context.Context) error {
 func (controller *Controller) cleanCheckout(ctx context.Context) error {
 	args := []string{"status", "--porcelain", "--untracked-files=all"}
 	if relative, ok := controller.checkoutStatePath(); ok {
-		args = append(args, "--", ":(top)", ":(top,exclude)"+filepath.ToSlash(relative))
+		args = append(args, "--", ":(top)", ":(top,exclude,literal)"+filepath.ToSlash(relative))
 	}
 	output, err := controller.git(ctx, args...)
 	if err != nil {
