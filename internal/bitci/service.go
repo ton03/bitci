@@ -96,8 +96,11 @@ func servicePath(config Config, checkout string) (string, error) {
 				command = filepath.Join(checkout, command)
 			}
 			info, err := os.Stat(command)
-			if err != nil || info.IsDir() {
-				return "", fmt.Errorf("resolve configured command %q", command)
+			if err != nil {
+				return "", fmt.Errorf("stat configured command %q: %w", command, err)
+			}
+			if info.IsDir() {
+				return "", fmt.Errorf("configured command %q is a directory", command)
 			}
 			add(filepath.Dir(command))
 			continue

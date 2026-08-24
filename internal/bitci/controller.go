@@ -653,6 +653,7 @@ func (controller *Controller) ready(transaction *sql.Tx, job Job, task Task) (bo
 }
 
 func (controller *Controller) resourcesFree(transaction *sql.Tx, task Task, config Config) (bool, error) {
+	snapshots := map[string]Config{}
 	for _, resource := range task.Resources {
 		rows, err := transaction.Query("SELECT COALESCE(jobs.config_json, '') FROM leases JOIN jobs ON jobs.id = leases.job_id WHERE leases.resource = ?", resource)
 		if err != nil {
@@ -667,10 +668,15 @@ func (controller *Controller) resourcesFree(transaction *sql.Tx, task Task, conf
 				return false, err
 			}
 			held++
-			leaseConfig, err := controller.snapshotConfig(snapshot)
-			if err != nil {
-				rows.Close()
-				return false, err
+			leaseConfig, ok := snapshots[snapshot]
+			if !ok {
+				var err error
+				leaseConfig, err = controller.snapshotConfig(snapshot)
+				if err != nil {
+					rows.Close()
+					return false, err
+				}
+				snapshots[snapshot] = leaseConfig
 			}
 			if leaseConfig.Resources[resource] < limit {
 				limit = leaseConfig.Resources[resource]

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -1557,6 +1558,14 @@ func TestServicePathUsesPrepareExecutable(t *testing.T) {
 	}
 	if !strings.Contains(path, filepath.Dir(sh)) {
 		t.Fatalf("service PATH %q misses prepare command directory", path)
+	}
+}
+
+func TestServicePathReportsMissingConfiguredCommand(t *testing.T) {
+	checkout := t.TempDir()
+	_, err := servicePath(Config{Tasks: map[string]Task{"unit": {Run: []string{"./missing"}}}}, checkout)
+	if err == nil || !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("service path error = %v", err)
 	}
 }
 
