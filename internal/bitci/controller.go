@@ -275,12 +275,13 @@ func (controller *Controller) RunOnce(ctx context.Context, maxWorkers int) (bool
 	if isCheckoutSHA(job.Ref) && len(config.Prepare) > 0 && controller.isCheckoutExecutable(config.Prepare[0], job.checkoutRoot, worktreeRoot, workDir) {
 		fmt.Fprintln(logFile, "BitCI refuses a checkout-local absolute prepare executable for a recorded SHA job")
 		code = 126
-	} else if isCheckoutSHA(job.Ref) && controller.isCheckoutExecutable(task.Run[0], job.checkoutRoot, worktreeRoot, workDir) {
-		fmt.Fprintln(logFile, "BitCI refuses a checkout-local absolute task executable for a recorded SHA job")
-		code = 126
 	} else {
 		if isCheckoutSHA(job.Ref) && len(config.Prepare) > 0 {
 			code = controller.executeCommand(ctx, config.Prepare, task.Timeout, logFile, workDir)
+		}
+		if code == 0 && isCheckoutSHA(job.Ref) && controller.isCheckoutExecutable(task.Run[0], job.checkoutRoot, worktreeRoot, workDir) {
+			fmt.Fprintln(logFile, "BitCI refuses a checkout-local absolute task executable for a recorded SHA job")
+			code = 126
 		}
 		if code == 0 {
 			code = controller.execute(ctx, task, logFile, workDir)
