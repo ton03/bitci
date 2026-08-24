@@ -89,7 +89,17 @@ func (controller *Controller) protectStateFromTarget(ctx context.Context, sha st
 	if !ok {
 		return nil
 	}
-	output, err := controller.git(ctx, "ls-tree", "-r", "-z", "--name-only", sha)
+	output, err := controller.git(ctx, "ls-tree", "-r", "-z", "--name-only", sha, "--", ":(top,literal)"+filepath.ToSlash(relative))
+	if err != nil {
+		return err
+	}
+	if output != "" {
+		return fmt.Errorf("staged pull request must not contain tracked BitCI state files")
+	}
+	if !caseAliasExists(controller.gitDirectory(), relative) {
+		return nil
+	}
+	output, err = controller.git(ctx, "ls-tree", "-r", "-z", "--name-only", sha)
 	if err != nil {
 		return err
 	}
@@ -290,6 +300,22 @@ func (controller *Controller) lexicalCheckoutRoot(checkout string) string {
 
 func samePath(first, second string) bool {
 	return pathWithin(first, second) && pathWithin(second, first)
+}
+
+func caseAliasExists(root, relative string) bool {
+	for index, character := range relative {
+		if character >= 'a' && character <= 'z' {
+			alias := relative[:index] + strings.ToUpper(string(character)) + relative[index+1:]
+			_, err := os.Stat(filepath.Join(root, alias))
+			return err == nil
+		}
+		if character >= 'A' && character <= 'Z' {
+			alias := relative[:index] + strings.ToLower(string(character)) + relative[index+1:]
+			_, err := os.Stat(filepath.Join(root, alias))
+			return err == nil
+		}
+	}
+	return false
 }
 
 func pathUsesSymlink(root, relative string) (bool, error) {
