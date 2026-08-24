@@ -43,6 +43,12 @@ func TestConfigContract(t *testing.T) {
 	if _, err := LoadConfig(writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["x"],"raw":"no"}}}`)); err == nil {
 		t.Fatal("unknown config key passed")
 	}
+	if _, err := LoadConfig(writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["x"],"env":{"BAD-NAME":"value"}}}}`)); err == nil {
+		t.Fatal("invalid environment variable passed")
+	}
+	if _, err := LoadConfig(writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["x"],"env":{"VALUE":"bad\u0000value"}}}}`)); err == nil {
+		t.Fatal("NUL environment value passed")
+	}
 }
 
 func TestStackExamplesValidate(t *testing.T) {
@@ -158,6 +164,29 @@ func TestQueueContract(t *testing.T) {
 		if job.State != "passed" {
 			t.Fatalf("job %#v did not pass", job)
 		}
+	}
+}
+
+func TestConfiguredTaskEnvironment(t *testing.T) {
+	t.Setenv("BITCI_TASK_ENV", "inherited")
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["sh","-c","test \"$BITCI_TASK_ENV\" = configured"],"env":{"BITCI_TASK_ENV":"configured"}}}}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "passed" {
+		t.Fatalf("configured environment job = %#v", jobs[0])
 	}
 }
 
