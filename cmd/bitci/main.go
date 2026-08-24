@@ -202,6 +202,22 @@ func runService(args []string, configPath, stateDir string, maxWorkers int, http
 		fmt.Println("stopped", service.Label)
 		return nil
 	}
+	if args[0] == "start" {
+		service, err := bitci.NewServiceForStart(configPath, stateDir, maxWorkers, httpAddress)
+		if err != nil {
+			return err
+		}
+		started, err := service.Start()
+		if err != nil {
+			return err
+		}
+		if started {
+			fmt.Println("started", service.Label)
+		} else {
+			fmt.Println("already running", service.Label)
+		}
+		return nil
+	}
 	service, err := bitci.NewServiceWithHTTP(configPath, stateDir, maxWorkers, httpAddress)
 	if err != nil {
 		return err
@@ -212,17 +228,6 @@ func runService(args []string, configPath, stateDir string, maxWorkers int, http
 			return err
 		}
 		fmt.Println("installed", service.Label)
-		return nil
-	case "start":
-		started, err := service.Start()
-		if err != nil {
-			return err
-		}
-		if started {
-			fmt.Println("started", service.Label)
-		} else {
-			fmt.Println("already running", service.Label)
-		}
 		return nil
 	case "status":
 		output, err := service.Status()

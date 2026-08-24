@@ -87,16 +87,11 @@ func OpenState(configPath, stateDir string) (*Controller, error) {
 	if err != nil {
 		return nil, err
 	}
-	configPath = absoluteConfig
-	stateDir = DefaultStateDir(configPath, stateDir)
-	absoluteState, err := filepath.Abs(stateDir)
+	stateDir, err = ValidateStateDir(absoluteConfig, stateDir)
 	if err != nil {
 		return nil, err
 	}
-	stateDir = absoluteState
-	if gitDirectory, err := gitCommonDirectory(configPath); err == nil && pathsOverlap(stateDir, gitDirectory) {
-		return nil, fmt.Errorf("state directory must not overlap Git metadata")
-	}
+	configPath = absoluteConfig
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		return nil, err
 	}
@@ -111,6 +106,24 @@ func OpenState(configPath, stateDir string) (*Controller, error) {
 		return nil, err
 	}
 	return controller, nil
+}
+
+// ValidateStateDir checks that state does not overlap the checkout's Git metadata.
+func ValidateStateDir(configPath, stateDir string) (string, error) {
+	absoluteConfig, err := filepath.Abs(configPath)
+	if err != nil {
+		return "", err
+	}
+	stateDir = DefaultStateDir(absoluteConfig, stateDir)
+	absoluteState, err := filepath.Abs(stateDir)
+	if err != nil {
+		return "", err
+	}
+	stateDir = absoluteState
+	if gitDirectory, err := gitCommonDirectory(absoluteConfig); err == nil && pathsOverlap(stateDir, gitDirectory) {
+		return "", fmt.Errorf("state directory must not overlap Git metadata")
+	}
+	return stateDir, nil
 }
 
 func DefaultStateDir(configPath, stateDir string) string {

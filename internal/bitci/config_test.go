@@ -2792,6 +2792,7 @@ func TestServiceStartDoesNotReplaceExistingPlist(t *testing.T) {
 		t.Fatal(err)
 	}
 	service.PlistPath = filepath.Join(t.TempDir(), "existing.plist")
+	service.LockPath = filepath.Join(t.TempDir(), "service.lock")
 	if err := os.WriteFile(service.PlistPath, []byte("existing"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -2801,6 +2802,113 @@ func TestServiceStartDoesNotReplaceExistingPlist(t *testing.T) {
 	}
 	if err == nil || !strings.Contains(err.Error(), "existing service") {
 		t.Fatalf("start error = %v", err)
+	}
+	content, err := os.ReadFile(service.PlistPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != "existing" {
+		t.Fatalf("plist changed: %q", content)
+	}
+}
+
+func TestServiceStartChecksExistingServiceBeforeConfig(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("launchd applies on macOS")
+	}
+	service, err := NewServiceForStart(filepath.Join(t.TempDir(), "missing.json"), filepath.Join(t.TempDir(), "state"), 1, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.PlistPath = filepath.Join(t.TempDir(), "existing.plist")
+	service.LockPath = filepath.Join(t.TempDir(), "service.lock")
+	if err := os.WriteFile(service.PlistPath, []byte("existing"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	started, err := service.Start()
+	if started {
+		t.Fatal("start created a replacement service")
+	}
+	if err == nil || !strings.Contains(err.Error(), "existing service") {
+		t.Fatalf("start error = %v", err)
+	}
+}
+
+func TestServiceStartUsesStableLockPath(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("launchd applies on macOS")
+	}
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+	first, err := NewServiceForStart(configPath, filepath.Join(t.TempDir(), "first"), 1, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewServiceForStart(configPath, filepath.Join(t.TempDir(), "second"), 1, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.LockPath != second.LockPath {
+		t.Fatalf("lock paths differ: %q and %q", first.LockPath, second.LockPath)
+	}
+}
+
+func TestInstallRejectsStateInsideGitMetadata(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("launchd applies on macOS")
+	}
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	service, err := NewService(configPath, filepath.Join(checkout, ".git"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Install(); err == nil || !strings.Contains(err.Error(), "state directory must not overlap Git metadata") {
+		t.Fatalf("install error = %v", err)
+	}
+}
+
+func TestPlistStateDir(t *testing.T) {
+	stateDir, err := plistStateDir(strings.NewReader(`<?xml version="1.0"?><plist><dict><key>ProgramArguments</key><array><string>bitci</string><string>serve</string><string>--state-dir</string><string>/tmp/bitci-state</string></array></dict></plist>`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stateDir != "/tmp/bitci-state" {
+		t.Fatalf("state dir = %q", stateDir)
+	}
+}
+
+func TestServiceReadsStateDirFromInstalledPlist(t *testing.T) {
+	service := Service{
+		ConfigPath: filepath.Join(t.TempDir(), "bitci.json"),
+		StateDir:   filepath.Join(t.TempDir(), "caller-state"),
+		PlistPath:  filepath.Join(t.TempDir(), "service.plist"),
+	}
+	installedStateDir := filepath.Join(t.TempDir(), "installed-state")
+	installed := service
+	installed.StateDir = installedStateDir
+	if err := os.WriteFile(service.PlistPath, []byte(installed.plist()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := service.withInstalledStateDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.StateDir != installedStateDir {
+		t.Fatalf("state dir = %q, want %q", resolved.StateDir, installedStateDir)
+	}
+}
+
+func TestInstallAbsentDoesNotReplacePlist(t *testing.T) {
+	service := Service{PlistPath: filepath.Join(t.TempDir(), "service.plist"), StateDir: filepath.Join(t.TempDir(), "state")}
+	if err := os.WriteFile(service.PlistPath, []byte("existing"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.installAbsent(); err == nil || !errors.Is(err, os.ErrExist) {
+		t.Fatalf("install absent error = %v", err)
 	}
 	content, err := os.ReadFile(service.PlistPath)
 	if err != nil {
