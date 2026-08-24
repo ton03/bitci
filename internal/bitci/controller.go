@@ -521,6 +521,9 @@ func (controller *Controller) Serve(ctx context.Context, maxWorkers int, interva
 	if maxWorkers < 1 {
 		return fmt.Errorf("max-workers must be positive")
 	}
+	if len(httpAddresses) > 1 {
+		return fmt.Errorf("serve accepts at most one dashboard address")
+	}
 	listener, err := controller.Listen(socketPath)
 	if err != nil {
 		return err

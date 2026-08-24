@@ -106,10 +106,10 @@ func (controller *Controller) dashboardData(now time.Time) (dashboardPage, error
 	}
 	page := dashboardPage{
 		Now:       now,
-		Counts:    make([]dashboardCount, 0, 4),
+		Counts:    make([]dashboardCount, 0, 5),
 		DiskGuard: byteSize(controller.config.MinFreeBytes),
 	}
-	counts := map[string]int{"queued": 0, "running": 0, "passed": 0, "failed": 0}
+	counts := map[string]int{"queued": 0, "running": 0, "passed": 0, "failed": 0, "cancelled": 0}
 	var passed time.Duration
 	for _, job := range jobs {
 		counts[job.State]++
@@ -136,7 +136,7 @@ func (controller *Controller) dashboardData(now time.Time) (dashboardPage, error
 			passed += finished.Sub(started)
 		}
 	}
-	for _, state := range []string{"queued", "running", "passed", "failed"} {
+	for _, state := range []string{"queued", "running", "passed", "failed", "cancelled"} {
 		page.Counts = append(page.Counts, dashboardCount{State: state, Count: counts[state]})
 	}
 	if page.PassedLastWeek > 0 {

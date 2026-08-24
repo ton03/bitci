@@ -863,6 +863,19 @@ func TestDuplicateServeDoesNotRecoverRunningJobs(t *testing.T) {
 	}
 }
 
+func TestServeRejectsExtraDashboardAddresses(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	err = controller.Serve(context.Background(), 1, time.Second, "", "127.0.0.1:8181", "127.0.0.1:8182")
+	if err == nil || !strings.Contains(err.Error(), "at most one dashboard address") {
+		t.Fatalf("extra dashboard addresses error = %v", err)
+	}
+}
+
 func TestMCPReadOnlyTools(t *testing.T) {
 	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
 	stateDir := filepath.Join(t.TempDir(), "state")
@@ -1336,6 +1349,34 @@ func TestDashboardUsesJobConfigSnapshot(t *testing.T) {
 	if got, want := page.Jobs[1].Resources, "unavailable"; got != want {
 		t.Fatalf("unknown task resources = %q, want %q", got, want)
 	}
+}
+
+func TestDashboardCountsCancelledJobs(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.db.Exec(
+		"INSERT INTO jobs(batch, task, ref, state, created_at, finished_at) VALUES (?, ?, ?, ?, ?, ?)",
+		"batch", "unit", "ref", "cancelled", time.Now().UTC().Add(-time.Minute).Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339),
+	); err != nil {
+		t.Fatal(err)
+	}
+	page, err := controller.dashboardData(time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, count := range page.Counts {
+		if count.State == "cancelled" {
+			if count.Count != 1 {
+				t.Fatalf("cancelled count = %d, want 1", count.Count)
+			}
+			return
+		}
+	}
+	t.Fatal("dashboard omitted cancelled count")
 }
 
 func TestDashboardBindsLoopbackOnly(t *testing.T) {
