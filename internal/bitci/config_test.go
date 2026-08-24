@@ -324,6 +324,9 @@ func TestRecoverInterruptedRemovesWorktreeAfterCheckoutDisappears(t *testing.T) 
 	if err := os.Rename(checkout, movedCheckout); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Mkdir(checkout, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	controller, err = OpenState(configPath, filepath.Join(filepath.Dir(path), ".."))
 	if err != nil {
 		t.Fatal(err)
@@ -333,7 +336,14 @@ func TestRecoverInterruptedRemovesWorktreeAfterCheckoutDisappears(t *testing.T) 
 		t.Fatal(err)
 	}
 	if _, err := os.Lstat(path); !os.IsNotExist(err) {
-		t.Fatalf("worktree remains after missing checkout: %v", err)
+		t.Fatalf("worktree remains after replaced checkout: %v", err)
+	}
+	var pending int
+	if err := controller.db.QueryRow("SELECT cleanup_pending FROM jobs WHERE id = ?", jobs[0].ID).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	if pending != 0 {
+		t.Fatalf("cleanup pending after replaced checkout = %d", pending)
 	}
 }
 
@@ -782,6 +792,37 @@ func TestRetryPreservesRecordedSHAAndConfiguration(t *testing.T) {
 	}
 	if jobs[1].State != "passed" {
 		t.Fatalf("retried job = %#v", jobs[1])
+	}
+}
+
+func TestRetryPinsLegacyRecordedSHA(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	original, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.db.Exec("UPDATE jobs SET checkout_root = '', config_relative = '' WHERE id = ?", original[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	retried, err := controller.Retry(original[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinned := git(t, checkout, "rev-parse", "--verify", "refs/bitci/jobs/"+retried[0].Batch+"^{commit}")
+	if pinned != original[0].Ref {
+		t.Fatalf("pinned retry SHA = %q, want %q", pinned, original[0].Ref)
 	}
 }
 
@@ -1316,6 +1357,42 @@ func TestRecordedSHARejectsCheckoutAbsoluteExecutable(t *testing.T) {
 	}
 	if jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 126 {
 		t.Fatalf("absolute executable job = %#v", jobs[0])
+	}
+}
+
+func TestRecordedSHARejectsInterpreterScriptFromSubmittedCheckout(t *testing.T) {
+	checkout := t.TempDir()
+	runner := filepath.Join(checkout, "runner")
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(runner, []byte("touch escaped\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(fmt.Sprintf(`{"version":1,"tasks":{"unit":{"run":["sh",%q]}}}`, runner)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json", "runner")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 126 {
+		t.Fatalf("interpreter script job = %#v", jobs[0])
+	}
+	if _, err := os.Stat(filepath.Join(checkout, "escaped")); !os.IsNotExist(err) {
+		t.Fatalf("task executed mutable checkout script: %v", err)
 	}
 }
 

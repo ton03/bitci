@@ -307,15 +307,15 @@ func (controller *Controller) RunOnce(ctx context.Context, maxWorkers int) (bool
 		worktreeRoot = filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", job.ID))
 	}
 	code := 0
-	if isCheckoutSHA(job.Ref) && len(config.Prepare) > 0 && controller.isCheckoutExecutable(config.Prepare[0], job.checkoutRoot, worktreeRoot, workDir) {
-		fmt.Fprintln(logFile, "BitCI refuses an unsafe checkout-local prepare command for a recorded SHA job")
+	if isCheckoutSHA(job.Ref) && len(config.Prepare) > 0 && controller.hasUnsafeCheckoutArgument(config.Prepare, job.checkoutRoot, worktreeRoot, workDir) {
+		fmt.Fprintln(logFile, "BitCI refuses an unsafe checkout-local prepare argument for a recorded SHA job")
 		code = 126
 	} else {
 		if isCheckoutSHA(job.Ref) && len(config.Prepare) > 0 {
 			code = controller.executeCommand(ctx, config.Prepare, task.Timeout, logFile, workDir)
 		}
-		if code == 0 && isCheckoutSHA(job.Ref) && controller.isCheckoutExecutable(task.Run[0], job.checkoutRoot, worktreeRoot, workDir) {
-			fmt.Fprintln(logFile, "BitCI refuses an unsafe checkout-local task command for a recorded SHA job")
+		if code == 0 && isCheckoutSHA(job.Ref) && controller.hasUnsafeCheckoutArgument(task.Run, job.checkoutRoot, worktreeRoot, workDir) {
+			fmt.Fprintln(logFile, "BitCI refuses an unsafe checkout-local task argument for a recorded SHA job")
 			code = 126
 		}
 		if code == 0 {
@@ -581,6 +581,8 @@ func (controller *Controller) removeJobWorktree(id int64, checkoutRoot string) e
 		checkoutMissing = true
 	} else if err != nil {
 		failures = append(failures, err)
+	} else if _, err := gitAt(context.Background(), checkoutRoot, "rev-parse", "--git-dir"); err != nil {
+		checkoutMissing = true
 	}
 	if _, err := os.Lstat(path); err == nil {
 		if !checkoutMissing {
@@ -795,6 +797,17 @@ func (controller *Controller) isCheckoutExecutable(command, checkoutRoot, worktr
 	return pathWithin(root, resolvedPath)
 }
 
+func (controller *Controller) hasUnsafeCheckoutArgument(argv []string, checkoutRoot, worktreeRoot, workDir string) bool {
+	for index, value := range argv {
+		if index == 0 || filepath.IsAbs(value) || strings.HasPrefix(value, "."+string(filepath.Separator)) || strings.HasPrefix(value, ".."+string(filepath.Separator)) {
+			if controller.isCheckoutExecutable(value, checkoutRoot, worktreeRoot, workDir) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func pathOrAncestorWithin(root, path string) bool {
 	for current := path; ; current = filepath.Dir(current) {
 		if resolved, err := filepath.EvalSymlinks(current); err == nil && pathWithin(root, resolved) {
@@ -931,6 +944,13 @@ func (controller *Controller) Retry(id int64) ([]Job, error) {
 		}
 		if err := config.Validate(); err != nil {
 			return nil, fmt.Errorf("validate retried job configuration: %w", err)
+		}
+	}
+	if isCheckoutSHA(ref) && checkoutRoot == "" {
+		var err error
+		checkoutRoot, configRelative, err = controller.checkoutLocation()
+		if err != nil {
+			return nil, fmt.Errorf("find checkout for retried SHA: %w", err)
 		}
 	}
 	return controller.submit(config, []string{task}, ref, checkoutRoot, configRelative)
