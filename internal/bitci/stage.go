@@ -86,7 +86,7 @@ func (controller *Controller) protectStateFromTarget(ctx context.Context, sha st
 	if !ok {
 		return nil
 	}
-	output, err := controller.git(ctx, "ls-tree", "-r", "--name-only", sha, "--", relative)
+	output, err := controller.git(ctx, "ls-tree", "-r", "--name-only", sha, "--", ":(top,literal)"+filepath.ToSlash(relative))
 	if err != nil {
 		return err
 	}
@@ -108,7 +108,8 @@ func (controller *Controller) noActiveJobs() error {
 }
 
 func (controller *Controller) cleanGeneratedNext(ctx context.Context) error {
-	nextPath := filepath.Join(filepath.Dir(controller.configPath), ".next")
+	nextRelative := filepath.Join(controller.configRelative, ".next")
+	nextPath := filepath.Join(controller.gitDirectory(), nextRelative)
 	info, err := os.Lstat(nextPath)
 	if os.IsNotExist(err) {
 		return nil
@@ -119,7 +120,7 @@ func (controller *Controller) cleanGeneratedNext(ctx context.Context) error {
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("refuse generated cleanup for non-directory .next")
 	}
-	if _, err := controller.git(ctx, "clean", "-fdX", "--", ".next"); err != nil {
+	if _, err := controller.git(ctx, "clean", "-fdX", "--", ":(top,literal)"+filepath.ToSlash(nextRelative)); err != nil {
 		return fmt.Errorf("clean ignored .next: %w", err)
 	}
 	return nil

@@ -930,6 +930,40 @@ func TestRecordedSHARejectsCheckoutAbsoluteExecutable(t *testing.T) {
 	}
 }
 
+func TestRecordedSHARejectsExecutableFromSubmittedCheckout(t *testing.T) {
+	checkout := t.TempDir()
+	runner := filepath.Join(checkout, "runner")
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(runner, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(fmt.Sprintf(`{"version":1,"tasks":{"unit":{"run":[%q]}}}`, runner)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json", "runner")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	controller.checkoutRoot = t.TempDir()
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 126 {
+		t.Fatalf("submitted checkout executable job = %#v", jobs[0])
+	}
+}
+
 func TestRecordedSHARejectsCheckoutPathExecutable(t *testing.T) {
 	checkout := t.TempDir()
 	runner := filepath.Join(checkout, "runner")
@@ -1066,7 +1100,8 @@ func TestCleanCheckoutRejectsTrackedStateFiles(t *testing.T) {
 func TestStageProtectsStateFromTargetTree(t *testing.T) {
 	checkout := t.TempDir()
 	configPath := filepath.Join(checkout, "bitci.json")
-	if err := os.WriteFile(filepath.Join(checkout, ".gitignore"), []byte(".bitci/\n"), 0o600); err != nil {
+	stateDir := filepath.Join(checkout, ".bitci[local]")
+	if err := os.WriteFile(filepath.Join(checkout, ".gitignore"), []byte(".bitci[[]local]/\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
@@ -1075,22 +1110,57 @@ func TestStageProtectsStateFromTargetTree(t *testing.T) {
 	git(t, checkout, "init", "-q")
 	git(t, checkout, "add", ".")
 	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
-	controller, err := Open(configPath, filepath.Join(checkout, ".bitci"))
+	controller, err := Open(configPath, stateDir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer controller.Close()
-	if err := os.WriteFile(filepath.Join(checkout, ".bitci", "poison"), []byte("tracked target"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(stateDir, "poison"), []byte("tracked target"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	git(t, checkout, "add", "-f", ".bitci/poison")
+	git(t, checkout, "add", "-f", ".bitci[local]/poison")
 	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "target state")
 	sha := git(t, checkout, "rev-parse", "HEAD")
 	if err := controller.protectStateFromTarget(context.Background(), sha); err == nil || !strings.Contains(err.Error(), "state files") {
 		t.Fatalf("target state protection error = %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(checkout, ".bitci", "bitci.db")); err != nil {
+	if _, err := os.Stat(filepath.Join(stateDir, "bitci.db")); err != nil {
 		t.Fatalf("BitCI state was replaced: %v", err)
+	}
+}
+
+func TestCleanGeneratedNextUsesNestedConfigDirectory(t *testing.T) {
+	checkout := t.TempDir()
+	configDir := filepath.Join(checkout, "ci")
+	configPath := filepath.Join(configDir, "bitci.json")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, ".gitignore"), []byte("ci/.next/\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", ".")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	if err := os.MkdirAll(filepath.Join(configDir, ".next"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, ".next", "stale"), []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if err := controller.cleanGeneratedNext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(configDir, ".next")); !os.IsNotExist(err) {
+		t.Fatalf("nested generated files remain: %v", err)
 	}
 }
 

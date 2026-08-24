@@ -270,10 +270,10 @@ func (controller *Controller) RunOnce(ctx context.Context, maxWorkers int) (bool
 		}
 	}
 	code := 0
-	if isCheckoutSHA(job.Ref) && len(config.Prepare) > 0 && controller.isCheckoutExecutable(config.Prepare[0]) {
+	if isCheckoutSHA(job.Ref) && len(config.Prepare) > 0 && controller.isCheckoutExecutable(config.Prepare[0], job.checkoutRoot) {
 		fmt.Fprintln(logFile, "BitCI refuses a checkout-local absolute prepare executable for a recorded SHA job")
 		code = 126
-	} else if isCheckoutSHA(job.Ref) && controller.isCheckoutExecutable(task.Run[0]) {
+	} else if isCheckoutSHA(job.Ref) && controller.isCheckoutExecutable(task.Run[0], job.checkoutRoot) {
 		fmt.Fprintln(logFile, "BitCI refuses a checkout-local absolute task executable for a recorded SHA job")
 		code = 126
 	} else {
@@ -670,7 +670,7 @@ func (controller *Controller) snapshotConfig(snapshot string) (Config, error) {
 	return config, nil
 }
 
-func (controller *Controller) isCheckoutExecutable(command string) bool {
+func (controller *Controller) isCheckoutExecutable(command, checkoutRoot string) bool {
 	if !filepath.IsAbs(command) {
 		if strings.ContainsRune(command, filepath.Separator) {
 			return false
@@ -681,11 +681,10 @@ func (controller *Controller) isCheckoutExecutable(command string) bool {
 		}
 		command = resolved
 	}
-	checkout, err := controller.git(context.Background(), "rev-parse", "--show-toplevel")
-	if err != nil {
-		return false
+	if checkoutRoot == "" {
+		checkoutRoot = controller.gitDirectory()
 	}
-	root, err := filepath.EvalSymlinks(filepath.Clean(strings.TrimSpace(checkout)))
+	root, err := filepath.EvalSymlinks(filepath.Clean(checkoutRoot))
 	if err != nil {
 		return false
 	}
