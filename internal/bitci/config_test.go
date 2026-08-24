@@ -58,6 +58,9 @@ func TestConfigContract(t *testing.T) {
 	if _, err := LoadConfig(writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["x"],"env":{"VALUE":"bad\u0000value"}}}}`)); err == nil {
 		t.Fatal("NUL environment value passed")
 	}
+	if _, err := LoadConfig(writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["x"],"max_retries":-1}}}`)); err == nil {
+		t.Fatal("negative retry cap passed")
+	}
 }
 
 func TestLogsRedactConfiguredValues(t *testing.T) {
@@ -871,7 +874,7 @@ func TestMCPStatusIncludesTestedSHA(t *testing.T) {
 	}
 	defer controller.Close()
 	sha := "0123456789012345678901234567890123456789"
-	if _, err := controller.db.Exec("INSERT INTO jobs(batch, task, ref, tested_sha, state, created_at) VALUES ('batch', 'unit', ?, ?, 'passed', '2026-01-01T00:00:00Z')", sha, sha); err != nil {
+	if _, err := controller.db.Exec("INSERT INTO jobs(batch, task, ref, tested_sha, state, created_at, attempt, queue_wait_seconds, duration_seconds, terminal_result) VALUES ('batch', 'unit', ?, ?, 'passed', '2026-01-01T00:00:00Z', 2, 3, 4, 'passed')", sha, sha); err != nil {
 		t.Fatal(err)
 	}
 	socketPath := fmt.Sprintf("/tmp/bitci-%d.sock", time.Now().UnixNano())
@@ -885,7 +888,7 @@ func TestMCPStatusIncludesTestedSHA(t *testing.T) {
 	ownerDone := make(chan error, 1)
 	go func() { ownerDone <- controller.ServeRPC(ctx, listener) }()
 	status := mcpStatus(t, socketPath)
-	if len(status.Jobs) != 1 || status.Jobs[0].TestedSHA != sha {
+	if len(status.Jobs) != 1 || status.Jobs[0].TestedSHA != sha || status.Jobs[0].Attempt != 2 || status.Jobs[0].QueueWaitSeconds != 3 || status.Jobs[0].DurationSeconds != 4 || status.Jobs[0].TerminalResult != "passed" {
 		t.Fatalf("MCP status = %#v", status)
 	}
 	cancel()
@@ -1074,6 +1077,86 @@ func TestReadLogDoesNotAdvanceAtReadCap(t *testing.T) {
 	}
 	if !strings.Contains(string(encoded), `"lines":[]`) {
 		t.Fatalf("empty log lines encoded as %s", encoded)
+	}
+}
+
+func TestRetryCapRecordsHistory(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["false"],"max_retries":2}}}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	original, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run original = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].Attempt != 1 || jobs[0].TerminalResult != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 1 {
+		t.Fatalf("original history = %#v", jobs[0])
+	}
+	retried, err := controller.Retry(original[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retried[0].Attempt != 2 || retried[0].RetryOf == nil || *retried[0].RetryOf != original[0].ID || retried[0].RetryRoot != original[0].ID || retried[0].PriorExitCode == nil || *retried[0].PriorExitCode != 1 {
+		t.Fatalf("retry history = %#v", retried[0])
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run retry = %v, %v", ran, err)
+	}
+	third, err := controller.Retry(original[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third[0].Attempt != 3 || third[0].RetryOf == nil || *third[0].RetryOf != retried[0].ID || third[0].PriorExitCode == nil || *third[0].PriorExitCode != 1 {
+		t.Fatalf("third retry history = %#v", third[0])
+	}
+	if _, err := controller.Retry(original[0].ID); err == nil || !strings.Contains(err.Error(), "max_retries 2") {
+		t.Fatalf("retry cap error = %v", err)
+	}
+}
+
+func TestRetryCapSerializesConcurrentRetries(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["false"],"max_retries":1}}}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	original, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run original = %v, %v", ran, err)
+	}
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for range 2 {
+		go func() {
+			<-start
+			_, err := controller.Retry(original[0].ID)
+			results <- err
+		}()
+	}
+	close(start)
+	successes := 0
+	for range 2 {
+		if err := <-results; err == nil {
+			successes++
+		} else if !strings.Contains(err.Error(), "max_retries 1") {
+			t.Fatalf("concurrent retry error = %v", err)
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("concurrent retries succeeded = %d, want 1", successes)
 	}
 }
 

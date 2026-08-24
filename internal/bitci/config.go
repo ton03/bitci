@@ -22,12 +22,13 @@ type Config struct {
 }
 
 type Task struct {
-	Run       []string          `json:"run"`
-	Env       map[string]string `json:"env"`
-	Needs     []string          `json:"needs"`
-	Resources []string          `json:"resources"`
-	Paths     []string          `json:"paths"`
-	Timeout   int               `json:"timeout_seconds"`
+	Run        []string          `json:"run"`
+	Env        map[string]string `json:"env"`
+	Needs      []string          `json:"needs"`
+	Resources  []string          `json:"resources"`
+	Paths      []string          `json:"paths"`
+	Timeout    int               `json:"timeout_seconds"`
+	MaxRetries int               `json:"max_retries"`
 }
 
 func LoadConfig(filename string) (Config, error) {
@@ -94,6 +95,9 @@ func (config Config) Validate() error {
 			if strings.ContainsRune(value, '\x00') {
 				return fmt.Errorf("task %q environment variable %q contains NUL", name, variable)
 			}
+		}
+		if task.MaxRetries < 0 {
+			return fmt.Errorf("task %q max_retries must not be negative", name)
 		}
 		for _, need := range task.Needs {
 			if _, ok := config.Tasks[need]; !ok {
