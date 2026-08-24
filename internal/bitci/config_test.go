@@ -589,6 +589,61 @@ func TestRecoverOrphanedReleasesLeaseAndCancelsBatch(t *testing.T) {
 	}
 }
 
+func TestRecoverOrphanedSkipsChangedJob(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	jobs, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid := 999999999
+	if _, err := controller.db.Exec("UPDATE jobs SET worker_pid = ? WHERE id = ?", pid, jobs[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if recovered, err := controller.recoverJobs([]Job{{ID: jobs[0].ID, WorkerPID: &pid}}, false); err == nil || recovered != 0 {
+		t.Fatalf("manual recovery = %d, %v", recovered, err)
+	}
+	if recovered, err := controller.recoverJobs([]Job{{ID: jobs[0].ID, WorkerPID: &pid}}, true); err != nil || recovered != 0 {
+		t.Fatalf("background recovery = %d, %v", recovered, err)
+	}
+}
+
+func TestFinishAcceptsRecoveredJob(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	job, claimed, err := controller.claim(1)
+	if err != nil || !claimed {
+		t.Fatalf("claim = %v, %v", claimed, err)
+	}
+	if _, err := controller.db.Exec("UPDATE jobs SET worker_pid = ?, started_at = ? WHERE id = ?", 999999999, time.Now().Add(-orphanRecoveryGrace).UTC().Format(time.RFC3339), job.ID); err != nil {
+		t.Fatal(err)
+	}
+	if recovered, err := controller.RecoverOrphaned(); err != nil || recovered != 1 {
+		t.Fatalf("recover orphaned = %d, %v", recovered, err)
+	}
+	if err := controller.finish(job, 125, false); err != nil {
+		t.Fatalf("finish recovered job: %v", err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 125 {
+		t.Fatalf("recovered job = %#v", jobs[0])
+	}
+}
+
 func TestRecoverJobRefusesLiveTaskProcess(t *testing.T) {
 	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
 	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))

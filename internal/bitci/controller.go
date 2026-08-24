@@ -1167,6 +1167,15 @@ func (controller *Controller) finish(job Job, code int, cleanupPending bool) err
 	if updated, err := result.RowsAffected(); err != nil {
 		return err
 	} else if updated == 0 {
+		var recoveredState string
+		var recoveredCode int
+		var recoveredPID *int
+		if err := controller.db.QueryRow("SELECT state, COALESCE(exit_code, 0), worker_pid FROM jobs WHERE id = ?", job.ID).Scan(&recoveredState, &recoveredCode, &recoveredPID); err != nil {
+			return err
+		}
+		if recoveredState == "failed" && recoveredCode == 125 && recoveredPID == nil {
+			return nil
+		}
 		return fmt.Errorf("job %d is no longer finishable", job.ID)
 	}
 	_, err = controller.db.Exec("DELETE FROM leases WHERE job_id = ?", job.ID)
