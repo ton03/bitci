@@ -453,7 +453,8 @@ func TestDuplicateServeDoesNotRecoverRunningJobs(t *testing.T) {
 	go func() { ownerDone <- owner.Serve(ctx, 1, time.Hour, socketPath) }()
 	deadline := time.Now().Add(time.Second)
 	for {
-		if _, err := os.Stat(socketPath); err == nil {
+		var jobs []Job
+		if Call(socketPath, "status", struct{}{}, &jobs) == nil {
 			break
 		}
 		select {
@@ -462,7 +463,7 @@ func TestDuplicateServeDoesNotRecoverRunningJobs(t *testing.T) {
 		default:
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("owner did not create socket")
+			t.Fatal("owner did not accept status requests")
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -1617,6 +1618,44 @@ func TestStageRejectsSymlinkedInCheckoutState(t *testing.T) {
 	}
 }
 
+func TestStageProtectsStateWithSymlinkedConfigDirectory(t *testing.T) {
+	checkout := t.TempDir()
+	configDir := filepath.Join(checkout, "ci", "nested")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, ".gitignore"), []byte(".bitci/\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "bitci.json"), []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", ".")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	if err := os.Symlink(filepath.Join("ci", "nested"), filepath.Join(checkout, "alias")); err != nil {
+		t.Fatal(err)
+	}
+	stateDir := filepath.Join(checkout, ".bitci")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stateDir, "poison"), []byte("tracked target"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "add", "-f", ".bitci/poison")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "target state")
+	controller, err := Open(filepath.Join(checkout, "alias", "bitci.json"), stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	sha := git(t, checkout, "rev-parse", "HEAD")
+	if err := controller.protectStateFromTarget(context.Background(), sha); err == nil || !strings.Contains(err.Error(), "state files") {
+		t.Fatalf("target state protection error = %v", err)
+	}
+}
+
 func TestStagePRChecksTrustAndCleansNext(t *testing.T) {
 	checkout := t.TempDir()
 	configPath := filepath.Join(checkout, "bitci.json")
@@ -1743,9 +1782,17 @@ func TestServicePathUsesPrepareExecutable(t *testing.T) {
 	}
 }
 
-func TestServicePathReportsMissingConfiguredCommand(t *testing.T) {
+func TestServicePathAllowsTaskExecutableCreatedByPrepare(t *testing.T) {
 	checkout := t.TempDir()
-	_, err := servicePath(Config{Tasks: map[string]Task{"unit": {Run: []string{"./missing"}}}}, checkout)
+	_, err := servicePath(Config{Prepare: []string{"true"}, Tasks: map[string]Task{"unit": {Run: []string{"./node_modules/.bin/unit"}}}}, checkout)
+	if err != nil {
+		t.Fatalf("service path error = %v", err)
+	}
+}
+
+func TestServicePathReportsMissingPrepareCommand(t *testing.T) {
+	checkout := t.TempDir()
+	_, err := servicePath(Config{Prepare: []string{"./missing"}, Tasks: map[string]Task{"unit": {Run: []string{"true"}}}}, checkout)
 	if err == nil || !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("service path error = %v", err)
 	}

@@ -188,16 +188,23 @@ func (controller *Controller) cleanCheckout(ctx context.Context) error {
 func (controller *Controller) checkoutStatePath() (string, bool, error) {
 	checkout := controller.gitDirectory()
 	if controller.checkoutRoot != "" {
-		checkout = filepath.Dir(controller.configPath)
-		if controller.configRelative != "" && controller.configRelative != "." {
-			for range strings.Split(controller.configRelative, string(filepath.Separator)) {
-				checkout = filepath.Dir(checkout)
-			}
-		}
+		checkout = controller.checkoutRoot
 	}
 	checkout = filepath.Clean(checkout)
 	state := filepath.Clean(controller.stateDir)
-	relative, err := filepath.Rel(checkout, state)
+	if lexicalRoot := controller.lexicalCheckoutRoot(checkout); lexicalRoot != "" {
+		if lexicalRelative, err := filepath.Rel(lexicalRoot, state); err == nil && lexicalRelative != "." && lexicalRelative != ".." && !strings.HasPrefix(lexicalRelative, ".."+string(filepath.Separator)) {
+			usesSymlink, err := pathUsesSymlink(lexicalRoot, lexicalRelative)
+			if err != nil {
+				return "", false, err
+			}
+			if usesSymlink {
+				return "", false, fmt.Errorf("state directory must not use a symlink inside the checkout")
+			}
+		}
+	}
+	resolvedState := resolvedPathForComparison(state)
+	relative, err := filepath.Rel(checkout, resolvedState)
 	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
 		return "", false, nil
 	}
@@ -209,6 +216,20 @@ func (controller *Controller) checkoutStatePath() (string, bool, error) {
 		return "", false, fmt.Errorf("state directory must not use a symlink inside the checkout")
 	}
 	return relative, true, nil
+}
+
+func (controller *Controller) lexicalCheckoutRoot(checkout string) string {
+	path := filepath.Dir(controller.configPath)
+	for {
+		if resolvedPathForComparison(path) == checkout {
+			return path
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			return ""
+		}
+		path = parent
+	}
 }
 
 func pathUsesSymlink(root, relative string) (bool, error) {
