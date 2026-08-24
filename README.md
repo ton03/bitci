@@ -46,6 +46,11 @@ Validate it:
 
 ```sh
 bitci validate
+```
+
+Start the local controller and dashboard:
+
+```sh
 bitci serve --max-workers 2 --http 127.0.0.1:8787
 ```
 
@@ -114,7 +119,7 @@ Do not put secrets in `bitci.json` or task output.
 Install BitCI once in a permanent location. Use `go install` above, or keep a
 Release binary at a permanent path.
 
-From the project root, this one command installs and starts the local service:
+From the project root, these commands install and start the local service:
 
 ```sh
 mkdir -p "$HOME/.local/bin"

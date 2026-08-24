@@ -1286,7 +1286,15 @@ func TestDashboardBindsLoopbackOnly(t *testing.T) {
 			t.Fatalf("dashboard accepted %q", address)
 		}
 	}
-	listener, err := listenDashboard("127.0.0.1:18787")
+	reserved, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := reserved.Addr().String()
+	if err := reserved.Close(); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := listenDashboard(address)
 	if err != nil {
 		t.Fatal(err)
 	}

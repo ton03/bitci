@@ -12,8 +12,6 @@ import (
 	"time"
 )
 
-const dashboardRefresh = 3 * time.Second
-
 type dashboardPage struct {
 	Now            time.Time
 	Jobs           []dashboardJob

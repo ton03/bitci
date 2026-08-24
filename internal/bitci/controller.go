@@ -542,7 +542,9 @@ func (controller *Controller) Serve(ctx context.Context, maxWorkers int, interva
 		}
 		dashboard = &http.Server{Handler: controller.DashboardHandler(), ReadHeaderTimeout: 5 * time.Second}
 		defer func() {
-			_ = dashboard.Shutdown(context.Background())
+			shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = dashboard.Shutdown(shutdown)
 			_ = dashboardListener.Close()
 		}()
 	}
