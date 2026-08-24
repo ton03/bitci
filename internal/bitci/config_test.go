@@ -733,6 +733,19 @@ func TestQueuedJobUsesSubmittedConfiguration(t *testing.T) {
 	if jobs[0].State != "passed" {
 		t.Fatalf("submitted configuration job = %#v", jobs[0])
 	}
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run current config = %v, %v", ran, err)
+	}
+	jobs, err = controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[1].State != "failed" {
+		t.Fatalf("current configuration job = %#v", jobs[1])
+	}
 }
 
 func TestRecordedSHARejectsCheckoutAbsoluteExecutable(t *testing.T) {

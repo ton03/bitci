@@ -562,8 +562,10 @@ func (controller *Controller) resourcesFree(transaction *sql.Tx, task Task, conf
 }
 
 func (controller *Controller) jobConfig(job Job) (Config, Task, error) {
-	config := controller.config
-	if job.configJSON != "" {
+	var config Config
+	if job.configJSON == "" {
+		config = controller.config
+	} else {
 		if err := json.Unmarshal([]byte(job.configJSON), &config); err != nil {
 			return Config{}, Task{}, fmt.Errorf("decode queued job configuration: %w", err)
 		}
