@@ -670,6 +670,12 @@ func TestFinishAcceptsRecoveredJob(t *testing.T) {
 	}
 }
 
+func TestRecoveryIntervalCapsQueuePollInterval(t *testing.T) {
+	if got := recoveryInterval(30 * time.Second); got != orphanRecoveryGrace {
+		t.Fatalf("recovery interval = %v, want %v", got, orphanRecoveryGrace)
+	}
+}
+
 func TestRecoverJobRefusesLiveTaskProcess(t *testing.T) {
 	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
 	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))

@@ -518,10 +518,7 @@ func (controller *Controller) Serve(ctx context.Context, maxWorkers int, interva
 }
 
 func (controller *Controller) serveRecovery(ctx context.Context, interval time.Duration, errors chan<- error) {
-	if interval < time.Second {
-		interval = time.Second
-	}
-	ticker := time.NewTicker(interval)
+	ticker := time.NewTicker(recoveryInterval(interval))
 	defer ticker.Stop()
 	for {
 		select {
@@ -534,6 +531,16 @@ func (controller *Controller) serveRecovery(ctx context.Context, interval time.D
 			}
 		}
 	}
+}
+
+func recoveryInterval(interval time.Duration) time.Duration {
+	if interval < time.Second {
+		return time.Second
+	}
+	if interval > orphanRecoveryGrace {
+		return orphanRecoveryGrace
+	}
+	return interval
 }
 
 func (controller *Controller) serveWorker(ctx context.Context, maxWorkers int, interval time.Duration, errors chan<- error) {
