@@ -38,6 +38,8 @@ type Controller struct {
 	ownerRelease   func()
 	ownerCount     int
 	stageMu        sync.Mutex
+	recoveryMu     sync.Mutex
+	recovered      bool
 }
 
 type Job struct {
@@ -205,7 +207,8 @@ func (controller *Controller) migrate() error {
 		);
 		CREATE TABLE IF NOT EXISTS batch_refs (
 			batch TEXT PRIMARY KEY,
-			checkout_root TEXT NOT NULL
+			checkout_root TEXT NOT NULL,
+			ref TEXT NOT NULL
 		);
 	`)
 	if err != nil {
@@ -223,7 +226,14 @@ func (controller *Controller) migrate() error {
 	if err := controller.addJobColumn("config_relative", "TEXT"); err != nil {
 		return err
 	}
-	return controller.addJobColumn("cleanup_pending", "INTEGER NOT NULL DEFAULT 0")
+	if err := controller.addJobColumn("cleanup_pending", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	if err := controller.addBatchRefColumn("ref", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	_, err = controller.db.Exec("UPDATE batch_refs SET ref = (SELECT ref FROM jobs WHERE jobs.batch = batch_refs.batch LIMIT 1) WHERE ref = ''")
+	return err
 }
 
 func (controller *Controller) addJobColumn(name, definition string) error {
@@ -254,6 +264,20 @@ func (controller *Controller) hasJobColumn(name string) (bool, error) {
 	} else {
 		return false, err
 	}
+}
+
+func (controller *Controller) addBatchRefColumn(name, definition string) error {
+	if _, err := controller.db.Exec("SELECT " + name + " FROM batch_refs LIMIT 0"); err == nil {
+		return nil
+	} else if !strings.Contains(err.Error(), "no such column: "+name) {
+		return err
+	}
+	if _, err := controller.db.Exec("ALTER TABLE batch_refs ADD COLUMN " + name + " " + definition); err != nil {
+		if _, checkErr := controller.db.Exec("SELECT " + name + " FROM batch_refs LIMIT 0"); checkErr != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (controller *Controller) Submit(taskNames []string, ref string) ([]Job, error) {
@@ -292,6 +316,11 @@ func recordedDirectoryExists(checkoutRoot, ref, relative string) error {
 }
 
 func (controller *Controller) submit(config Config, taskNames []string, ref, checkoutRoot, configRelative string) ([]Job, error) {
+	releaseStage, err := controller.acquireStageLock(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("lock checkout for submit: %w", err)
+	}
+	defer releaseStage()
 	ordered, err := config.Ordered(taskNames)
 	if err != nil {
 		return nil, err
@@ -303,6 +332,18 @@ func (controller *Controller) submit(config Config, taskNames []string, ref, che
 	if err != nil {
 		return nil, err
 	}
+	recordedRef := checkoutRoot != "" && isCheckoutSHA(ref)
+	if recordedRef {
+		if _, err := controller.db.Exec("INSERT INTO batch_refs(batch, checkout_root, ref) VALUES (?, ?, ?)", batch, checkoutRoot, ref); err != nil {
+			return nil, err
+		}
+	}
+	committed := false
+	defer func() {
+		if recordedRef && !committed {
+			_, _ = controller.db.Exec("DELETE FROM batch_refs WHERE batch = ?", batch)
+		}
+	}()
 	transaction, err := controller.db.Begin()
 	if err != nil {
 		return nil, err
@@ -328,10 +369,7 @@ func (controller *Controller) submit(config Config, taskNames []string, ref, che
 		jobs = append(jobs, Job{ID: id, Batch: batch, Task: taskName, Ref: ref, State: "queued", checkoutRoot: checkoutRoot, configRelative: configRelative})
 	}
 	refCreated := false
-	if checkoutRoot != "" && isCheckoutSHA(ref) {
-		if _, err := transaction.Exec("INSERT INTO batch_refs(batch, checkout_root) VALUES (?, ?)", batch, checkoutRoot); err != nil {
-			return nil, err
-		}
+	if recordedRef {
 		if _, err := gitAt(context.Background(), checkoutRoot, "update-ref", batchRef(batch), ref); err != nil {
 			return nil, fmt.Errorf("pin recorded checkout SHA: %w", err)
 		}
@@ -343,6 +381,7 @@ func (controller *Controller) submit(config Config, taskNames []string, ref, che
 		}
 		return nil, err
 	}
+	committed = true
 	return jobs, nil
 }
 
@@ -355,8 +394,18 @@ func (controller *Controller) RunOnce(ctx context.Context, maxWorkers int) (bool
 		return false, err
 	}
 	defer release()
-	if err := controller.cleanupOrphanBatchRefs(); err != nil {
-		return false, err
+	controller.recoveryMu.Lock()
+	if !controller.recovered {
+		err := controller.RecoverInterrupted()
+		if err == nil {
+			controller.recovered = true
+		}
+		controller.recoveryMu.Unlock()
+		if err != nil {
+			return false, err
+		}
+	} else {
+		controller.recoveryMu.Unlock()
 	}
 	return controller.runOnce(ctx, maxWorkers)
 }
@@ -603,7 +652,7 @@ func (controller *Controller) jobCheckout(ctx context.Context, job Job) (string,
 }
 
 func copyRecordedObjects(ctx context.Context, checkoutRoot, ref, stateDir, objectFormat string) (string, error) {
-	cacheDigest := sha256.Sum256([]byte(resolvedPathForComparison(checkoutRoot)))
+	cacheDigest := sha256.Sum256([]byte(resolvedPathForComparison(checkoutRoot) + "\x00" + strings.ToLower(strings.TrimSpace(objectFormat))))
 	cacheRoot := filepath.Join(stateDir, "object-cache", hex.EncodeToString(cacheDigest[:8]))
 	if _, err := os.Stat(cacheRoot); os.IsNotExist(err) {
 		if err := os.MkdirAll(filepath.Dir(cacheRoot), 0o700); err != nil {
@@ -817,7 +866,7 @@ func (controller *Controller) acquireStageLock(ctx context.Context) (func(), err
 	gitMetadata, err := gitCommonDirectory(controller.configPath)
 	if err != nil {
 		controller.stageMu.Unlock()
-		return nil, err
+		return func() {}, nil
 	}
 	file, err := os.OpenFile(filepath.Join(gitMetadata, "bitci-stage.lock"), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
@@ -974,15 +1023,15 @@ func batchRef(batch string) string {
 }
 
 func (controller *Controller) cleanupOrphanBatchRefs() error {
-	rows, err := controller.db.Query("SELECT batch, checkout_root FROM batch_refs WHERE batch NOT IN (SELECT DISTINCT batch FROM jobs WHERE state IN ('queued', 'running') OR cleanup_pending = 1)")
+	rows, err := controller.db.Query("SELECT batch, checkout_root, ref FROM batch_refs")
 	if err != nil {
 		return err
 	}
-	type ownedBatchRef struct{ batch, checkoutRoot string }
+	type ownedBatchRef struct{ batch, checkoutRoot, expected string }
 	var refs []ownedBatchRef
 	for rows.Next() {
 		var ref ownedBatchRef
-		if err := rows.Scan(&ref.batch, &ref.checkoutRoot); err != nil {
+		if err := rows.Scan(&ref.batch, &ref.checkoutRoot, &ref.expected); err != nil {
 			rows.Close()
 			return err
 		}
@@ -996,8 +1045,35 @@ func (controller *Controller) cleanupOrphanBatchRefs() error {
 		return err
 	}
 	for _, owned := range refs {
-		if _, err := gitAt(context.Background(), owned.checkoutRoot, "update-ref", "-d", batchRef(owned.batch)); err != nil {
-			return fmt.Errorf("remove orphan batch ref: %w", err)
+		var active int
+		if err := controller.db.QueryRow("SELECT COUNT(*) FROM jobs WHERE batch = ? AND (state IN ('queued', 'running') OR cleanup_pending = 1)", owned.batch).Scan(&active); err != nil {
+			return err
+		}
+		actual, refErr := gitAt(context.Background(), owned.checkoutRoot, "rev-parse", "--verify", batchRef(owned.batch)+"^{commit}")
+		if refErr != nil {
+			if _, repoErr := gitAt(context.Background(), owned.checkoutRoot, "rev-parse", "--git-dir"); repoErr != nil {
+				continue
+			}
+		}
+		if active != 0 {
+			if refErr != nil {
+				if _, objectErr := gitAt(context.Background(), owned.checkoutRoot, "cat-file", "-e", owned.expected+"^{commit}"); objectErr != nil {
+					continue
+				}
+				if _, err := gitAt(context.Background(), owned.checkoutRoot, "update-ref", batchRef(owned.batch), owned.expected); err != nil {
+					return fmt.Errorf("restore missing batch ref: %w", err)
+				}
+				continue
+			}
+			if !strings.EqualFold(strings.TrimSpace(actual), owned.expected) {
+				return fmt.Errorf("batch ref %s changed unexpectedly", owned.batch)
+			}
+			continue
+		}
+		if refErr == nil && strings.EqualFold(strings.TrimSpace(actual), owned.expected) {
+			if _, err := gitAt(context.Background(), owned.checkoutRoot, "update-ref", "-d", batchRef(owned.batch)); err != nil {
+				return fmt.Errorf("remove orphan batch ref: %w", err)
+			}
 		}
 		if _, err := controller.db.Exec("DELETE FROM batch_refs WHERE batch = ?", owned.batch); err != nil {
 			return err
@@ -1097,6 +1173,11 @@ func (controller *Controller) removeJobWorktree(id int64, _ string) error {
 }
 
 func (controller *Controller) claim(maxWorkers int) (Job, bool, error) {
+	releaseStage, err := controller.acquireStageLock(context.Background())
+	if err != nil {
+		return Job{}, false, fmt.Errorf("lock checkout for claim: %w", err)
+	}
+	defer releaseStage()
 	if maxWorkers < 1 {
 		return Job{}, false, fmt.Errorf("max-workers must be positive")
 	}
@@ -1194,7 +1275,7 @@ func (controller *Controller) pinClaimedJob(transaction *sql.Tx, job *Job) error
 		}
 	}
 	job.Ref = strings.ToLower(job.Ref)
-	if _, err := transaction.Exec("INSERT OR REPLACE INTO batch_refs(batch, checkout_root) VALUES (?, ?)", job.Batch, job.checkoutRoot); err != nil {
+	if _, err := transaction.Exec("INSERT OR REPLACE INTO batch_refs(batch, checkout_root, ref) VALUES (?, ?, ?)", job.Batch, job.checkoutRoot, job.Ref); err != nil {
 		return err
 	}
 	if _, err := gitAt(context.Background(), job.checkoutRoot, "update-ref", batchRef(job.Batch), job.Ref); err != nil {
@@ -1392,12 +1473,19 @@ func unsafeEvaluatorCommand(argv []string) bool {
 			continue
 		}
 		for _, argument := range argv[index+1:] {
-			if argument == "-c" || argument == "-e" || argument == "--command" || argument == "--eval" {
+			if interpreterEvaluatorOption(argument) {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+func interpreterEvaluatorOption(argument string) bool {
+	return argument == "-c" || argument == "-e" || argument == "--command" || argument == "--eval" ||
+		(strings.HasPrefix(argument, "-c") && len(argument) > 2) ||
+		(strings.HasPrefix(argument, "-e") && len(argument) > 2) ||
+		strings.HasPrefix(argument, "--command=") || strings.HasPrefix(argument, "--eval=")
 }
 
 func unsafeCommandEnvironment(argv []string, checkoutRoot string) bool {
@@ -1441,6 +1529,13 @@ func unsafePathOperand(value, checkoutRoot, worktreeRoot, workDir string) bool {
 		}
 		value = optionValue
 	}
+	if name, optionValue, ok := strings.Cut(value, "="); ok {
+		name = strings.ToLower(strings.TrimLeft(name, "-"))
+		switch name {
+		case "if", "of", "input", "output", "file", "filename", "path", "target", "target-directory", "directory", "dir", "dest", "destination", "prefix":
+			value = optionValue
+		}
+	}
 	path := value
 	relative := !filepath.IsAbs(path)
 	if relative {
@@ -1471,7 +1566,7 @@ func interpreterScriptOperand(argv []string) (string, bool) {
 		start = 2
 	}
 	for _, value := range argv[start:] {
-		if value == "-c" || value == "-e" || value == "--command" || value == "--eval" {
+		if interpreterEvaluatorOption(value) {
 			return "", false
 		}
 		if value == "--" {

@@ -2916,6 +2916,8 @@ func TestUnsafeEvaluatorCommandRejectsUnknownWrapper(t *testing.T) {
 func TestUnsafeEvaluatorCommandRecognizesInterpreterVariants(t *testing.T) {
 	for _, argv := range [][]string{
 		{"python3.12", "-c", "print(1)"},
+		{"sh", "-c'echo unsafe'"},
+		{"python", "--eval=print(1)"},
 		{"busybox", "ash", "-c", "echo unsafe"},
 	} {
 		if !unsafeEvaluatorCommand(argv) {
@@ -2940,6 +2942,12 @@ func TestUnsafePathOperandRejectsAttachedOptionPath(t *testing.T) {
 	}
 	if !unsafePathOperand("-toutside", t.TempDir(), worktree, worktree) {
 		t.Fatal("accepted attached option symlink")
+	}
+	if err := os.Symlink(t.TempDir(), filepath.Join(worktree, "destination")); err != nil {
+		t.Fatal(err)
+	}
+	if !unsafePathOperand("of=destination", t.TempDir(), worktree, worktree) {
+		t.Fatal("accepted path-valued option symlink")
 	}
 }
 
