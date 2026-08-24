@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -96,6 +97,28 @@ func (listener *socketListener) Close() error {
 }
 
 func (controller *Controller) ServeRPC(ctx context.Context, listener net.Listener) error {
+	var handlers sync.WaitGroup
+	connections := map[net.Conn]struct{}{}
+	var connectionsMu sync.Mutex
+	stopCloser := make(chan struct{})
+	closerDone := make(chan struct{})
+	defer func() {
+		close(stopCloser)
+		<-closerDone
+	}()
+	go func() {
+		defer close(closerDone)
+		select {
+		case <-ctx.Done():
+			connectionsMu.Lock()
+			for connection := range connections {
+				_ = connection.Close()
+			}
+			connectionsMu.Unlock()
+		case <-stopCloser:
+		}
+	}()
+	defer handlers.Wait()
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
@@ -104,18 +127,28 @@ func (controller *Controller) ServeRPC(ctx context.Context, listener net.Listene
 			}
 			return err
 		}
-		_ = connection.SetDeadline(time.Now().Add(10 * time.Second))
-		decoder := json.NewDecoder(connection)
-		encoder := json.NewEncoder(connection)
-		var request RPCRequest
-		if err := decoder.Decode(&request); err != nil {
-			_ = encoder.Encode(RPCResponse{Error: err.Error()})
-			connection.Close()
-			continue
-		}
-		response := controller.handleRPC(ctx, request)
-		_ = encoder.Encode(response)
-		connection.Close()
+		connectionsMu.Lock()
+		connections[connection] = struct{}{}
+		connectionsMu.Unlock()
+		handlers.Add(1)
+		go func(connection net.Conn) {
+			defer handlers.Done()
+			defer func() {
+				_ = connection.Close()
+				connectionsMu.Lock()
+				delete(connections, connection)
+				connectionsMu.Unlock()
+			}()
+			_ = connection.SetDeadline(time.Now().Add(10 * time.Second))
+			decoder := json.NewDecoder(connection)
+			encoder := json.NewEncoder(connection)
+			var request RPCRequest
+			if err := decoder.Decode(&request); err != nil {
+				_ = encoder.Encode(RPCResponse{Error: err.Error()})
+				return
+			}
+			_ = encoder.Encode(controller.handleRPC(ctx, request))
+		}(connection)
 	}
 }
 

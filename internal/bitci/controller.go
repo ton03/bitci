@@ -34,6 +34,9 @@ type Controller struct {
 	githubAPI      string
 	githubRepo     string
 	worktreeMu     sync.Mutex
+	ownerMu        sync.Mutex
+	ownerRelease   func()
+	ownerCount     int
 }
 
 type Job struct {
@@ -276,7 +279,8 @@ func recordedDirectoryExists(checkoutRoot, ref, relative string) error {
 	if relative == "." || relative == "" {
 		return nil
 	}
-	if _, err := gitAt(context.Background(), checkoutRoot, "cat-file", "-e", ref+":"+filepath.ToSlash(relative)); err != nil {
+	objectType, err := gitAt(context.Background(), checkoutRoot, "cat-file", "-t", ref+":"+filepath.ToSlash(relative))
+	if err != nil || strings.TrimSpace(objectType) != "tree" {
 		return fmt.Errorf("config directory does not exist at recorded checkout SHA")
 	}
 	return nil
@@ -307,7 +311,7 @@ func (controller *Controller) submit(config Config, taskNames []string, ref, che
 	for _, taskName := range ordered {
 		result, err := transaction.Exec(
 			"INSERT INTO jobs(batch, task, ref, config_json, checkout_root, config_relative, state, created_at) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)",
-			batch, taskName, ref, configJSON, checkoutRoot, configRelative, time.Now().UTC().Format(time.RFC3339),
+			batch, taskName, ref, configJSON, checkoutRoot, configRelative, timestamp(),
 		)
 		if err != nil {
 			return nil, err
@@ -318,24 +322,35 @@ func (controller *Controller) submit(config Config, taskNames []string, ref, che
 		}
 		jobs = append(jobs, Job{ID: id, Batch: batch, Task: taskName, Ref: ref, State: "queued", checkoutRoot: checkoutRoot, configRelative: configRelative})
 	}
-	if err := transaction.Commit(); err != nil {
-		return nil, err
-	}
+	refCreated := false
 	if checkoutRoot != "" && isCheckoutSHA(ref) {
-		// Keep queued and running batches reachable without creating refs that
-		// lack committed job records.
-		if _, err := gitAt(context.Background(), checkoutRoot, "update-ref", "refs/bitci/jobs/"+batch, ref); err != nil {
-			_, _ = controller.db.Exec("DELETE FROM jobs WHERE batch = ? AND state = 'queued'", batch)
+		if _, err := gitAt(context.Background(), checkoutRoot, "update-ref", batchRef(batch), ref); err != nil {
 			return nil, fmt.Errorf("pin recorded checkout SHA: %w", err)
 		}
-		if err := controller.releaseBatchRef(batch, checkoutRoot); err != nil {
-			return nil, err
+		refCreated = true
+	}
+	if err := transaction.Commit(); err != nil {
+		if refCreated {
+			_, _ = gitAt(context.Background(), checkoutRoot, "update-ref", "-d", batchRef(batch))
 		}
+		return nil, err
 	}
 	return jobs, nil
 }
 
 func (controller *Controller) RunOnce(ctx context.Context, maxWorkers int) (bool, error) {
+	release, err := controller.acquireOwner()
+	if err != nil {
+		return false, err
+	}
+	defer release()
+	if err := controller.cleanupOrphanBatchRefs(); err != nil {
+		return false, err
+	}
+	return controller.runOnce(ctx, maxWorkers)
+}
+
+func (controller *Controller) runOnce(ctx context.Context, maxWorkers int) (bool, error) {
 	if ctx.Err() != nil {
 		return false, nil
 	}
@@ -556,12 +571,11 @@ func (controller *Controller) jobCheckout(ctx context.Context, job Job) (string,
 	if _, err := gitAt(ctx, path, initArgs...); err != nil {
 		return "", cleanup, fmt.Errorf("initialize job worktree: %w", err)
 	}
-	objects, err := gitAt(ctx, checkoutRoot, "rev-parse", "--path-format=absolute", "--git-path", "objects")
+	objects, err := alternateObjectDirectories(checkoutRoot)
 	if err != nil {
-		return "", cleanup, fmt.Errorf("find source object directory: %w", err)
+		return "", cleanup, err
 	}
-	objects = strings.TrimSpace(objects)
-	if err := os.WriteFile(filepath.Join(path, ".git", "objects", "info", "alternates"), []byte(objects+"\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(path, ".git", "objects", "info", "alternates"), []byte(strings.Join(objects, "\n")+"\n"), 0o600); err != nil {
 		return "", cleanup, fmt.Errorf("link source objects: %w", err)
 	}
 	if _, err := gitAt(ctx, path, "checkout", "--quiet", "--detach", job.Ref); err != nil {
@@ -575,6 +589,48 @@ func (controller *Controller) jobCheckout(ctx context.Context, job Job) (string,
 		return "", cleanup, err
 	}
 	return filepath.Join(path, configRelative), cleanup, nil
+}
+
+func alternateObjectDirectories(checkoutRoot string) ([]string, error) {
+	primary, err := gitAt(context.Background(), checkoutRoot, "rev-parse", "--path-format=absolute", "--git-path", "objects")
+	if err != nil {
+		return nil, fmt.Errorf("find source object directory: %w", err)
+	}
+	var directories []string
+	seen := map[string]bool{}
+	var visit func(string) error
+	visit = func(directory string) error {
+		directory = filepath.Clean(directory)
+		if seen[directory] {
+			return nil
+		}
+		seen[directory] = true
+		directories = append(directories, directory)
+		data, err := os.ReadFile(filepath.Join(directory, "info", "alternates"))
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("read Git alternate object directories: %w", err)
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			alternate := strings.TrimSpace(line)
+			if alternate == "" {
+				continue
+			}
+			if !filepath.IsAbs(alternate) {
+				alternate = filepath.Join(directory, alternate)
+			}
+			if err := visit(alternate); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := visit(strings.TrimSpace(primary)); err != nil {
+		return nil, err
+	}
+	return directories, nil
 }
 
 func jobCheckoutOwner(job Job) []byte {
@@ -639,11 +695,15 @@ func isCheckoutSHA(value string) bool {
 	return true
 }
 
+func timestamp() string {
+	return time.Now().UTC().Format(time.RFC3339Nano)
+}
+
 func (controller *Controller) Serve(ctx context.Context, maxWorkers int, interval time.Duration, socketPath string) error {
 	if maxWorkers < 1 {
 		return fmt.Errorf("max-workers must be positive")
 	}
-	release, err := controller.lockOwner()
+	release, err := controller.acquireOwner()
 	if err != nil {
 		return err
 	}
@@ -715,9 +775,36 @@ func (controller *Controller) lockOwner() (func(), error) {
 	}, nil
 }
 
+func (controller *Controller) acquireOwner() (func(), error) {
+	controller.ownerMu.Lock()
+	defer controller.ownerMu.Unlock()
+	if controller.ownerCount > 0 {
+		controller.ownerCount++
+		return controller.releaseOwner, nil
+	}
+	release, err := controller.lockOwner()
+	if err != nil {
+		return nil, err
+	}
+	controller.ownerRelease = release
+	controller.ownerCount = 1
+	return controller.releaseOwner, nil
+}
+
+func (controller *Controller) releaseOwner() {
+	controller.ownerMu.Lock()
+	defer controller.ownerMu.Unlock()
+	controller.ownerCount--
+	if controller.ownerCount == 0 {
+		release := controller.ownerRelease
+		controller.ownerRelease = nil
+		release()
+	}
+}
+
 func (controller *Controller) serveWorker(ctx context.Context, maxWorkers int, interval time.Duration, errors chan<- error) {
 	for {
-		ran, err := controller.RunOnce(ctx, maxWorkers)
+		ran, err := controller.runOnce(ctx, maxWorkers)
 		if err != nil {
 			errors <- err
 			return
@@ -734,6 +821,9 @@ func (controller *Controller) serveWorker(ctx context.Context, maxWorkers int, i
 }
 
 func (controller *Controller) RecoverInterrupted() error {
+	if err := controller.cleanupOrphanBatchRefs(); err != nil {
+		return err
+	}
 	transaction, err := controller.db.Begin()
 	if err != nil {
 		return err
@@ -762,7 +852,7 @@ func (controller *Controller) RecoverInterrupted() error {
 	if err := rows.Close(); err != nil {
 		return err
 	}
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := timestamp()
 	if _, err := transaction.Exec("UPDATE jobs SET state = 'cancelled', finished_at = ? WHERE state = 'queued' AND batch IN (SELECT DISTINCT batch FROM jobs WHERE state = 'running')", now); err != nil {
 		return err
 	}
@@ -803,23 +893,86 @@ func (controller *Controller) RecoverInterrupted() error {
 	return errors.Join(failures...)
 }
 
+func batchRef(batch string) string {
+	return "refs/bitci/jobs/" + batch
+}
+
+func (controller *Controller) cleanupOrphanBatchRefs() error {
+	rows, err := controller.db.Query("SELECT DISTINCT checkout_root FROM jobs WHERE checkout_root IS NOT NULL AND checkout_root != '' AND (state IN ('queued', 'running') OR cleanup_pending = 1)")
+	if err != nil {
+		return err
+	}
+	var roots []string
+	for rows.Next() {
+		var root string
+		if err := rows.Scan(&root); err != nil {
+			rows.Close()
+			return err
+		}
+		roots = append(roots, root)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if len(roots) == 0 {
+		root := controller.checkoutRoot
+		if root == "" {
+			root, _, err = controller.checkoutLocation()
+			if err != nil {
+				return nil
+			}
+		}
+		roots = append(roots, root)
+	}
+	for _, checkoutRoot := range roots {
+		command := exec.CommandContext(context.Background(), "git", "-C", checkoutRoot, "for-each-ref", "--format=%(refname)", "refs/bitci/jobs/")
+		outputBytes, err := command.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("list batch refs: %s: %w", strings.TrimSpace(string(outputBytes)), err)
+		}
+		for _, ref := range strings.Fields(string(outputBytes)) {
+			batch := strings.TrimPrefix(ref, "refs/bitci/jobs/")
+			if batch == ref || batch == "" {
+				continue
+			}
+			var count int
+			if err := controller.db.QueryRow("SELECT COUNT(*) FROM jobs WHERE batch = ?", batch).Scan(&count); err != nil {
+				return err
+			}
+			if count == 0 {
+				if _, err := gitAt(context.Background(), checkoutRoot, "update-ref", "-d", ref); err != nil {
+					return fmt.Errorf("remove orphan batch ref: %w", err)
+				}
+			}
+		}
+	}
+	return nil
+}
+
 func (controller *Controller) releaseBatchRef(batch, checkoutRoot string) error {
 	var protected int
 	if err := controller.db.QueryRow("SELECT COUNT(*) FROM jobs WHERE batch = ? AND (state IN ('queued', 'running') OR cleanup_pending = 1)", batch).Scan(&protected); err != nil || protected != 0 {
 		return err
 	}
-	if checkoutRoot == "" {
-		var err error
-		checkoutRoot, _, err = controller.checkoutLocation()
-		if err != nil {
-			return nil
-		}
-	}
 	var expected string
 	if err := controller.db.QueryRow("SELECT ref FROM jobs WHERE batch = ? LIMIT 1", batch).Scan(&expected); err != nil {
 		return err
 	}
-	ref := "refs/bitci/jobs/" + batch
+	if !isCheckoutSHA(expected) {
+		return nil
+	}
+	if checkoutRoot == "" {
+		var err error
+		checkoutRoot, _, err = controller.checkoutLocation()
+		if err != nil {
+			return fmt.Errorf("find checkout for batch ref: %w", err)
+		}
+	}
+	ref := batchRef(batch)
 	actual, err := gitAt(context.Background(), checkoutRoot, "rev-parse", "--verify", ref+"^{commit}")
 	if err != nil || !strings.EqualFold(strings.TrimSpace(actual), expected) {
 		return nil
@@ -912,7 +1065,7 @@ func (controller *Controller) claim(maxWorkers int) (Job, bool, error) {
 		}
 		config, task, err := controller.jobConfig(job)
 		if err != nil {
-			if _, updateErr := transaction.Exec("UPDATE jobs SET state = 'failed', finished_at = ?, exit_code = 127 WHERE id = ?", time.Now().UTC().Format(time.RFC3339), job.ID); updateErr != nil {
+			if _, updateErr := transaction.Exec("UPDATE jobs SET state = 'failed', finished_at = ?, exit_code = 127 WHERE id = ?", timestamp(), job.ID); updateErr != nil {
 				return Job{}, false, updateErr
 			}
 			changed = true
@@ -926,7 +1079,7 @@ func (controller *Controller) claim(maxWorkers int) (Job, bool, error) {
 			return Job{}, false, err
 		}
 		if blocked {
-			if _, err := transaction.Exec("UPDATE jobs SET state = 'cancelled', finished_at = ? WHERE id = ?", time.Now().UTC().Format(time.RFC3339), job.ID); err != nil {
+			if _, err := transaction.Exec("UPDATE jobs SET state = 'cancelled', finished_at = ? WHERE id = ?", timestamp(), job.ID); err != nil {
 				return Job{}, false, err
 			}
 			changed = true
@@ -946,7 +1099,7 @@ func (controller *Controller) claim(maxWorkers int) (Job, bool, error) {
 				return Job{}, false, err
 			}
 		}
-		if _, err := transaction.Exec("UPDATE jobs SET state = 'running', started_at = ? WHERE id = ?", time.Now().UTC().Format(time.RFC3339), job.ID); err != nil {
+		if _, err := transaction.Exec("UPDATE jobs SET state = 'running', started_at = ? WHERE id = ?", timestamp(), job.ID); err != nil {
 			return Job{}, false, err
 		}
 		for _, resource := range task.Resources {
@@ -981,7 +1134,7 @@ func (controller *Controller) pinClaimedJob(transaction *sql.Tx, job *Job) error
 		}
 	}
 	job.Ref = strings.ToLower(job.Ref)
-	if _, err := gitAt(context.Background(), job.checkoutRoot, "update-ref", "refs/bitci/jobs/"+job.Batch, job.Ref); err != nil {
+	if _, err := gitAt(context.Background(), job.checkoutRoot, "update-ref", batchRef(job.Batch), job.Ref); err != nil {
 		return fmt.Errorf("pin recorded checkout SHA: %w", err)
 	}
 	return nil
@@ -1250,7 +1403,11 @@ func interpreterScriptOperand(argv []string) (string, bool) {
 	if !interpreterCommand(argv) {
 		return "", false
 	}
-	for _, value := range argv[1:] {
+	start := 1
+	if strings.EqualFold(filepath.Base(argv[0]), "busybox") {
+		start = 2
+	}
+	for _, value := range argv[start:] {
 		if value == "-c" || value == "-e" || value == "--command" || value == "--eval" {
 			return "", false
 		}
@@ -1265,16 +1422,30 @@ func interpreterScriptOperand(argv []string) (string, bool) {
 	return "", false
 }
 
+func isInterpreter(command string) bool {
+	base := strings.ToLower(filepath.Base(command))
+	for _, interpreter := range []string{"ash", "bash", "dash", "fish", "ksh", "node", "nodejs", "perl", "php", "python", "ruby", "sh", "zsh"} {
+		if base == interpreter {
+			return true
+		}
+		if strings.HasPrefix(base, interpreter) {
+			suffix := strings.TrimPrefix(base, interpreter)
+			if suffix != "" && strings.Trim(suffix, ".0123456789") == "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func interpreterCommand(argv []string) bool {
 	if len(argv) < 2 {
 		return false
 	}
-	return isInterpreter(argv[0])
-}
-
-func isInterpreter(command string) bool {
-	interpreters := map[string]bool{"bash": true, "dash": true, "fish": true, "ksh": true, "node": true, "perl": true, "php": true, "python": true, "python3": true, "ruby": true, "sh": true, "zsh": true}
-	return interpreters[strings.ToLower(filepath.Base(command))]
+	if isInterpreter(argv[0]) {
+		return true
+	}
+	return strings.EqualFold(filepath.Base(argv[0]), "busybox") && len(argv) > 1 && isInterpreter(argv[1])
 }
 
 func unsafeTaskEnvironment(environment []string, overrides map[string]string, checkoutRoot, worktreeRoot, workDir string) bool {
@@ -1370,7 +1541,7 @@ func unsafeGitEnvironment(name, value string) bool {
 
 func gitExecutionEnvironment(name string) bool {
 	switch name {
-	case "GIT_ASKPASS", "GIT_CONFIG_COUNT", "GIT_EDITOR", "GIT_EXTERNAL_DIFF", "GIT_PAGER", "GIT_PROXY_COMMAND", "GIT_SEQUENCE_EDITOR", "GIT_SSH", "GIT_SSH_COMMAND":
+	case "GIT_ASKPASS", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS", "GIT_EDITOR", "GIT_EXTERNAL_DIFF", "GIT_PAGER", "GIT_PROXY_COMMAND", "GIT_SEQUENCE_EDITOR", "GIT_SSH", "GIT_SSH_COMMAND":
 		return true
 	default:
 		return strings.HasPrefix(name, "GIT_CONFIG_KEY_") || strings.HasPrefix(name, "GIT_CONFIG_VALUE_")
@@ -1596,7 +1767,7 @@ func (controller *Controller) finish(job Job, code int, cleanupPending bool) err
 	}
 	_, err := controller.db.Exec(
 		"UPDATE jobs SET state = ?, finished_at = ?, exit_code = ?, log_path = ?, cleanup_pending = ? WHERE id = ?",
-		state, time.Now().UTC().Format(time.RFC3339), code, job.LogPath, cleanupPending, job.ID,
+		state, timestamp(), code, job.LogPath, cleanupPending, job.ID,
 	)
 	if err != nil {
 		return err
@@ -1634,7 +1805,7 @@ func (controller *Controller) Cancel(id int64) (bool, error) {
 	}
 	result, err := controller.db.Exec(
 		"UPDATE jobs SET state = 'cancelled', finished_at = ? WHERE id = ? AND state = 'queued'",
-		time.Now().UTC().Format(time.RFC3339), id,
+		timestamp(), id,
 	)
 	if err != nil {
 		return false, err

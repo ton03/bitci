@@ -896,6 +896,45 @@ func TestOwnerSocketRPCAndStaleRecovery(t *testing.T) {
 	}
 }
 
+func TestServeRPCDoesNotBlockOnIdleClient(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	socketPath := fmt.Sprintf("/tmp/bitci-%d.sock", time.Now().UnixNano())
+	defer os.Remove(socketPath)
+	listener, err := controller.Listen(socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- controller.ServeRPC(ctx, listener) }()
+	idle, err := net.Dial("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idle.Close()
+	var jobs []Job
+	if err := Call(socketPath, "status", struct{}{}, &jobs); err != nil {
+		t.Fatalf("status behind idle client: %v", err)
+	}
+	cancel()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("RPC server did not stop after cancelling idle client")
+	}
+}
+
 func TestDuplicateServeDoesNotRecoverRunningJobs(t *testing.T) {
 	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
 	stateDir := filepath.Join(t.TempDir(), "state")
@@ -1665,6 +1704,21 @@ func TestJobRunsInRecordedSHA256Checkout(t *testing.T) {
 	}
 	if got[0].State != "passed" || got[0].TestedSHA != sha {
 		t.Fatalf("SHA-256 checkout job = %#v", got[0])
+	}
+}
+
+func TestRecordedDirectoryExistsRejectsBlob(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	sha := git(t, checkout, "rev-parse", "HEAD")
+	if err := recordedDirectoryExists(checkout, sha, "bitci.json"); err == nil {
+		t.Fatal("accepted blob as recorded config directory")
 	}
 }
 
@@ -2862,6 +2916,23 @@ func TestUnsafeEvaluatorCommandRejectsUnknownWrapper(t *testing.T) {
 	}
 }
 
+func TestUnsafeEvaluatorCommandRecognizesInterpreterVariants(t *testing.T) {
+	for _, argv := range [][]string{
+		{"python3.12", "-c", "print(1)"},
+		{"busybox", "ash", "-c", "echo unsafe"},
+	} {
+		if !unsafeEvaluatorCommand(argv) {
+			t.Fatalf("accepted evaluator variant: %#v", argv)
+		}
+	}
+}
+
+func TestUnsafeTaskEnvironmentRejectsGitConfigParameters(t *testing.T) {
+	if !unsafeTaskEnvironment([]string{"GIT_CONFIG_PARAMETERS=diff.external=tool"}, nil, t.TempDir(), t.TempDir(), t.TempDir()) {
+		t.Fatal("accepted Git configuration parameter override")
+	}
+}
+
 func TestUnsafePathOperandRejectsAttachedOptionPath(t *testing.T) {
 	worktree := t.TempDir()
 	if !unsafePathOperand("-t../outside", t.TempDir(), worktree, worktree) {
@@ -3082,6 +3153,33 @@ func TestNestedConfigChecksWholeCheckout(t *testing.T) {
 	}
 	if err := controller.cleanCheckout(context.Background()); err == nil {
 		t.Fatal("nested config missed root-level checkout dirt")
+	}
+}
+
+func TestCheckoutStatePathRejectsExternalSymlinkAlias(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	stateTarget := filepath.Join(checkout, ".bitci")
+	if err := os.MkdirAll(stateTarget, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stateAlias := filepath.Join(t.TempDir(), "state")
+	if err := os.Symlink(stateTarget, stateAlias); err != nil {
+		t.Fatal(err)
+	}
+	controller, err := Open(configPath, stateAlias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, _, err := controller.checkoutStatePath(); err == nil {
+		t.Fatal("accepted external state symlink into checkout")
 	}
 }
 

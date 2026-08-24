@@ -233,6 +233,16 @@ func (controller *Controller) checkoutStatePath() (string, bool, error) {
 	}
 	checkout = filepath.Clean(checkout)
 	state := filepath.Clean(controller.stateDir)
+	resolvedState := resolvedPathForComparison(state)
+	if relative, ok := relativeWithin(checkout, resolvedState); ok && relative != "." {
+		usesSymlink, err := pathUsesSymlinkInto(checkout, state)
+		if err != nil {
+			return "", false, err
+		}
+		if usesSymlink {
+			return "", false, fmt.Errorf("state directory must not use a symlink inside the checkout")
+		}
+	}
 	if lexicalRoot := controller.lexicalCheckoutRoot(checkout); lexicalRoot != "" {
 		if lexicalRelative, err := filepath.Rel(lexicalRoot, state); err == nil && lexicalRelative != "." && lexicalRelative != ".." && !strings.HasPrefix(lexicalRelative, ".."+string(filepath.Separator)) {
 			usesSymlink, err := pathUsesSymlink(lexicalRoot, lexicalRelative)
@@ -253,7 +263,6 @@ func (controller *Controller) checkoutStatePath() (string, bool, error) {
 			return "", false, fmt.Errorf("state directory must not use a symlink inside the checkout")
 		}
 	}
-	resolvedState := resolvedPathForComparison(state)
 	relative, ok := relativeWithin(checkout, resolvedState)
 	if !ok || relative == "." {
 		return "", false, nil
@@ -363,6 +372,39 @@ func pathUsesSymlink(root, relative string) (bool, error) {
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
 			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func pathUsesSymlinkInto(root, path string) (bool, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return false, err
+	}
+	volumeRoot := filepath.VolumeName(absolute) + string(filepath.Separator)
+	current := volumeRoot
+	parts := strings.Split(strings.TrimPrefix(absolute, volumeRoot), string(filepath.Separator))
+	for _, part := range parts {
+		if part == "" || part == "." {
+			continue
+		}
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			resolved, err := filepath.EvalSymlinks(current)
+			if err != nil {
+				return false, err
+			}
+			if _, ok := relativeWithin(root, resolvedPathForComparison(resolved)); ok {
+				return true, nil
+			}
 		}
 	}
 	return false, nil
