@@ -110,6 +110,9 @@ func (controller *Controller) noActiveJobs() error {
 func (controller *Controller) cleanGeneratedNext(ctx context.Context) error {
 	nextRelative := filepath.Join(controller.configRelative, ".next")
 	nextPath := filepath.Join(controller.gitDirectory(), nextRelative)
+	if pathsOverlap(nextPath, controller.stateDir) {
+		return fmt.Errorf("state directory must not overlap generated output .next")
+	}
 	info, err := os.Lstat(nextPath)
 	if os.IsNotExist(err) {
 		return nil
@@ -124,6 +127,18 @@ func (controller *Controller) cleanGeneratedNext(ctx context.Context) error {
 		return fmt.Errorf("clean ignored .next: %w", err)
 	}
 	return nil
+}
+
+func pathsOverlap(first, second string) bool {
+	first = filepath.Clean(first)
+	second = filepath.Clean(second)
+	if resolved, err := filepath.EvalSymlinks(first); err == nil {
+		first = resolved
+	}
+	if resolved, err := filepath.EvalSymlinks(second); err == nil {
+		second = resolved
+	}
+	return pathWithin(first, second) || pathWithin(second, first)
 }
 
 func (controller *Controller) cleanCheckout(ctx context.Context) error {

@@ -254,6 +254,7 @@ func (controller *Controller) RunOnce(ctx context.Context, maxWorkers int) (bool
 		return true, controller.finish(job, 127, false)
 	}
 	workDir := filepath.Dir(controller.configPath)
+	worktreeRoot := ""
 	cleanup := func() error { return nil }
 	if isCheckoutSHA(job.Ref) {
 		var err error
@@ -268,12 +269,13 @@ func (controller *Controller) RunOnce(ctx context.Context, maxWorkers int) (bool
 			logFile.Close()
 			return true, controller.finish(job, 126, cleanupPending)
 		}
+		worktreeRoot = filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", job.ID))
 	}
 	code := 0
-	if isCheckoutSHA(job.Ref) && len(config.Prepare) > 0 && controller.isCheckoutExecutable(config.Prepare[0], job.checkoutRoot) {
+	if isCheckoutSHA(job.Ref) && len(config.Prepare) > 0 && controller.isCheckoutExecutable(config.Prepare[0], job.checkoutRoot, worktreeRoot, workDir) {
 		fmt.Fprintln(logFile, "BitCI refuses a checkout-local absolute prepare executable for a recorded SHA job")
 		code = 126
-	} else if isCheckoutSHA(job.Ref) && controller.isCheckoutExecutable(task.Run[0], job.checkoutRoot) {
+	} else if isCheckoutSHA(job.Ref) && controller.isCheckoutExecutable(task.Run[0], job.checkoutRoot, worktreeRoot, workDir) {
 		fmt.Fprintln(logFile, "BitCI refuses a checkout-local absolute task executable for a recorded SHA job")
 		code = 126
 	} else {
@@ -670,31 +672,57 @@ func (controller *Controller) snapshotConfig(snapshot string) (Config, error) {
 	return config, nil
 }
 
-func (controller *Controller) isCheckoutExecutable(command, checkoutRoot string) bool {
-	if !filepath.IsAbs(command) {
-		if strings.ContainsRune(command, filepath.Separator) {
-			return false
+func (controller *Controller) isCheckoutExecutable(command, checkoutRoot, worktreeRoot, workDir string) bool {
+	path := command
+	if !filepath.IsAbs(path) {
+		if strings.ContainsRune(path, filepath.Separator) {
+			path = filepath.Clean(filepath.Join(workDir, path))
+			if worktreeRoot != "" && !pathWithin(worktreeRoot, path) {
+				return true
+			}
+		} else {
+			resolved, err := exec.LookPath(command)
+			if err != nil {
+				return false
+			}
+			path = resolved
+			if !filepath.IsAbs(path) {
+				path, err = filepath.Abs(path)
+				if err != nil {
+					return false
+				}
+			}
 		}
-		resolved, err := exec.LookPath(command)
-		if err != nil {
-			return false
-		}
-		command = resolved
 	}
 	if checkoutRoot == "" {
 		checkoutRoot = controller.gitDirectory()
 	}
-	root, err := filepath.EvalSymlinks(filepath.Clean(checkoutRoot))
+	root := filepath.Clean(checkoutRoot)
+	path = filepath.Clean(path)
+	if pathWithin(root, path) {
+		return true
+	}
+	root, err := filepath.EvalSymlinks(root)
 	if err != nil {
 		return false
 	}
-	path := filepath.Clean(command)
-	parent, err := filepath.EvalSymlinks(filepath.Dir(path))
-	if err == nil && pathWithin(root, filepath.Join(parent, filepath.Base(path))) {
+	if pathOrAncestorWithin(root, path) {
 		return true
 	}
 	resolvedPath, err := filepath.EvalSymlinks(path)
 	return err == nil && pathWithin(root, resolvedPath)
+}
+
+func pathOrAncestorWithin(root, path string) bool {
+	for current := path; ; current = filepath.Dir(current) {
+		if resolved, err := filepath.EvalSymlinks(current); err == nil && pathWithin(root, resolved) {
+			return true
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return false
+		}
+	}
 }
 
 func pathWithin(root, path string) bool {
