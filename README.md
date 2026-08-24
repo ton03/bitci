@@ -18,6 +18,11 @@ go install github.com/ton03/bitci/cmd/bitci@v0.0.1-alpha.1
 bitci version
 ```
 
+## Dogfood
+
+This repository uses [bitci.json](bitci.json) to run `test`, `build`, `race`,
+and `vet` tasks from the same local controller BitCI ships.
+
 ## Set up a project
 
 Add `bitci.json` at the repository root:
