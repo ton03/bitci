@@ -129,7 +129,7 @@ func DefaultStateDir(configPath, stateDir string) string {
 
 func stateInsideGitMetadata(path string) bool {
 	for current := filepath.Clean(path); ; current = filepath.Dir(current) {
-		if filepath.Base(current) == ".git" {
+		if strings.EqualFold(filepath.Base(current), ".git") {
 			return true
 		}
 		parent := filepath.Dir(current)
@@ -241,6 +241,9 @@ func (controller *Controller) submit(config Config, taskNames []string, ref, che
 	ordered, err := config.Ordered(taskNames)
 	if err != nil {
 		return nil, err
+	}
+	if len(ordered) == 0 {
+		return nil, fmt.Errorf("submit requires at least one task")
 	}
 	batch, err := newBatch()
 	if err != nil {
@@ -356,6 +359,12 @@ func (controller *Controller) RunOnce(ctx context.Context, maxWorkers int) (bool
 		}
 		if code == 0 {
 			code = controller.execute(ctx, task, logFile, workDir)
+		}
+		if code == 0 && isCheckoutSHA(job.Ref) {
+			if err := controller.verifyJobWorktree(worktreeRoot, job.checkoutRoot, job.Ref); err != nil {
+				fmt.Fprintln(logFile, "BitCI worktree changed after task:", err)
+				code = 126
+			}
 		}
 	}
 	cleanupPending := false
@@ -639,6 +648,9 @@ func (controller *Controller) RecoverInterrupted() error {
 			failures = append(failures, err)
 		}
 	}
+	if err := controller.pruneLogs(); err != nil {
+		failures = append(failures, err)
+	}
 	return errors.Join(failures...)
 }
 
@@ -656,7 +668,7 @@ func (controller *Controller) removeJobWorktree(id int64, checkoutRoot string) e
 		checkoutMissing = true
 	} else if err != nil {
 		failures = append(failures, err)
-	} else if topLevel, err := gitAt(context.Background(), checkoutRoot, "rev-parse", "--show-toplevel"); err != nil || resolvedPathForComparison(strings.TrimSpace(topLevel)) != resolvedPathForComparison(checkoutRoot) {
+	} else if topLevel, err := gitAt(context.Background(), checkoutRoot, "rev-parse", "--show-toplevel"); err != nil || !samePath(strings.TrimSpace(topLevel), checkoutRoot) {
 		checkoutMissing = true
 	}
 	if _, err := os.Lstat(path); err == nil {
@@ -890,13 +902,13 @@ func (controller *Controller) hasUnsafeCheckoutCommand(argv []string, checkoutRo
 	if checkoutRoot == "" {
 		checkoutRoot = controller.gitDirectory()
 	}
-	if unsafeEvaluatorCommand(argv, checkoutRoot) || unsafeTaskEnvironment(overrides, checkoutRoot) {
-		return true
-	}
-	if script, ok := interpreterScriptOperand(argv); ok && controller.isCheckoutScript(script, checkoutRoot, worktreeRoot, workDir, taskEnvironment(overrides)) {
-		return true
-	}
 	environment := taskEnvironment(overrides)
+	if unsafeEvaluatorCommand(argv, checkoutRoot) || unsafeTaskEnvironment(environment, checkoutRoot, worktreeRoot, workDir) || unsafeGitCommand(argv) {
+		return true
+	}
+	if script, ok := interpreterScriptOperand(argv); ok && controller.isCheckoutScript(script, checkoutRoot, worktreeRoot, workDir, environment) {
+		return true
+	}
 	for _, value := range argv {
 		if containsCheckoutPath(value, checkoutRoot) || containsCheckoutPath(value, filepath.Dir(controller.configPath)) || controller.isCheckoutExecutable(value, checkoutRoot, worktreeRoot, workDir, environment) {
 			return true
@@ -967,10 +979,53 @@ func interpreterCommand(argv []string) bool {
 	return interpreters[strings.ToLower(filepath.Base(argv[0]))]
 }
 
-func unsafeTaskEnvironment(overrides map[string]string, checkoutRoot string) bool {
-	for name, value := range overrides {
+func unsafeTaskEnvironment(environment []string, checkoutRoot, worktreeRoot, workDir string) bool {
+	for _, item := range environment {
+		name, value, ok := strings.Cut(item, "=")
+		if !ok {
+			continue
+		}
 		upper := strings.ToUpper(name)
-		if strings.HasPrefix(upper, "LD_") || strings.HasPrefix(upper, "DYLD_") || unsafeGitEnvironment(upper, value) || containsCheckoutPath(value, checkoutRoot) {
+		if strings.HasPrefix(upper, "LD_") || strings.HasPrefix(upper, "DYLD_") || unsafeGitEnvironment(upper, value) || containsCheckoutPath(value, checkoutRoot) || upper == "PATH" && unsafeTaskPath(value, checkoutRoot, worktreeRoot, workDir) {
+			return true
+		}
+	}
+	return false
+}
+
+func unsafeTaskPath(value, checkoutRoot, worktreeRoot, workDir string) bool {
+	root := resolvedPathForComparison(checkoutRoot)
+	worktree := resolvedPathForComparison(worktreeRoot)
+	for _, entry := range filepath.SplitList(value) {
+		path := entry
+		if path == "" {
+			path = workDir
+		} else if !filepath.IsAbs(path) {
+			path = filepath.Join(workDir, path)
+		}
+		path = filepath.Clean(path)
+		resolved := resolvedPathForComparison(path)
+		insideWorktree := worktreeRoot != "" && pathWithin(worktreeRoot, path)
+		if pathWithin(checkoutRoot, path) && !insideWorktree {
+			return true
+		}
+		if worktreeRoot != "" && insideWorktree && !pathWithin(worktree, resolved) {
+			return true
+		}
+		if pathWithin(root, resolved) && (worktreeRoot == "" || !pathWithin(worktree, resolved)) {
+			return true
+		}
+	}
+	return false
+}
+
+func unsafeGitCommand(argv []string) bool {
+	if len(argv) < 2 || strings.ToLower(filepath.Base(argv[0])) != "git" {
+		return false
+	}
+	mutating := map[string]bool{"branch": true, "checkout": true, "commit": true, "config": true, "fetch": true, "gc": true, "merge": true, "notes": true, "pack-refs": true, "push": true, "rebase": true, "reset": true, "submodule": true, "tag": true, "update-ref": true, "worktree": true}
+	for _, value := range argv[1:] {
+		if mutating[value] {
 			return true
 		}
 	}
@@ -1171,9 +1226,6 @@ func (controller *Controller) executeCommandWithEnv(parent context.Context, argv
 }
 
 func taskEnvironment(overrides map[string]string) []string {
-	if len(overrides) == 0 {
-		return nil
-	}
 	values := map[string]string{}
 	for _, value := range os.Environ() {
 		name, value, ok := strings.Cut(value, "=")
@@ -1357,6 +1409,14 @@ func (controller *Controller) ReadLog(id, cursor int64, limit int) (LogCursorOut
 		}
 		if err != nil {
 			if err == bufio.ErrBufferFull {
+				if terminalJobState(state) {
+					discarded, discardErr := discardLogLine(reader)
+					readCursor += discarded
+					if discardErr != nil && discardErr != io.EOF {
+						return LogCursorOutput{}, discardErr
+					}
+					output.Cursor = readCursor
+				}
 				break
 			}
 			if err == io.EOF {
@@ -1389,6 +1449,17 @@ func readLogLine(reader *bufio.Reader, maxBytes int64) (string, int64, bool, err
 			continue
 		}
 		return string(line), consumed, err == nil, err
+	}
+}
+
+func discardLogLine(reader *bufio.Reader) (int64, error) {
+	var consumed int64
+	for {
+		fragment, err := reader.ReadSlice('\n')
+		consumed += int64(len(fragment))
+		if err != bufio.ErrBufferFull {
+			return consumed, err
+		}
 	}
 }
 

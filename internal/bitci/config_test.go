@@ -322,6 +322,20 @@ func TestOpenStateRejectsStateInsideGitMetadata(t *testing.T) {
 	}
 }
 
+func TestOpenStateRejectsCaseAliasOfGitMetadata(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "missing-bitci.json")
+	git(t, checkout, "init", "-q")
+	controller, err := OpenState(configPath, filepath.Join(checkout, ".GIT", "new-state"))
+	if err == nil {
+		controller.Close()
+		t.Fatal("opened state inside a case alias of Git metadata")
+	}
+	if !strings.Contains(err.Error(), "state directory must not overlap Git metadata") {
+		t.Fatalf("OpenState error = %v", err)
+	}
+}
+
 func TestOpenStateRejectsStateSymlinkToOtherGitMetadata(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "missing-bitci.json")
 	otherCheckout := t.TempDir()
@@ -1256,7 +1270,7 @@ func TestReadLogSkipsOversizedTerminalPartialLine(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(logPath, []byte(strings.Repeat("x", maxLogReadBytes+1)), 0o600); err != nil {
+	if err := os.WriteFile(logPath, []byte(strings.Repeat("x", maxLogReadBytes+8192)), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	result, err := controller.db.Exec("INSERT INTO jobs(batch, task, ref, state, created_at, log_path) VALUES ('batch', 'unit', '', 'passed', '2026-01-01T00:00:00Z', ?)", logPath)
@@ -1268,7 +1282,7 @@ func TestReadLogSkipsOversizedTerminalPartialLine(t *testing.T) {
 		t.Fatal(err)
 	}
 	logs, err := controller.ReadLog(id, 0, 80)
-	if err != nil || len(logs.Lines) != 0 || logs.Cursor <= maxLogReadBytes {
+	if err != nil || len(logs.Lines) != 0 || logs.Cursor != maxLogReadBytes+8192 {
 		t.Fatalf("terminal capped log = %#v, %v", logs, err)
 	}
 }
@@ -1627,6 +1641,28 @@ func TestSubmitPinsRecordedCheckoutSHA(t *testing.T) {
 	}
 }
 
+func TestSubmitRejectsEmptyTaskListBeforePinningSHA(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{}, ""); err == nil || !strings.Contains(err.Error(), "at least one task") {
+		t.Fatalf("empty submit error = %v", err)
+	}
+	if refs := git(t, checkout, "for-each-ref", "refs/bitci/jobs"); refs != "" {
+		t.Fatalf("empty submit pinned refs: %q", refs)
+	}
+}
+
 func TestPathWithinUsesFilesystemIdentity(t *testing.T) {
 	parent := t.TempDir()
 	root := filepath.Join(parent, "BitCI")
@@ -1801,6 +1837,38 @@ func TestRecordedSHARejectsPrepareThatChangesWorktreeSHA(t *testing.T) {
 	}
 	if jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 126 {
 		t.Fatalf("mutated worktree job = %#v", jobs[0])
+	}
+}
+
+func TestRecordedSHARejectsTaskThatChangesWorktree(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(filepath.Join(checkout, "marker"), []byte("initial\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["sh","-c","printf changed > marker"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json", "marker")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 126 {
+		t.Fatalf("mutated task job = %#v", jobs[0])
 	}
 }
 
@@ -2260,9 +2328,24 @@ func TestUnsafeTaskEnvironmentRejectsGitMetadataPaths(t *testing.T) {
 		"GIT_WORK_TREE":  "../../..",
 		"GIT_INDEX_FILE": ".git-index",
 	} {
-		if !unsafeTaskEnvironment(map[string]string{name: value}, t.TempDir()) {
+		checkout := t.TempDir()
+		if !unsafeTaskEnvironment([]string{name + "=" + value}, checkout, checkout, checkout) {
 			t.Fatalf("accepted unsafe %s=%q", name, value)
 		}
+	}
+}
+
+func TestUnsafeTaskEnvironmentRejectsCheckoutPATH(t *testing.T) {
+	checkout := t.TempDir()
+	worktree := t.TempDir()
+	if !unsafeTaskEnvironment([]string{"PATH=" + checkout}, checkout, worktree, worktree) {
+		t.Fatal("accepted checkout PATH entry")
+	}
+}
+
+func TestUnsafeGitCommandRejectsMetadataWrites(t *testing.T) {
+	if !unsafeGitCommand([]string{"git", "update-ref", "refs/heads/main", "HEAD"}) {
+		t.Fatal("accepted Git metadata write")
 	}
 }
 
@@ -2694,6 +2777,12 @@ func TestStageProtectsCaseInsensitiveStatePath(t *testing.T) {
 	sha := git(t, checkout, "rev-parse", "HEAD")
 	if err := controller.protectStateFromTarget(context.Background(), sha); err == nil || !strings.Contains(err.Error(), "state files") {
 		t.Fatalf("case-insensitive state protection error = %v", err)
+	}
+}
+
+func TestGitTreeContainsPathMatchesFullCaseFoldedPath(t *testing.T) {
+	if !gitTreeContainsPath(".BITCI/poison\x00", ".bitci") {
+		t.Fatal("missed a multi-character case alias")
 	}
 }
 

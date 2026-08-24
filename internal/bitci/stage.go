@@ -71,7 +71,7 @@ func (controller *Controller) StagePR(ctx context.Context, number int, token str
 	if err := controller.protectStateFromTarget(ctx, pull.Head.SHA); err != nil {
 		return Stage{}, err
 	}
-	if _, err := controller.git(ctx, "checkout", "--detach", "--no-overwrite-ignore", pull.Head.SHA); err != nil {
+	if _, err := controller.git(ctx, "checkout", "--detach", pull.Head.SHA); err != nil {
 		return Stage{}, fmt.Errorf("checkout trusted pull request: %w", err)
 	}
 	sha, err := controller.checkoutSHA()
@@ -95,9 +95,6 @@ func (controller *Controller) protectStateFromTarget(ctx context.Context, sha st
 	}
 	if output != "" {
 		return fmt.Errorf("staged pull request must not contain tracked BitCI state files")
-	}
-	if !caseAliasExists(controller.gitDirectory(), relative) {
-		return nil
 	}
 	output, err = controller.git(ctx, "ls-tree", "-r", "-z", "--name-only", sha)
 	if err != nil {
@@ -300,22 +297,6 @@ func (controller *Controller) lexicalCheckoutRoot(checkout string) string {
 
 func samePath(first, second string) bool {
 	return pathWithin(first, second) && pathWithin(second, first)
-}
-
-func caseAliasExists(root, relative string) bool {
-	for index, character := range relative {
-		if character >= 'a' && character <= 'z' {
-			alias := relative[:index] + strings.ToUpper(string(character)) + relative[index+1:]
-			_, err := os.Stat(filepath.Join(root, alias))
-			return err == nil
-		}
-		if character >= 'A' && character <= 'Z' {
-			alias := relative[:index] + strings.ToLower(string(character)) + relative[index+1:]
-			_, err := os.Stat(filepath.Join(root, alias))
-			return err == nil
-		}
-	}
-	return false
 }
 
 func pathUsesSymlink(root, relative string) (bool, error) {

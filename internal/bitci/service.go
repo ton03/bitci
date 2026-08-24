@@ -2,6 +2,7 @@ package bitci
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"html"
 	"os"
@@ -104,15 +105,15 @@ func servicePath(config Config, checkout string) (string, error) {
 	}
 	for _, configured := range commands {
 		command := configured.name
-		if !configured.requireExists {
-			continue
-		}
 		if strings.ContainsRune(command, filepath.Separator) {
 			if !filepath.IsAbs(command) {
 				command = filepath.Join(checkout, command)
 			}
 			info, err := os.Stat(command)
 			if err != nil {
+				if !configured.requireExists && os.IsNotExist(err) {
+					continue
+				}
 				return "", fmt.Errorf("stat configured command %q: %w", command, err)
 			}
 			if info.IsDir() {
@@ -123,6 +124,9 @@ func servicePath(config Config, checkout string) (string, error) {
 		}
 		resolved, err := lookPath(command, taskEnvironment(configured.environment), checkout)
 		if err != nil {
+			if !configured.requireExists && errors.Is(err, exec.ErrNotFound) {
+				continue
+			}
 			return "", fmt.Errorf("resolve configured command %q: %w", command, err)
 		}
 		add(filepath.Dir(resolved))
