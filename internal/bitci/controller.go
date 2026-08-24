@@ -890,6 +890,9 @@ func (controller *Controller) hasUnsafeCheckoutCommand(argv []string, checkoutRo
 	if unsafeEvaluatorCommand(argv, checkoutRoot) || unsafeTaskEnvironment(overrides, checkoutRoot) {
 		return true
 	}
+	if script, ok := interpreterScriptOperand(argv); ok && controller.isCheckoutScript(script, checkoutRoot, worktreeRoot, workDir, taskEnvironment(overrides)) {
+		return true
+	}
 	environment := taskEnvironment(overrides)
 	for _, value := range argv {
 		if containsCheckoutPath(value, checkoutRoot) || containsCheckoutPath(value, filepath.Dir(controller.configPath)) || controller.isCheckoutExecutable(value, checkoutRoot, worktreeRoot, workDir, environment) {
@@ -897,6 +900,16 @@ func (controller *Controller) hasUnsafeCheckoutCommand(argv []string, checkoutRo
 		}
 	}
 	return false
+}
+
+func (controller *Controller) isCheckoutScript(script, checkoutRoot, worktreeRoot, workDir string, environment []string) bool {
+	if !filepath.IsAbs(script) {
+		script = filepath.Join(workDir, script)
+		if worktreeRoot != "" && !pathWithin(worktreeRoot, script) {
+			return true
+		}
+	}
+	return controller.isCheckoutExecutable(script, checkoutRoot, worktreeRoot, workDir, environment)
 }
 
 func containsCheckoutPath(value, checkoutRoot string) bool {
@@ -907,11 +920,7 @@ func containsCheckoutPath(value, checkoutRoot string) bool {
 }
 
 func unsafeEvaluatorCommand(argv []string, checkoutRoot string) bool {
-	if len(argv) < 2 {
-		return false
-	}
-	interpreters := map[string]bool{"bash": true, "dash": true, "fish": true, "ksh": true, "node": true, "perl": true, "php": true, "python": true, "python3": true, "ruby": true, "sh": true, "zsh": true}
-	if !interpreters[strings.ToLower(filepath.Base(argv[0]))] {
+	if !interpreterCommand(argv) {
 		return false
 	}
 	for index, value := range argv[1:] {
@@ -928,14 +937,59 @@ func unsafeEvaluatorCommand(argv []string, checkoutRoot string) bool {
 	return false
 }
 
+func interpreterScriptOperand(argv []string) (string, bool) {
+	if !interpreterCommand(argv) {
+		return "", false
+	}
+	for _, value := range argv[1:] {
+		if value == "-c" || value == "-e" || value == "--command" || value == "--eval" {
+			return "", false
+		}
+		if value == "--" {
+			continue
+		}
+		if strings.HasPrefix(value, "-") {
+			continue
+		}
+		return value, true
+	}
+	return "", false
+}
+
+func interpreterCommand(argv []string) bool {
+	if len(argv) < 2 {
+		return false
+	}
+	interpreters := map[string]bool{"bash": true, "dash": true, "fish": true, "ksh": true, "node": true, "perl": true, "php": true, "python": true, "python3": true, "ruby": true, "sh": true, "zsh": true}
+	return interpreters[strings.ToLower(filepath.Base(argv[0]))]
+}
+
 func unsafeTaskEnvironment(overrides map[string]string, checkoutRoot string) bool {
 	for name, value := range overrides {
 		upper := strings.ToUpper(name)
-		if strings.HasPrefix(upper, "LD_") || strings.HasPrefix(upper, "DYLD_") || containsCheckoutPath(value, checkoutRoot) {
+		if strings.HasPrefix(upper, "LD_") || strings.HasPrefix(upper, "DYLD_") || unsafeGitEnvironment(upper, value) || containsCheckoutPath(value, checkoutRoot) {
 			return true
 		}
 	}
 	return false
+}
+
+func unsafeGitEnvironment(name, value string) bool {
+	if !strings.HasPrefix(name, "GIT_") {
+		return false
+	}
+	pathVariables := map[string]bool{
+		"GIT_ALTERNATE_OBJECT_DIRECTORIES": true,
+		"GIT_CEILING_DIRECTORIES":          true,
+		"GIT_COMMON_DIR":                   true,
+		"GIT_CONFIG_GLOBAL":                true,
+		"GIT_CONFIG_SYSTEM":                true,
+		"GIT_DIR":                          true,
+		"GIT_INDEX_FILE":                   true,
+		"GIT_OBJECT_DIRECTORY":             true,
+		"GIT_WORK_TREE":                    true,
+	}
+	return pathVariables[name] || filepath.IsAbs(value) || strings.ContainsAny(value, "/\\") || pathHasParentTraversal(value)
 }
 
 func pathHasParentTraversal(path string) bool {
@@ -1299,6 +1353,9 @@ func (controller *Controller) ReadLog(id, cursor int64, limit int) (LogCursorOut
 			output.Cursor = readCursor
 		}
 		if err != nil {
+			if err == bufio.ErrBufferFull {
+				break
+			}
 			if err == io.EOF {
 				break
 			}
@@ -1318,6 +1375,14 @@ func readLogLine(reader *bufio.Reader, maxBytes int64) (string, int64, bool, err
 			line = append(line, fragment...)
 		}
 		if err == bufio.ErrBufferFull {
+			if consumed >= maxBytes {
+				fragment, nextErr := reader.ReadSlice('\n')
+				consumed += int64(len(fragment))
+				if nextErr == nil {
+					return string(line), consumed, true, nil
+				}
+				return string(line), consumed, false, nextErr
+			}
 			continue
 		}
 		return string(line), consumed, err == nil, err
@@ -1353,7 +1418,9 @@ func (controller *Controller) logRedaction(configJSON string) ([]string, error) 
 		return nil, err
 	}
 	redact := append([]string{}, config.Redact...)
-	return append(redact, controller.config.Redact...), nil
+	redact = append(redact, controller.config.Redact...)
+	sort.SliceStable(redact, func(left, right int) bool { return len(redact[left]) > len(redact[right]) })
+	return redact, nil
 }
 
 func scanLog(file *os.File, limit int, include func(string) bool, redact []string) ([]string, error) {

@@ -1,6 +1,7 @@
 package bitci
 
 import (
+	"bufio"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -62,6 +63,26 @@ func TestConfigContract(t *testing.T) {
 
 func TestLogsRedactConfiguredValues(t *testing.T) {
 	configPath := writeConfig(t, `{"version":1,"redact":["secret-value"],"tasks":{"unit":{"run":["printf","secret-value\\n"]}}}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	jobs, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	lines, err := controller.TailLog(jobs[0].ID, 80)
+	if err != nil || strings.Join(lines, "") != "[REDACTED]" {
+		t.Fatalf("redacted logs = %q, %v", lines, err)
+	}
+}
+
+func TestLogsRedactLongestConfiguredValueFirst(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"redact":["secret","secret-value"],"tasks":{"unit":{"run":["printf","secret-value\\n"]}}}`)
 	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
 	if err != nil {
 		t.Fatal(err)
@@ -1127,6 +1148,43 @@ func TestReadLogDoesNotAdvanceAtReadCap(t *testing.T) {
 	}
 }
 
+func TestReadLogLineCapsIncompleteLine(t *testing.T) {
+	reader := bufio.NewReaderSize(strings.NewReader(strings.Repeat("x", maxLogReadBytes*2)), 1024)
+	_, consumed, complete, err := readLogLine(reader, maxLogReadBytes)
+	if complete || !errors.Is(err, bufio.ErrBufferFull) || consumed > maxLogReadBytes+1024 {
+		t.Fatalf("capped partial line = complete:%v consumed:%d err:%v", complete, consumed, err)
+	}
+}
+
+func TestReadLogKeepsLiveIncompleteCursorAtCap(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+	stateDir := filepath.Join(t.TempDir(), "state")
+	controller, err := Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	logPath := filepath.Join(stateDir, "logs", "live-capped.log")
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath, []byte(strings.Repeat("x", maxLogReadBytes*2)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := controller.db.Exec("INSERT INTO jobs(batch, task, ref, state, created_at, log_path) VALUES ('batch', 'unit', '', 'running', '2026-01-01T00:00:00Z', ?)", logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs, err := controller.ReadLog(id, 0, 80)
+	if err != nil || len(logs.Lines) != 0 || logs.Cursor != 0 {
+		t.Fatalf("live capped log = %#v, %v", logs, err)
+	}
+}
+
 func TestRetryPreservesRecordedSHAAndConfiguration(t *testing.T) {
 	checkout := t.TempDir()
 	configPath := filepath.Join(checkout, "bitci.json")
@@ -2052,6 +2110,57 @@ func TestRecordedSHARejectsRelativeInterpreterScriptSymlink(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(checkout, "escaped")); !os.IsNotExist(err) {
 		t.Fatalf("task executed mutable checkout script: %v", err)
+	}
+}
+
+func TestRecordedSHARejectsBareInterpreterScriptSymlink(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	primaryScript := filepath.Join(checkout, "primary-script")
+	if err := os.WriteFile(primaryScript, []byte("touch escaped\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(primaryScript, filepath.Join(checkout, "runner")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["sh","runner"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json", "runner")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 126 {
+		t.Fatalf("bare interpreter script job = %#v", jobs[0])
+	}
+	if _, err := os.Stat(filepath.Join(checkout, "escaped")); !os.IsNotExist(err) {
+		t.Fatalf("task executed mutable checkout script: %v", err)
+	}
+}
+
+func TestUnsafeTaskEnvironmentRejectsGitMetadataPaths(t *testing.T) {
+	for name, value := range map[string]string{
+		"GIT_DIR":        "../../../.git",
+		"GIT_WORK_TREE":  "../../..",
+		"GIT_INDEX_FILE": ".git-index",
+	} {
+		if !unsafeTaskEnvironment(map[string]string{name: value}, t.TempDir()) {
+			t.Fatalf("accepted unsafe %s=%q", name, value)
+		}
 	}
 }
 
