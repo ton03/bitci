@@ -60,9 +60,6 @@ func Open(configPath, stateDir string) (*Controller, error) {
 	if err != nil {
 		return nil, err
 	}
-	if gitDirectory, err := gitCommonDirectory(absoluteConfig); err == nil && pathsOverlap(absoluteState, gitDirectory) {
-		return nil, fmt.Errorf("state directory must not overlap Git metadata")
-	}
 	controller, err := OpenState(absoluteConfig, absoluteState)
 	if err != nil {
 		return nil, err
@@ -89,6 +86,9 @@ func OpenState(configPath, stateDir string) (*Controller, error) {
 		return nil, err
 	}
 	stateDir = absoluteState
+	if gitDirectory, err := gitCommonDirectory(configPath); err == nil && pathsOverlap(stateDir, gitDirectory) {
+		return nil, fmt.Errorf("state directory must not overlap Git metadata")
+	}
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		return nil, err
 	}
