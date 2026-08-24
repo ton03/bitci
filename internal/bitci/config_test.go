@@ -3873,7 +3873,7 @@ func TestRecordedSHAScriptCannotMutateSourceRefs(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["./mutate"]}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(checkout, "mutate"), []byte("#!/bin/sh\ngit update-ref refs/heads/main HEAD~1\n"), 0o700); err != nil {
+	if err := os.WriteFile(filepath.Join(checkout, "mutate"), []byte("#!/bin/sh\ntest -f .git/objects/info/alternates\ngit update-ref refs/heads/main HEAD~1\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	git(t, checkout, "init", "-q")
@@ -3904,11 +3904,81 @@ func TestRecordedSHAScriptCannotMutateSourceRefs(t *testing.T) {
 	if jobs[0].State != "passed" {
 		t.Fatalf("isolated Git script job = %#v", jobs[0])
 	}
-	if _, err := os.Stat(filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", jobs[0].ID), ".git", "objects", "info", "alternates")); !os.IsNotExist(err) {
-		t.Fatalf("recorded checkout still exposes source alternates: %v", err)
-	}
 	if got := git(t, checkout, "rev-parse", "refs/heads/main"); got != wantMain {
 		t.Fatalf("source main ref = %q, want %q", got, wantMain)
+	}
+}
+
+func TestCleanupDoesNotRemoveAnotherStateBatchRef(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	first, err := Open(configPath, filepath.Join(t.TempDir(), "state-one"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := Open(configPath, filepath.Join(t.TempDir(), "state-two"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	jobs, err := second.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.cleanupOrphanBatchRefs(); err != nil {
+		t.Fatal(err)
+	}
+	if got := git(t, checkout, "rev-parse", "--verify", "refs/bitci/jobs/"+jobs[0].Batch+"^{commit}"); got != jobs[0].Ref {
+		t.Fatalf("foreign state removed batch ref: %q", got)
+	}
+}
+
+func TestVerifyJobGitMetadataRejectsSymlink(t *testing.T) {
+	gitDirectory := filepath.Join(t.TempDir(), ".git")
+	if err := os.MkdirAll(gitDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), filepath.Join(gitDirectory, "objects")); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyJobGitMetadata(gitDirectory); err == nil {
+		t.Fatal("accepted symlinked Git metadata")
+	}
+}
+
+func TestStageLockSerializesControllers(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	first, err := Open(configPath, filepath.Join(t.TempDir(), "state-one"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := Open(configPath, filepath.Join(t.TempDir(), "state-two"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	release, err := first.acquireStageLock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := second.acquireStageLock(ctx); err == nil {
+		t.Fatal("second controller acquired staging lock")
 	}
 }
 

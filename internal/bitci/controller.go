@@ -37,6 +37,7 @@ type Controller struct {
 	ownerMu        sync.Mutex
 	ownerRelease   func()
 	ownerCount     int
+	stageMu        sync.Mutex
 }
 
 type Job struct {
@@ -202,6 +203,10 @@ func (controller *Controller) migrate() error {
 			job_id INTEGER NOT NULL REFERENCES jobs(id),
 			PRIMARY KEY (resource, job_id)
 		);
+		CREATE TABLE IF NOT EXISTS batch_refs (
+			batch TEXT PRIMARY KEY,
+			checkout_root TEXT NOT NULL
+		);
 	`)
 	if err != nil {
 		return err
@@ -324,6 +329,9 @@ func (controller *Controller) submit(config Config, taskNames []string, ref, che
 	}
 	refCreated := false
 	if checkoutRoot != "" && isCheckoutSHA(ref) {
+		if _, err := transaction.Exec("INSERT INTO batch_refs(batch, checkout_root) VALUES (?, ?)", batch, checkoutRoot); err != nil {
+			return nil, err
+		}
 		if _, err := gitAt(context.Background(), checkoutRoot, "update-ref", batchRef(batch), ref); err != nil {
 			return nil, fmt.Errorf("pin recorded checkout SHA: %w", err)
 		}
@@ -574,8 +582,12 @@ func (controller *Controller) jobCheckout(ctx context.Context, job Job) (string,
 	if _, err := gitAt(ctx, path, initArgs...); err != nil {
 		return "", cleanup, fmt.Errorf("initialize job worktree: %w", err)
 	}
-	if err := copyRecordedObjects(ctx, checkoutRoot, path, job.Ref); err != nil {
+	objectCache, err := copyRecordedObjects(ctx, checkoutRoot, job.Ref, controller.stateDir, objectFormat)
+	if err != nil {
 		return "", cleanup, err
+	}
+	if err := os.WriteFile(filepath.Join(path, ".git", "objects", "info", "alternates"), []byte(objectCache+"\n"), 0o600); err != nil {
+		return "", cleanup, fmt.Errorf("link recorded checkout objects: %w", err)
 	}
 	if _, err := gitAt(ctx, path, "checkout", "--quiet", "--detach", job.Ref); err != nil {
 		return "", cleanup, fmt.Errorf("create job worktree: %w", err)
@@ -590,36 +602,55 @@ func (controller *Controller) jobCheckout(ctx context.Context, job Job) (string,
 	return filepath.Join(path, configRelative), cleanup, nil
 }
 
-func copyRecordedObjects(ctx context.Context, checkoutRoot, worktreeRoot, ref string) error {
+func copyRecordedObjects(ctx context.Context, checkoutRoot, ref, stateDir, objectFormat string) (string, error) {
+	cacheDigest := sha256.Sum256([]byte(resolvedPathForComparison(checkoutRoot)))
+	cacheRoot := filepath.Join(stateDir, "object-cache", hex.EncodeToString(cacheDigest[:8]))
+	if _, err := os.Stat(cacheRoot); os.IsNotExist(err) {
+		if err := os.MkdirAll(filepath.Dir(cacheRoot), 0o700); err != nil {
+			return "", fmt.Errorf("create recorded checkout object cache: %w", err)
+		}
+		initArgs := []string{"init", "--bare", "--quiet"}
+		if format := strings.TrimSpace(objectFormat); format != "" && format != "sha1" {
+			initArgs = append(initArgs, "--object-format="+format)
+		}
+		if _, err := gitAt(ctx, filepath.Dir(cacheRoot), append(initArgs, cacheRoot)...); err != nil {
+			return "", fmt.Errorf("initialize recorded checkout object cache: %w", err)
+		}
+	} else if err != nil {
+		return "", fmt.Errorf("inspect recorded checkout object cache: %w", err)
+	}
+	if _, err := gitAt(ctx, cacheRoot, "cat-file", "-e", ref+"^{commit}"); err == nil {
+		return filepath.Join(cacheRoot, "objects"), nil
+	}
 	pack := exec.CommandContext(ctx, "git", "-C", checkoutRoot, "pack-objects", "--stdout", "--revs", "--delta-base-offset")
 	pack.Stdin = strings.NewReader(ref + "\n")
 	packOutput, err := pack.StdoutPipe()
 	if err != nil {
-		return fmt.Errorf("prepare recorded checkout objects: %w", err)
+		return "", fmt.Errorf("prepare recorded checkout objects: %w", err)
 	}
 	var packError bytes.Buffer
 	pack.Stderr = &packError
-	index := exec.CommandContext(ctx, "git", "-C", worktreeRoot, "index-pack", "--stdin", "--fix-thin", "--keep")
+	index := exec.CommandContext(ctx, "git", "-C", cacheRoot, "index-pack", "--stdin", "--fix-thin", "--keep")
 	index.Stdin = packOutput
 	var indexError bytes.Buffer
 	index.Stderr = &indexError
 	if err := index.Start(); err != nil {
-		return fmt.Errorf("start recorded checkout object import: %w", err)
+		return "", fmt.Errorf("start recorded checkout object import: %w", err)
 	}
 	if err := pack.Start(); err != nil {
 		_ = packOutput.Close()
 		_ = index.Wait()
-		return fmt.Errorf("start recorded checkout object export: %w", err)
+		return "", fmt.Errorf("start recorded checkout object export: %w", err)
 	}
 	packErr := pack.Wait()
 	indexErr := index.Wait()
 	if packErr != nil {
-		return fmt.Errorf("export recorded checkout objects: %s: %w", strings.TrimSpace(packError.String()), packErr)
+		return "", fmt.Errorf("export recorded checkout objects: %s: %w", strings.TrimSpace(packError.String()), packErr)
 	}
 	if indexErr != nil {
-		return fmt.Errorf("import recorded checkout objects: %s: %w", strings.TrimSpace(indexError.String()), indexErr)
+		return "", fmt.Errorf("import recorded checkout objects: %s: %w", strings.TrimSpace(indexError.String()), indexErr)
 	}
-	return nil
+	return filepath.Join(cacheRoot, "objects"), nil
 }
 
 func jobCheckoutOwner(job Job) []byte {
@@ -630,11 +661,28 @@ func jobCheckoutOwnerPath(worktreeRoot string) string {
 	return filepath.Join(worktreeRoot, ".git", "bitci-owner")
 }
 
+func verifyJobGitMetadata(gitDirectory string) error {
+	root := filepath.Clean(gitDirectory)
+	return filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			relative, _ := filepath.Rel(root, path)
+			return fmt.Errorf("worktree Git metadata contains symlink: %s", relative)
+		}
+		return nil
+	})
+}
+
 func (controller *Controller) verifyJobWorktree(worktreeRoot, ref string, expectedOwner []byte) error {
 	gitDirectory := filepath.Join(worktreeRoot, ".git")
 	info, err := os.Lstat(gitDirectory)
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("worktree Git directory changed")
+	}
+	if err := verifyJobGitMetadata(gitDirectory); err != nil {
+		return err
 	}
 	owner, err := os.ReadFile(jobCheckoutOwnerPath(worktreeRoot))
 	if err != nil || !bytes.Equal(owner, expectedOwner) {
@@ -764,6 +812,45 @@ func (controller *Controller) lockOwner() (func(), error) {
 	}, nil
 }
 
+func (controller *Controller) acquireStageLock(ctx context.Context) (func(), error) {
+	controller.stageMu.Lock()
+	gitMetadata, err := gitCommonDirectory(controller.configPath)
+	if err != nil {
+		controller.stageMu.Unlock()
+		return nil, err
+	}
+	file, err := os.OpenFile(filepath.Join(gitMetadata, "bitci-stage.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		controller.stageMu.Unlock()
+		return nil, err
+	}
+	release := func() {
+		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+		_ = file.Close()
+		controller.stageMu.Unlock()
+	}
+	for {
+		err = syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return release, nil
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
+			release()
+			return nil, err
+		}
+		timer := time.NewTimer(25 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			release()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
 func (controller *Controller) acquireOwner() (func(), error) {
 	controller.ownerMu.Lock()
 	defer controller.ownerMu.Unlock()
@@ -887,18 +974,19 @@ func batchRef(batch string) string {
 }
 
 func (controller *Controller) cleanupOrphanBatchRefs() error {
-	rows, err := controller.db.Query("SELECT DISTINCT checkout_root FROM jobs WHERE checkout_root IS NOT NULL AND checkout_root != '' AND (state IN ('queued', 'running') OR cleanup_pending = 1)")
+	rows, err := controller.db.Query("SELECT batch, checkout_root FROM batch_refs WHERE batch NOT IN (SELECT DISTINCT batch FROM jobs WHERE state IN ('queued', 'running') OR cleanup_pending = 1)")
 	if err != nil {
 		return err
 	}
-	var roots []string
+	type ownedBatchRef struct{ batch, checkoutRoot string }
+	var refs []ownedBatchRef
 	for rows.Next() {
-		var root string
-		if err := rows.Scan(&root); err != nil {
+		var ref ownedBatchRef
+		if err := rows.Scan(&ref.batch, &ref.checkoutRoot); err != nil {
 			rows.Close()
 			return err
 		}
-		roots = append(roots, root)
+		refs = append(refs, ref)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -907,36 +995,12 @@ func (controller *Controller) cleanupOrphanBatchRefs() error {
 	if err := rows.Close(); err != nil {
 		return err
 	}
-	if len(roots) == 0 {
-		root := controller.checkoutRoot
-		if root == "" {
-			root, _, err = controller.checkoutLocation()
-			if err != nil {
-				return nil
-			}
+	for _, owned := range refs {
+		if _, err := gitAt(context.Background(), owned.checkoutRoot, "update-ref", "-d", batchRef(owned.batch)); err != nil {
+			return fmt.Errorf("remove orphan batch ref: %w", err)
 		}
-		roots = append(roots, root)
-	}
-	for _, checkoutRoot := range roots {
-		command := exec.CommandContext(context.Background(), "git", "-C", checkoutRoot, "for-each-ref", "--format=%(refname)", "refs/bitci/jobs/")
-		outputBytes, err := command.CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("list batch refs: %s: %w", strings.TrimSpace(string(outputBytes)), err)
-		}
-		for _, ref := range strings.Fields(string(outputBytes)) {
-			batch := strings.TrimPrefix(ref, "refs/bitci/jobs/")
-			if batch == ref || batch == "" {
-				continue
-			}
-			var count int
-			if err := controller.db.QueryRow("SELECT COUNT(*) FROM jobs WHERE batch = ?", batch).Scan(&count); err != nil {
-				return err
-			}
-			if count == 0 {
-				if _, err := gitAt(context.Background(), checkoutRoot, "update-ref", "-d", ref); err != nil {
-					return fmt.Errorf("remove orphan batch ref: %w", err)
-				}
-			}
+		if _, err := controller.db.Exec("DELETE FROM batch_refs WHERE batch = ?", owned.batch); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -952,6 +1016,7 @@ func (controller *Controller) releaseBatchRef(batch, checkoutRoot string) error 
 		return err
 	}
 	if !isCheckoutSHA(expected) {
+		_, _ = controller.db.Exec("DELETE FROM batch_refs WHERE batch = ?", batch)
 		return nil
 	}
 	if checkoutRoot == "" {
@@ -967,6 +1032,9 @@ func (controller *Controller) releaseBatchRef(batch, checkoutRoot string) error 
 		return nil
 	}
 	_, err = gitAt(context.Background(), checkoutRoot, "update-ref", "-d", ref)
+	if err == nil {
+		_, _ = controller.db.Exec("DELETE FROM batch_refs WHERE batch = ?", batch)
+	}
 	return err
 }
 
@@ -1021,6 +1089,9 @@ func (controller *Controller) removeJobWorktree(id int64, _ string) error {
 	info, err := os.Lstat(filepath.Join(path, ".git"))
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("refuse to remove job worktree with changed Git directory")
+	}
+	if err := verifyJobGitMetadata(filepath.Join(path, ".git")); err != nil {
+		return fmt.Errorf("refuse to remove job worktree with changed Git metadata: %w", err)
 	}
 	return os.RemoveAll(path)
 }
@@ -1123,6 +1194,9 @@ func (controller *Controller) pinClaimedJob(transaction *sql.Tx, job *Job) error
 		}
 	}
 	job.Ref = strings.ToLower(job.Ref)
+	if _, err := transaction.Exec("INSERT OR REPLACE INTO batch_refs(batch, checkout_root) VALUES (?, ?)", job.Batch, job.checkoutRoot); err != nil {
+		return err
+	}
 	if _, err := gitAt(context.Background(), job.checkoutRoot, "update-ref", batchRef(job.Batch), job.Ref); err != nil {
 		return fmt.Errorf("pin recorded checkout SHA: %w", err)
 	}

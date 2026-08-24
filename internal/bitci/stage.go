@@ -40,6 +40,11 @@ func (controller *Controller) StagePR(ctx context.Context, number int, token str
 	if token == "" {
 		return Stage{}, fmt.Errorf("stage-pr requires BITCI_GITHUB_TOKEN")
 	}
+	release, err := controller.acquireStageLock(ctx)
+	if err != nil {
+		return Stage{}, fmt.Errorf("lock checkout for staging: %w", err)
+	}
+	defer release()
 	if err := controller.noActiveJobs(); err != nil {
 		return Stage{}, err
 	}
