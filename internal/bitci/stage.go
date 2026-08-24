@@ -89,11 +89,11 @@ func (controller *Controller) protectStateFromTarget(ctx context.Context, sha st
 	if !ok {
 		return nil
 	}
-	output, err := controller.git(ctx, "ls-tree", "-r", "--name-only", sha, "--", ":(top,literal)"+filepath.ToSlash(relative))
+	output, err := controller.git(ctx, "ls-tree", "-r", "--name-only", sha)
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(output) != "" {
+	if gitTreeContainsPath(output, relative) {
 		return fmt.Errorf("staged pull request must not contain tracked BitCI state files")
 	}
 	return nil
@@ -166,14 +166,14 @@ func (controller *Controller) cleanCheckout(ctx context.Context) error {
 		return err
 	}
 	if ok {
-		tracked, err := controller.git(ctx, "ls-files", "--", ":(top,literal)"+filepath.ToSlash(relative))
+		tracked, err := controller.git(ctx, "ls-files", "--", statePathspec(relative))
 		if err != nil {
 			return err
 		}
 		if strings.TrimSpace(tracked) != "" {
 			return fmt.Errorf("state directory must not contain tracked files")
 		}
-		args = append(args, "--", ":(top)", ":(top,exclude,literal)"+filepath.ToSlash(relative))
+		args = append(args, "--", ":(top)", ":(top,exclude,icase,literal)"+filepath.ToSlash(relative))
 	}
 	output, err := controller.git(ctx, args...)
 	if err != nil {
@@ -203,6 +203,15 @@ func (controller *Controller) checkoutStatePath() (string, bool, error) {
 			}
 		}
 	}
+	if relative, ok := relativeLexicallyWithin(checkout, state); ok && relative != "." {
+		usesSymlink, err := pathUsesSymlink(checkout, relative)
+		if err != nil {
+			return "", false, err
+		}
+		if usesSymlink {
+			return "", false, fmt.Errorf("state directory must not use a symlink inside the checkout")
+		}
+	}
 	resolvedState := resolvedPathForComparison(state)
 	relative, ok := relativeWithin(checkout, resolvedState)
 	if !ok || relative == "." {
@@ -216,6 +225,36 @@ func (controller *Controller) checkoutStatePath() (string, bool, error) {
 		return "", false, fmt.Errorf("state directory must not use a symlink inside the checkout")
 	}
 	return relative, true, nil
+}
+
+func statePathspec(relative string) string {
+	return ":(top,icase,literal)" + filepath.ToSlash(relative)
+}
+
+func gitTreeContainsPath(output, relative string) bool {
+	relative = filepath.ToSlash(relative)
+	for _, path := range strings.Split(strings.TrimSpace(output), "\n") {
+		if strings.EqualFold(path, relative) || strings.HasPrefix(strings.ToLower(path), strings.ToLower(relative)+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+func relativeLexicallyWithin(root, path string) (string, bool) {
+	path = filepath.Clean(path)
+	suffix := filepath.Base(path)
+	for parent := filepath.Dir(path); ; parent = filepath.Dir(parent) {
+		if resolved, err := filepath.EvalSymlinks(parent); err == nil {
+			if relative, ok := relativeWithin(root, filepath.Join(resolved, suffix)); ok {
+				return relative, true
+			}
+		}
+		if parent == filepath.Dir(parent) {
+			return "", false
+		}
+		suffix = filepath.Join(filepath.Base(parent), suffix)
+	}
 }
 
 func relativeWithin(root, path string) (string, bool) {

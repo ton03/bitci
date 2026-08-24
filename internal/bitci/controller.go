@@ -322,6 +322,13 @@ func (controller *Controller) RunOnce(ctx context.Context, maxWorkers int) (bool
 		if isCheckoutSHA(job.Ref) && len(config.Prepare) > 0 {
 			code = controller.executeCommand(ctx, config.Prepare, task.Timeout, logFile, workDir)
 		}
+		if code == 0 && isCheckoutSHA(job.Ref) {
+			sha, err := checkoutSHA(worktreeRoot)
+			if err != nil || sha != job.Ref {
+				fmt.Fprintln(logFile, "BitCI worktree SHA changed after prepare")
+				code = 126
+			}
+		}
 		if code == 0 && isCheckoutSHA(job.Ref) && controller.hasUnsafeCheckoutArgument(task.Run, job.checkoutRoot, worktreeRoot, workDir) {
 			fmt.Fprintln(logFile, "BitCI refuses an unsafe checkout-local task argument for a recorded SHA job")
 			code = 126
@@ -812,14 +819,20 @@ func (controller *Controller) isCheckoutExecutable(command, checkoutRoot, worktr
 }
 
 func (controller *Controller) hasUnsafeCheckoutArgument(argv []string, checkoutRoot, worktreeRoot, workDir string) bool {
-	for index, value := range argv {
-		if index == 0 || filepath.IsAbs(value) || strings.ContainsRune(value, filepath.Separator) {
-			if controller.isCheckoutExecutable(value, checkoutRoot, worktreeRoot, workDir) {
-				return true
-			}
+	if checkoutRoot == "" {
+		checkoutRoot = controller.gitDirectory()
+	}
+	for _, value := range argv {
+		if containsCheckoutPath(value, checkoutRoot) || containsCheckoutPath(value, filepath.Dir(controller.configPath)) || controller.isCheckoutExecutable(value, checkoutRoot, worktreeRoot, workDir) {
+			return true
 		}
 	}
 	return false
+}
+
+func containsCheckoutPath(value, checkoutRoot string) bool {
+	checkoutRoot = filepath.Clean(checkoutRoot)
+	return strings.Contains(value, checkoutRoot+string(filepath.Separator)) || value == checkoutRoot
 }
 
 func pathOrAncestorWithin(root, path string) bool {
