@@ -799,7 +799,7 @@ func (controller *Controller) isCheckoutExecutable(command, checkoutRoot, worktr
 
 func (controller *Controller) hasUnsafeCheckoutArgument(argv []string, checkoutRoot, worktreeRoot, workDir string) bool {
 	for index, value := range argv {
-		if index == 0 || filepath.IsAbs(value) || strings.HasPrefix(value, "."+string(filepath.Separator)) || strings.HasPrefix(value, ".."+string(filepath.Separator)) {
+		if index == 0 || filepath.IsAbs(value) || strings.ContainsRune(value, filepath.Separator) {
 			if controller.isCheckoutExecutable(value, checkoutRoot, worktreeRoot, workDir) {
 				return true
 			}

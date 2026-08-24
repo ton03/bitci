@@ -1396,6 +1396,48 @@ func TestRecordedSHARejectsInterpreterScriptFromSubmittedCheckout(t *testing.T) 
 	}
 }
 
+func TestRecordedSHARejectsRelativeInterpreterScriptSymlink(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	primaryScript := filepath.Join(checkout, "primary-script")
+	if err := os.Mkdir(filepath.Join(checkout, "scripts"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(primaryScript, []byte("touch escaped\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(primaryScript, filepath.Join(checkout, "scripts", "runner")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["sh","scripts/runner"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json", "scripts/runner")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 126 {
+		t.Fatalf("relative interpreter script job = %#v", jobs[0])
+	}
+	if _, err := os.Stat(filepath.Join(checkout, "escaped")); !os.IsNotExist(err) {
+		t.Fatalf("task executed mutable checkout script: %v", err)
+	}
+}
+
 func TestRecordedSHARejectsExecutableFromSubmittedCheckout(t *testing.T) {
 	checkout := t.TempDir()
 	runner := filepath.Join(checkout, "runner")
