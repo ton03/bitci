@@ -92,6 +92,9 @@ func OpenState(configPath, stateDir string) (*Controller, error) {
 	if gitDirectory, err := gitCommonDirectory(configPath); err == nil && pathsOverlap(stateDir, gitDirectory) {
 		return nil, fmt.Errorf("state directory must not overlap Git metadata")
 	}
+	if stateInsideGitMetadata(stateDir) {
+		return nil, fmt.Errorf("state directory must not overlap Git metadata")
+	}
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		return nil, err
 	}
@@ -122,6 +125,18 @@ func DefaultStateDir(configPath, stateDir string) string {
 	}
 	digest := sha256.Sum256([]byte(absoluteConfig))
 	return filepath.Join(home, ".local", "state", "bitci", hex.EncodeToString(digest[:6]))
+}
+
+func stateInsideGitMetadata(path string) bool {
+	for current := filepath.Clean(path); ; current = filepath.Dir(current) {
+		if filepath.Base(current) == ".git" {
+			return true
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return false
+		}
+	}
 }
 
 func (controller *Controller) Close() error { return controller.db.Close() }
@@ -460,10 +475,10 @@ func (controller *Controller) jobCheckout(ctx context.Context, job Job) (string,
 	if _, err := controller.db.Exec("UPDATE jobs SET cleanup_pending = 1 WHERE id = ?", job.ID); err != nil {
 		return "", cleanup, err
 	}
+	cleanup = func() error { return controller.removeJobWorktree(job.ID, checkoutRoot) }
 	if _, err := gitAt(ctx, checkoutRoot, "worktree", "add", "--detach", path, job.Ref); err != nil {
 		return "", cleanup, fmt.Errorf("create job worktree: %w", err)
 	}
-	cleanup = func() error { return controller.removeJobWorktree(job.ID, checkoutRoot) }
 	sha, err := checkoutSHA(path)
 	if err != nil || sha != job.Ref {
 		return "", cleanup, fmt.Errorf("verify job worktree SHA")
@@ -483,6 +498,9 @@ func (controller *Controller) verifyJobWorktree(worktreeRoot, checkoutRoot, ref 
 	root, err := gitAt(context.Background(), worktreeRoot, "rev-parse", "--show-toplevel")
 	if err != nil || !samePath(strings.TrimSpace(root), worktreeRoot) {
 		return fmt.Errorf("worktree root changed")
+	}
+	if _, err := gitAt(context.Background(), worktreeRoot, "update-index", "--no-assume-unchanged", "--no-skip-worktree", "--", "."); err != nil {
+		return fmt.Errorf("refresh worktree index: %w", err)
 	}
 	status, err := gitAt(context.Background(), worktreeRoot, "status", "--porcelain", "--untracked-files=no")
 	if err != nil || status != "" {
@@ -818,15 +836,12 @@ func (controller *Controller) isCheckoutExecutable(command, checkoutRoot, worktr
 	if !filepath.IsAbs(path) {
 		if strings.ContainsRune(path, filepath.Separator) {
 			relativeCheckoutPath = true
-			if pathHasParentTraversal(path) {
-				return true
-			}
 			path = workDir + string(filepath.Separator) + path
 			if worktreeRoot != "" && !pathWithin(worktreeRoot, path) {
 				return true
 			}
 		} else {
-			resolved, err := lookPath(command, environment)
+			resolved, err := lookPath(command, environment, workDir)
 			if err != nil {
 				return false
 			}
@@ -932,7 +947,7 @@ func pathHasParentTraversal(path string) bool {
 	return false
 }
 
-func lookPath(file string, environment []string) (string, error) {
+func lookPath(file string, environment []string, base string) (string, error) {
 	if len(environment) == 0 {
 		return exec.LookPath(file)
 	}
@@ -944,6 +959,11 @@ func lookPath(file string, environment []string) (string, error) {
 		}
 	}
 	for _, directory := range filepath.SplitList(path) {
+		if directory == "" {
+			directory = base
+		} else if !filepath.IsAbs(directory) {
+			directory = filepath.Join(base, directory)
+		}
 		candidate := filepath.Join(directory, file)
 		info, err := os.Stat(candidate)
 		if err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
@@ -1070,7 +1090,7 @@ func (controller *Controller) executeCommandWithEnv(parent context.Context, argv
 	env := taskEnvironment(environment)
 	program := argv[0]
 	if !strings.ContainsRune(program, filepath.Separator) {
-		resolved, err := lookPath(program, env)
+		resolved, err := lookPath(program, env, directory)
 		if err != nil {
 			fmt.Fprintf(output, "BitCI could not start task: %v\n", err)
 			return 127
@@ -1129,6 +1149,9 @@ func (controller *Controller) finish(job Job, code int, cleanupPending bool) err
 		state, time.Now().UTC().Format(time.RFC3339), code, job.LogPath, cleanupPending, job.ID,
 	)
 	if err != nil {
+		return err
+	}
+	if err := controller.pruneLogs(); err != nil {
 		return err
 	}
 	_, err = controller.db.Exec("DELETE FROM leases WHERE job_id = ?", job.ID)
@@ -1264,7 +1287,7 @@ func (controller *Controller) ReadLog(id, cursor int64, limit int) (LogCursorOut
 		if consumed == 0 && err == io.EOF {
 			break
 		}
-		if consumed > remaining || (!complete && readCursor-cursor >= maxLogReadBytes) {
+		if complete && consumed > remaining {
 			output.Cursor = readCursor
 			break
 		}

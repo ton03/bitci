@@ -86,18 +86,21 @@ func servicePath(config Config, checkout string) (string, error) {
 	commands := make([]struct {
 		name          string
 		requireExists bool
+		environment   map[string]string
 	}, 0, len(config.Tasks)+1)
 	if len(config.Prepare) > 0 {
 		commands = append(commands, struct {
 			name          string
 			requireExists bool
+			environment   map[string]string
 		}{name: config.Prepare[0], requireExists: true})
 	}
 	for _, name := range config.TaskNames() {
 		commands = append(commands, struct {
 			name          string
 			requireExists bool
-		}{name: config.Tasks[name].Run[0], requireExists: len(config.Prepare) == 0})
+			environment   map[string]string
+		}{name: config.Tasks[name].Run[0], requireExists: len(config.Prepare) == 0, environment: config.Tasks[name].Env})
 	}
 	for _, configured := range commands {
 		command := configured.name
@@ -118,7 +121,7 @@ func servicePath(config Config, checkout string) (string, error) {
 			add(filepath.Dir(command))
 			continue
 		}
-		resolved, err := exec.LookPath(command)
+		resolved, err := lookPath(command, taskEnvironment(configured.environment), checkout)
 		if err != nil {
 			return "", fmt.Errorf("resolve configured command %q: %w", command, err)
 		}
