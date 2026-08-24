@@ -725,6 +725,58 @@ func TestJobRunsInRecordedCheckoutSHA(t *testing.T) {
 	}
 }
 
+func TestSubmitRejectsRequestedSHAWithoutMatchingCheckout(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	requested := git(t, checkout, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(checkout, "marker"), []byte("changed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "add", "marker")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "changed")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, requested); err == nil || !strings.Contains(err.Error(), "does not match checkout HEAD") {
+		t.Fatalf("submit mismatched SHA error = %v", err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("mismatched SHA queued jobs = %#v", jobs)
+	}
+}
+
+func TestSubmitRejectsRequestedSHAWithoutCheckout(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	requested := strings.Repeat("a", 40)
+	if _, err := controller.Submit([]string{"unit"}, requested); err == nil || !strings.Contains(err.Error(), "cannot submit requested checkout SHA") {
+		t.Fatalf("submit without checkout error = %v", err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("unavailable checkout queued jobs = %#v", jobs)
+	}
+}
+
 func TestRecordedSHAPreparesEachWorktree(t *testing.T) {
 	checkout := t.TempDir()
 	configPath := filepath.Join(checkout, "bitci.json")
