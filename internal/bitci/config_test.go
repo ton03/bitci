@@ -589,6 +589,32 @@ func TestRecoverOrphanedReleasesLeaseAndCancelsBatch(t *testing.T) {
 	}
 }
 
+func TestRecoverOrphanedHandlesMissingStartedAt(t *testing.T) {
+	for _, startedAt := range []any{nil, "invalid"} {
+		t.Run(fmt.Sprint(startedAt), func(t *testing.T) {
+			configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+			controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer controller.Close()
+			if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+				t.Fatal(err)
+			}
+			job, claimed, err := controller.claim(1)
+			if err != nil || !claimed {
+				t.Fatalf("claim = %v, %v", claimed, err)
+			}
+			if _, err := controller.db.Exec("UPDATE jobs SET worker_pid = ?, started_at = ? WHERE id = ?", 999999999, startedAt, job.ID); err != nil {
+				t.Fatal(err)
+			}
+			if recovered, err := controller.RecoverOrphaned(); err != nil || recovered != 1 {
+				t.Fatalf("recover orphaned = %d, %v", recovered, err)
+			}
+		})
+	}
+}
+
 func TestRecoverOrphanedSkipsChangedJob(t *testing.T) {
 	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
 	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))

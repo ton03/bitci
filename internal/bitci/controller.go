@@ -631,7 +631,7 @@ func (controller *Controller) RecoverOrphaned() (int, error) {
 			return 0, err
 		}
 		startedAt, err := time.Parse(time.RFC3339, job.startedAt)
-		if err != nil || time.Since(startedAt) < orphanRecoveryGrace {
+		if err == nil && time.Since(startedAt) < orphanRecoveryGrace {
 			continue
 		}
 		alive, err := processAlive(*job.WorkerPID)
