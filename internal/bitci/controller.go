@@ -1092,7 +1092,7 @@ func (controller *Controller) Retry(id int64) ([]Job, error) {
 	if err := controller.db.QueryRow("SELECT batch, task, ref, COALESCE(config_json, ''), COALESCE(checkout_root, ''), COALESCE(config_relative, ''), state FROM jobs WHERE id = ?", id).Scan(&batch, &task, &ref, &configJSON, &checkoutRoot, &configRelative, &state); err != nil {
 		return nil, err
 	}
-	if state == "running" {
+	if state == "queued" || state == "running" {
 		return nil, fmt.Errorf("job %d is not finished", id)
 	}
 	config := controller.config

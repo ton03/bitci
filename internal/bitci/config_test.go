@@ -1123,6 +1123,29 @@ func TestRetryCapRecordsHistory(t *testing.T) {
 	}
 }
 
+func TestRetryRejectsQueuedJob(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	jobs, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.Retry(jobs[0].ID); err == nil || !strings.Contains(err.Error(), "not finished") {
+		t.Fatalf("retry queued job error = %v", err)
+	}
+	stored, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 1 || stored[0].State != "queued" {
+		t.Fatalf("queued job changed after retry = %#v", stored)
+	}
+}
+
 func TestRetryCapSerializesConcurrentRetries(t *testing.T) {
 	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["false"],"max_retries":1}}}`)
 	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
@@ -1182,6 +1205,9 @@ func TestRetryPreservesRecordedSHAAndConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run original = %v, %v", ran, err)
+	}
 	if err := controller.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -1204,9 +1230,6 @@ func TestRetryPreservesRecordedSHAAndConfiguration(t *testing.T) {
 	}
 	if retried[0].Ref != original[0].Ref || retried[0].checkoutRoot != original[0].checkoutRoot || retried[0].configRelative != original[0].configRelative {
 		t.Fatalf("retry changed recorded checkout: %#v", retried[0])
-	}
-	if cancelled, err := controller.Cancel(original[0].ID); err != nil || !cancelled {
-		t.Fatalf("cancel original = %v, %v", cancelled, err)
 	}
 	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
 		t.Fatalf("run retry = %v, %v", ran, err)
@@ -1237,6 +1260,9 @@ func TestRetryPinsLegacyRecordedSHA(t *testing.T) {
 	original, err := controller.Submit([]string{"unit"}, "")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if cancelled, err := controller.Cancel(original[0].ID); err != nil || !cancelled {
+		t.Fatalf("cancel original = %v, %v", cancelled, err)
 	}
 	if _, err := controller.db.Exec("UPDATE jobs SET checkout_root = '', config_relative = '' WHERE id = ?", original[0].ID); err != nil {
 		t.Fatal(err)
