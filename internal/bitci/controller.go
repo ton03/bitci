@@ -366,6 +366,25 @@ func (controller *Controller) RecoverInterrupted() error {
 		return err
 	}
 	defer transaction.Rollback()
+	rows, err := transaction.Query("SELECT id, ref FROM jobs WHERE state = 'running'")
+	if err != nil {
+		return err
+	}
+	var interrupted []int64
+	for rows.Next() {
+		var id int64
+		var ref string
+		if err := rows.Scan(&id, &ref); err != nil {
+			rows.Close()
+			return err
+		}
+		if isCheckoutSHA(ref) {
+			interrupted = append(interrupted, id)
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	if _, err := transaction.Exec("UPDATE jobs SET state = 'cancelled', finished_at = ? WHERE state = 'queued' AND batch IN (SELECT DISTINCT batch FROM jobs WHERE state = 'running')", now); err != nil {
 		return err
@@ -376,7 +395,35 @@ func (controller *Controller) RecoverInterrupted() error {
 	if _, err := transaction.Exec("UPDATE jobs SET state = 'failed', finished_at = ?, exit_code = 125 WHERE state = 'running'", now); err != nil {
 		return err
 	}
-	return transaction.Commit()
+	if err := transaction.Commit(); err != nil {
+		return err
+	}
+	var failures []error
+	for _, id := range interrupted {
+		if err := controller.removeJobWorktree(id); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	return errors.Join(failures...)
+}
+
+func (controller *Controller) removeJobWorktree(id int64) error {
+	path := filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", id))
+	var failures []error
+	if _, err := os.Lstat(path); err == nil {
+		if _, err := controller.git(context.Background(), "worktree", "remove", "--force", path); err != nil {
+			failures = append(failures, err)
+		}
+	} else if !os.IsNotExist(err) {
+		failures = append(failures, err)
+	}
+	if err := os.RemoveAll(path); err != nil {
+		failures = append(failures, err)
+	}
+	if _, err := controller.git(context.Background(), "worktree", "prune"); err != nil {
+		failures = append(failures, err)
+	}
+	return errors.Join(failures...)
 }
 
 func (controller *Controller) claim(maxWorkers int) (Job, bool, error) {

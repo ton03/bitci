@@ -2,6 +2,8 @@ package bitci
 
 import (
 	"context"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -166,6 +168,70 @@ func TestRecoverInterruptedReleasesLease(t *testing.T) {
 	}
 }
 
+func TestRecoverInterruptedRemovesJobWorktree(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	jobs, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, claimed, err := controller.claim(1); err != nil || !claimed {
+		t.Fatalf("claim = %v, %v", claimed, err)
+	}
+	path := filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", jobs[0].ID))
+	if _, err := controller.git(context.Background(), "worktree", "add", "--detach", path, jobs[0].Ref); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.RecoverInterrupted(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Fatalf("interrupted worktree remains: %v", err)
+	}
+}
+
+func TestOpenStateMigratesLegacyJobs(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), "state")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	database, err := sql.Open("sqlite", filepath.Join(stateDir, "bitci.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = database.Exec(`CREATE TABLE jobs (id INTEGER PRIMARY KEY, batch TEXT NOT NULL, task TEXT NOT NULL, ref TEXT NOT NULL, state TEXT NOT NULL, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, exit_code INTEGER, log_path TEXT); INSERT INTO jobs(batch, task, ref, state, created_at) VALUES ('batch', 'unit', 'ref', 'passed', '2026-01-01T00:00:00Z');`)
+	if err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	controller, err := OpenState(filepath.Join(t.TempDir(), "bitci.json"), stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 || jobs[0].TestedSHA != "" {
+		t.Fatalf("migrated jobs = %#v", jobs)
+	}
+}
+
 func TestOwnerSocketRPCAndStaleRecovery(t *testing.T) {
 	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
 	stateDir := filepath.Join(t.TempDir(), "state")
@@ -258,6 +324,74 @@ func TestMCPReadOnlyTools(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("owner RPC server did not stop")
 	}
+}
+
+func TestMCPStatusIncludesTestedSHA(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+	stateDir := filepath.Join(t.TempDir(), "state")
+	controller, err := Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	sha := "0123456789012345678901234567890123456789"
+	if _, err := controller.db.Exec("INSERT INTO jobs(batch, task, ref, tested_sha, state, created_at) VALUES ('batch', 'unit', ?, ?, 'passed', '2026-01-01T00:00:00Z')", sha, sha); err != nil {
+		t.Fatal(err)
+	}
+	socketPath := fmt.Sprintf("/tmp/bitci-%d.sock", time.Now().UnixNano())
+	defer os.Remove(socketPath)
+	listener, err := controller.Listen(socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ownerDone := make(chan error, 1)
+	go func() { ownerDone <- controller.ServeRPC(ctx, listener) }()
+	status := mcpStatus(t, socketPath)
+	if len(status.Jobs) != 1 || status.Jobs[0].TestedSHA != sha {
+		t.Fatalf("MCP status = %#v", status)
+	}
+	cancel()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-ownerDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("owner RPC server did not stop")
+	}
+}
+
+func mcpStatus(t *testing.T, socketPath string) MCPStatus {
+	t.Helper()
+	command := exec.Command(os.Args[0], "-test.run=TestMCPHelper", "--")
+	command.Env = append(os.Environ(), "GO_WANT_MCP_HELPER=1", "BITCI_TEST_SOCKET="+socketPath, "BITCI_TEST_ALLOW_RUNS=0")
+	client := mcp.NewClient(&mcp.Implementation{Name: "bitci-test", Version: "0.1.0"}, nil)
+	session, err := client.Connect(context.Background(), &mcp.CommandTransport{Command: command}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "status"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := result.GetError(); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(result.StructuredContent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var status MCPStatus
+	if err := json.Unmarshal(encoded, &status); err != nil {
+		t.Fatal(err)
+	}
+	return status
 }
 
 func mcpToolNames(t *testing.T, socketPath string, allowRuns bool) map[string]bool {
