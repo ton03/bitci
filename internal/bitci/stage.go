@@ -89,7 +89,7 @@ func (controller *Controller) protectStateFromTarget(ctx context.Context, sha st
 	if !ok {
 		return nil
 	}
-	output, err := controller.git(ctx, "ls-tree", "-r", "--name-only", sha)
+	output, err := controller.git(ctx, "ls-tree", "-r", "-z", "--name-only", sha)
 	if err != nil {
 		return err
 	}
@@ -233,7 +233,10 @@ func statePathspec(relative string) string {
 
 func gitTreeContainsPath(output, relative string) bool {
 	relative = filepath.ToSlash(relative)
-	for _, path := range strings.Split(strings.TrimSpace(output), "\n") {
+	for _, path := range strings.Split(output, "\x00") {
+		if path == "" {
+			continue
+		}
 		if strings.EqualFold(path, relative) || strings.HasPrefix(strings.ToLower(path), strings.ToLower(relative)+"/") {
 			return true
 		}
@@ -274,7 +277,7 @@ func relativeWithin(root, path string) (string, bool) {
 func (controller *Controller) lexicalCheckoutRoot(checkout string) string {
 	path := filepath.Dir(controller.configPath)
 	for {
-		if resolvedPathForComparison(path) == checkout {
+		if samePath(resolvedPathForComparison(path), checkout) {
 			return path
 		}
 		parent := filepath.Dir(path)
@@ -283,6 +286,10 @@ func (controller *Controller) lexicalCheckoutRoot(checkout string) string {
 		}
 		path = parent
 	}
+}
+
+func samePath(first, second string) bool {
+	return pathWithin(first, second) && pathWithin(second, first)
 }
 
 func pathUsesSymlink(root, relative string) (bool, error) {

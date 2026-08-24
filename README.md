@@ -89,7 +89,7 @@ secrets from tasks.
 
 Use literal `redact` values to hide known secrets from BitCI log reads. It does
 not change the retained files. Use `log_retention` to keep the newest N
-finished job logs; `0` removes every older log before the next job starts.
+finished job logs; omit it or use `0` to keep all finished logs.
 
 ### Task environment
 

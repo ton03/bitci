@@ -157,7 +157,7 @@ func TestLogRetentionPrunesFinishedLogs(t *testing.T) {
 				t.Fatal(err)
 			}
 			for index, job := range jobs {
-				wantRetained := index >= len(jobs)-retention
+				wantRetained := retention == 0 || index >= len(jobs)-retention
 				if got := job.LogPath != ""; got != wantRetained {
 					t.Fatalf("job %d retained metadata = %v, want %v", job.ID, got, wantRetained)
 				}
@@ -342,6 +342,52 @@ func TestConfiguredTaskEnvironment(t *testing.T) {
 	}
 	if jobs[0].State != "passed" {
 		t.Fatalf("configured environment job = %#v", jobs[0])
+	}
+}
+
+func TestTaskEnvironmentPathControlsCommandLookup(t *testing.T) {
+	tools := t.TempDir()
+	tool := filepath.Join(tools, "bitci-test-tool")
+	if err := os.WriteFile(tool, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := writeConfig(t, fmt.Sprintf(`{"version":1,"tasks":{"unit":{"run":["bitci-test-tool"],"env":{"PATH":%q}}}}`, tools))
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil || jobs[0].State != "passed" {
+		t.Fatalf("PATH override job = %#v, %v", jobs, err)
+	}
+}
+
+func TestInvalidLegacyJobDoesNotBlockQueue(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.db.Exec("INSERT INTO jobs(batch, task, ref, state, created_at) VALUES ('legacy', 'removed', '', 'queued', '2026-01-01T00:00:00Z')"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil || jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 127 || jobs[1].State != "passed" {
+		t.Fatalf("legacy queue recovery = %#v, %v", jobs, err)
 	}
 }
 
@@ -1065,8 +1111,12 @@ func TestReadLogDoesNotAdvanceAtReadCap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(logs.Lines) != 0 || logs.Cursor != 0 || logs.State != "passed" {
+	if len(logs.Lines) != 0 || logs.Cursor <= maxLogReadBytes || logs.State != "passed" {
 		t.Fatalf("capped log read = %#v", logs)
+	}
+	next, err := controller.ReadLog(id, logs.Cursor, 80)
+	if err != nil || strings.Join(next.Lines, ",") != "next" {
+		t.Fatalf("next capped log read = %#v, %v", next, err)
 	}
 	encoded, err := json.Marshal(logs)
 	if err != nil {
@@ -1793,8 +1843,8 @@ func TestJobCheckoutFailureDoesNotPanicOnCleanup(t *testing.T) {
 	if stored[0].State != "failed" || stored[0].ExitCode == nil || *stored[0].ExitCode != 126 {
 		t.Fatalf("failed checkout job = %#v", stored[0])
 	}
-	if _, err := os.Lstat(filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", jobs[0].ID))); !os.IsNotExist(err) {
-		t.Fatalf("failed checkout worktree remains: %v", err)
+	if _, err := os.Lstat(filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", jobs[0].ID))); err != nil {
+		t.Fatalf("failed checkout collision was removed: %v", err)
 	}
 }
 

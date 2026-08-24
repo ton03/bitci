@@ -315,7 +315,7 @@ func (controller *Controller) RunOnce(ctx context.Context, maxWorkers int) (bool
 		worktreeRoot = filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", job.ID))
 	}
 	code := 0
-	if isCheckoutSHA(job.Ref) && len(config.Prepare) > 0 && controller.hasUnsafeCheckoutArgument(config.Prepare, job.checkoutRoot, worktreeRoot, workDir) {
+	if isCheckoutSHA(job.Ref) && len(config.Prepare) > 0 && controller.hasUnsafeCheckoutCommand(config.Prepare, job.checkoutRoot, worktreeRoot, workDir, nil) {
 		fmt.Fprintln(logFile, "BitCI refuses an unsafe checkout-local prepare argument for a recorded SHA job")
 		code = 126
 	} else {
@@ -323,13 +323,16 @@ func (controller *Controller) RunOnce(ctx context.Context, maxWorkers int) (bool
 			code = controller.executeCommand(ctx, config.Prepare, task.Timeout, logFile, workDir)
 		}
 		if code == 0 && isCheckoutSHA(job.Ref) {
-			sha, err := checkoutSHA(worktreeRoot)
-			if err != nil || sha != job.Ref {
-				fmt.Fprintln(logFile, "BitCI worktree SHA changed after prepare")
+			if err := controller.verifyJobWorktree(worktreeRoot, job.checkoutRoot, job.Ref); err != nil {
+				fmt.Fprintln(logFile, "BitCI worktree changed after prepare:", err)
 				code = 126
 			}
 		}
-		if code == 0 && isCheckoutSHA(job.Ref) && controller.hasUnsafeCheckoutArgument(task.Run, job.checkoutRoot, worktreeRoot, workDir) {
+		if code == 0 && isCheckoutSHA(job.Ref) && !controller.workDirWithinWorktree(worktreeRoot, workDir) {
+			fmt.Fprintln(logFile, "BitCI refuses a task work directory outside the recorded worktree")
+			code = 126
+		}
+		if code == 0 && isCheckoutSHA(job.Ref) && controller.hasUnsafeCheckoutCommand(task.Run, job.checkoutRoot, worktreeRoot, workDir, task.Env) {
 			fmt.Fprintln(logFile, "BitCI refuses an unsafe checkout-local task argument for a recorded SHA job")
 			code = 126
 		}
@@ -398,7 +401,11 @@ func checkoutLocation(configPath string) (string, string, error) {
 }
 
 func gitCommonDirectory(configPath string) (string, error) {
-	configDirectory, err := filepath.EvalSymlinks(filepath.Dir(configPath))
+	resolvedConfig, err := filepath.EvalSymlinks(configPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve config file: %w", err)
+	}
+	configDirectory, err := filepath.EvalSymlinks(filepath.Dir(resolvedConfig))
 	if err != nil {
 		return "", fmt.Errorf("resolve config directory: %w", err)
 	}
@@ -439,7 +446,7 @@ func (controller *Controller) jobCheckout(ctx context.Context, job Job) (string,
 	if err != nil {
 		return "", func() error { return nil }, err
 	}
-	cleanup := func() error { return controller.removeJobWorktree(job.ID, checkoutRoot) }
+	cleanup := func() error { return nil }
 	root := filepath.Join(controller.stateDir, "worktrees")
 	path := filepath.Join(root, fmt.Sprintf("job-%d", job.ID))
 	if err := os.MkdirAll(root, 0o700); err != nil {
@@ -456,6 +463,7 @@ func (controller *Controller) jobCheckout(ctx context.Context, job Job) (string,
 	if _, err := gitAt(ctx, checkoutRoot, "worktree", "add", "--detach", path, job.Ref); err != nil {
 		return "", cleanup, fmt.Errorf("create job worktree: %w", err)
 	}
+	cleanup = func() error { return controller.removeJobWorktree(job.ID, checkoutRoot) }
 	sha, err := checkoutSHA(path)
 	if err != nil || sha != job.Ref {
 		return "", cleanup, fmt.Errorf("verify job worktree SHA")
@@ -464,6 +472,31 @@ func (controller *Controller) jobCheckout(ctx context.Context, job Job) (string,
 		return "", cleanup, err
 	}
 	return filepath.Join(path, configRelative), cleanup, nil
+}
+
+func (controller *Controller) verifyJobWorktree(worktreeRoot, checkoutRoot, ref string) error {
+	gitFile := filepath.Join(worktreeRoot, ".git")
+	info, err := os.Lstat(gitFile)
+	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("worktree Git file changed")
+	}
+	root, err := gitAt(context.Background(), worktreeRoot, "rev-parse", "--show-toplevel")
+	if err != nil || !samePath(strings.TrimSpace(root), worktreeRoot) {
+		return fmt.Errorf("worktree root changed")
+	}
+	status, err := gitAt(context.Background(), worktreeRoot, "status", "--porcelain", "--untracked-files=no")
+	if err != nil || status != "" {
+		return fmt.Errorf("worktree tracked files changed")
+	}
+	sha, err := checkoutSHA(worktreeRoot)
+	if err != nil || sha != ref {
+		return fmt.Errorf("worktree SHA changed")
+	}
+	return nil
+}
+
+func (controller *Controller) workDirWithinWorktree(worktreeRoot, workDir string) bool {
+	return worktreeRoot != "" && pathWithin(resolvedPathForComparison(worktreeRoot), resolvedPathForComparison(workDir))
 }
 
 func isCheckoutSHA(value string) bool {
@@ -646,6 +679,7 @@ func (controller *Controller) claim(maxWorkers int) (Job, bool, error) {
 		return Job{}, false, err
 	}
 	defer rows.Close()
+	changed := false
 	for rows.Next() {
 		var job Job
 		if err := rows.Scan(&job.ID, &job.Batch, &job.Task, &job.Ref, &job.configJSON, &job.checkoutRoot, &job.configRelative, &job.State); err != nil {
@@ -653,7 +687,11 @@ func (controller *Controller) claim(maxWorkers int) (Job, bool, error) {
 		}
 		config, task, err := controller.jobConfig(job)
 		if err != nil {
-			return Job{}, false, err
+			if _, updateErr := transaction.Exec("UPDATE jobs SET state = 'failed', finished_at = ?, exit_code = 127 WHERE id = ?", time.Now().UTC().Format(time.RFC3339), job.ID); updateErr != nil {
+				return Job{}, false, updateErr
+			}
+			changed = true
+			continue
 		}
 		if err := controller.diskOK(config.MinFreeBytes); err != nil {
 			return Job{}, false, err
@@ -681,7 +719,13 @@ func (controller *Controller) claim(maxWorkers int) (Job, bool, error) {
 		job.State = "running"
 		return job, true, transaction.Commit()
 	}
-	return Job{}, false, rows.Err()
+	if err := rows.Err(); err != nil {
+		return Job{}, false, err
+	}
+	if changed {
+		return Job{}, false, transaction.Commit()
+	}
+	return Job{}, false, nil
 }
 
 func (controller *Controller) ready(transaction *sql.Tx, job Job, task Task) (bool, error) {
@@ -768,16 +812,21 @@ func (controller *Controller) snapshotConfig(snapshot string) (Config, error) {
 	return config, nil
 }
 
-func (controller *Controller) isCheckoutExecutable(command, checkoutRoot, worktreeRoot, workDir string) bool {
+func (controller *Controller) isCheckoutExecutable(command, checkoutRoot, worktreeRoot, workDir string, environment []string) bool {
 	path := command
+	relativeCheckoutPath := false
 	if !filepath.IsAbs(path) {
 		if strings.ContainsRune(path, filepath.Separator) {
-			path = filepath.Clean(filepath.Join(workDir, path))
+			relativeCheckoutPath = true
+			if pathHasParentTraversal(path) {
+				return true
+			}
+			path = workDir + string(filepath.Separator) + path
 			if worktreeRoot != "" && !pathWithin(worktreeRoot, path) {
 				return true
 			}
 		} else {
-			resolved, err := exec.LookPath(command)
+			resolved, err := lookPath(command, environment)
 			if err != nil {
 				return false
 			}
@@ -803,27 +852,32 @@ func (controller *Controller) isCheckoutExecutable(command, checkoutRoot, worktr
 	if err != nil {
 		return false
 	}
-	if pathOrAncestorWithin(root, path) && !insideWorktree {
+	if pathOrAncestorWithin(root, path, worktreeRoot) {
 		return true
 	}
 	resolvedPath, err := filepath.EvalSymlinks(path)
 	if err != nil {
 		return false
 	}
-	if worktreeRoot != "" {
-		if resolvedWorktree, worktreeErr := filepath.EvalSymlinks(worktreeRoot); worktreeErr == nil && pathWithin(resolvedWorktree, resolvedPath) {
-			return false
-		}
+	if relativeCheckoutPath && worktreeRoot != "" && !pathWithin(resolvedPathForComparison(worktreeRoot), resolvedPathForComparison(path)) {
+		return true
+	}
+	if worktreeRoot != "" && pathWithin(resolvedPathForComparison(worktreeRoot), resolvedPath) {
+		return false
 	}
 	return pathWithin(root, resolvedPath)
 }
 
-func (controller *Controller) hasUnsafeCheckoutArgument(argv []string, checkoutRoot, worktreeRoot, workDir string) bool {
+func (controller *Controller) hasUnsafeCheckoutCommand(argv []string, checkoutRoot, worktreeRoot, workDir string, overrides map[string]string) bool {
 	if checkoutRoot == "" {
 		checkoutRoot = controller.gitDirectory()
 	}
+	if unsafeEvaluatorCommand(argv, checkoutRoot) || unsafeTaskEnvironment(overrides, checkoutRoot) {
+		return true
+	}
+	environment := taskEnvironment(overrides)
 	for _, value := range argv {
-		if containsCheckoutPath(value, checkoutRoot) || containsCheckoutPath(value, filepath.Dir(controller.configPath)) || controller.isCheckoutExecutable(value, checkoutRoot, worktreeRoot, workDir) {
+		if containsCheckoutPath(value, checkoutRoot) || containsCheckoutPath(value, filepath.Dir(controller.configPath)) || controller.isCheckoutExecutable(value, checkoutRoot, worktreeRoot, workDir, environment) {
 			return true
 		}
 	}
@@ -832,13 +886,82 @@ func (controller *Controller) hasUnsafeCheckoutArgument(argv []string, checkoutR
 
 func containsCheckoutPath(value, checkoutRoot string) bool {
 	checkoutRoot = filepath.Clean(checkoutRoot)
+	value = strings.ToLower(value)
+	checkoutRoot = strings.ToLower(checkoutRoot)
 	return strings.Contains(value, checkoutRoot+string(filepath.Separator)) || value == checkoutRoot
 }
 
-func pathOrAncestorWithin(root, path string) bool {
-	for current := path; ; current = filepath.Dir(current) {
-		if resolved, err := filepath.EvalSymlinks(current); err == nil && pathWithin(root, resolved) {
+func unsafeEvaluatorCommand(argv []string, checkoutRoot string) bool {
+	if len(argv) < 2 {
+		return false
+	}
+	interpreters := map[string]bool{"bash": true, "dash": true, "fish": true, "ksh": true, "node": true, "perl": true, "php": true, "python": true, "python3": true, "ruby": true, "sh": true, "zsh": true}
+	if !interpreters[strings.ToLower(filepath.Base(argv[0]))] {
+		return false
+	}
+	for index, value := range argv[1:] {
+		if value == "-c" || value == "-e" || value == "--command" || value == "--eval" {
+			if index+2 >= len(argv) {
+				return true
+			}
+			script := argv[index+2]
+			if pathHasParentTraversal(script) || containsCheckoutPath(script, checkoutRoot) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func unsafeTaskEnvironment(overrides map[string]string, checkoutRoot string) bool {
+	for name, value := range overrides {
+		upper := strings.ToUpper(name)
+		if strings.HasPrefix(upper, "LD_") || strings.HasPrefix(upper, "DYLD_") || containsCheckoutPath(value, checkoutRoot) {
 			return true
+		}
+	}
+	return false
+}
+
+func pathHasParentTraversal(path string) bool {
+	for _, part := range strings.FieldsFunc(path, func(r rune) bool { return r == '/' || r == '\\' }) {
+		if part == ".." {
+			return true
+		}
+	}
+	return false
+}
+
+func lookPath(file string, environment []string) (string, error) {
+	if len(environment) == 0 {
+		return exec.LookPath(file)
+	}
+	path := ""
+	for _, value := range environment {
+		if name, value, ok := strings.Cut(value, "="); ok && name == "PATH" {
+			path = value
+			break
+		}
+	}
+	for _, directory := range filepath.SplitList(path) {
+		candidate := filepath.Join(directory, file)
+		info, err := os.Stat(candidate)
+		if err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
+			return candidate, nil
+		}
+	}
+	return "", exec.ErrNotFound
+}
+
+func pathOrAncestorWithin(root, path, worktreeRoot string) bool {
+	for current := path; ; current = filepath.Dir(current) {
+		if resolved, err := filepath.EvalSymlinks(current); err == nil {
+			if worktreeRoot != "" && samePath(resolved, worktreeRoot) {
+				return false
+			}
+			if pathWithin(root, resolved) && (worktreeRoot == "" || !pathWithin(resolvedPathForComparison(worktreeRoot), resolved)) {
+				return true
+			}
 		}
 		parent := filepath.Dir(current)
 		if parent == current {
@@ -887,6 +1010,9 @@ func (controller *Controller) startLog(job *Job) (*os.File, error) {
 }
 
 func (controller *Controller) pruneLogs() error {
+	if controller.config.LogRetention == 0 {
+		return nil
+	}
 	rows, err := controller.db.Query("SELECT id, COALESCE(log_path, '') FROM jobs WHERE state IN ('passed', 'failed', 'cancelled') AND COALESCE(log_path, '') != '' ORDER BY finished_at DESC, id DESC LIMIT -1 OFFSET ?", controller.config.LogRetention)
 	if err != nil {
 		return err
@@ -941,9 +1067,19 @@ func (controller *Controller) executeCommandWithEnv(parent context.Context, argv
 		ctx, cancel = context.WithTimeout(parent, time.Duration(timeout)*time.Second)
 		defer cancel()
 	}
-	command := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	env := taskEnvironment(environment)
+	program := argv[0]
+	if !strings.ContainsRune(program, filepath.Separator) {
+		resolved, err := lookPath(program, env)
+		if err != nil {
+			fmt.Fprintf(output, "BitCI could not start task: %v\n", err)
+			return 127
+		}
+		program = resolved
+	}
+	command := exec.CommandContext(ctx, program, argv[1:]...)
 	command.Dir = directory
-	command.Env = taskEnvironment(environment)
+	command.Env = env
 	command.Stdout = output
 	command.Stderr = output
 	err := command.Run()
@@ -1118,13 +1254,21 @@ func (controller *Controller) ReadLog(id, cursor int64, limit int) (LogCursorOut
 	if _, err := file.Seek(cursor, io.SeekStart); err != nil {
 		return LogCursorOutput{}, err
 	}
-	reader := bufio.NewReader(io.LimitReader(file, maxLogReadBytes))
+	reader := bufio.NewReader(file)
 	readCursor := cursor
 	limit = logLimit(limit)
-	for len(output.Lines) < limit {
-		line, err := reader.ReadString('\n')
-		readCursor += int64(len(line))
-		if len(line) > 0 && strings.HasSuffix(line, "\n") {
+	for len(output.Lines) < limit && readCursor-cursor < maxLogReadBytes {
+		remaining := maxLogReadBytes - (readCursor - cursor)
+		line, consumed, complete, err := readLogLine(reader, remaining)
+		readCursor += consumed
+		if consumed == 0 && err == io.EOF {
+			break
+		}
+		if consumed > remaining || (!complete && readCursor-cursor >= maxLogReadBytes) {
+			output.Cursor = readCursor
+			break
+		}
+		if complete {
 			output.Lines = append(output.Lines, redactLogLine(strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r"), redact))
 			output.Cursor = readCursor
 		} else if len(line) > 0 && err == io.EOF && terminalJobState(state) && readCursor == info.Size() {
@@ -1139,6 +1283,22 @@ func (controller *Controller) ReadLog(id, cursor int64, limit int) (LogCursorOut
 		}
 	}
 	return output, nil
+}
+
+func readLogLine(reader *bufio.Reader, maxBytes int64) (string, int64, bool, error) {
+	var line []byte
+	var consumed int64
+	for {
+		fragment, err := reader.ReadSlice('\n')
+		consumed += int64(len(fragment))
+		if consumed <= maxBytes {
+			line = append(line, fragment...)
+		}
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+		return string(line), consumed, err == nil, err
+	}
 }
 
 func terminalJobState(state string) bool {
