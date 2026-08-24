@@ -441,14 +441,14 @@ func (controller *Controller) Serve(ctx context.Context, maxWorkers int, interva
 	if maxWorkers < 1 {
 		return fmt.Errorf("max-workers must be positive")
 	}
-	if err := controller.RecoverInterrupted(); err != nil {
-		return err
-	}
 	listener, err := controller.Listen(socketPath)
 	if err != nil {
 		return err
 	}
 	defer listener.Close()
+	if err := controller.RecoverInterrupted(); err != nil {
+		return err
+	}
 	if interval <= 0 {
 		interval = time.Second
 	}

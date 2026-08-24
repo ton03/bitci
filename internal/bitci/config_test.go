@@ -437,6 +437,69 @@ func TestOwnerSocketRPCAndStaleRecovery(t *testing.T) {
 	}
 }
 
+func TestDuplicateServeDoesNotRecoverRunningJobs(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+	stateDir := filepath.Join(t.TempDir(), "state")
+	owner, err := Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	socketPath := fmt.Sprintf("/tmp/bitci-%d.sock", time.Now().UnixNano())
+	defer os.Remove(socketPath)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ownerDone := make(chan error, 1)
+	go func() { ownerDone <- owner.Serve(ctx, 1, time.Hour, socketPath) }()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if _, err := os.Stat(socketPath); err == nil {
+			break
+		}
+		select {
+		case err := <-ownerDone:
+			t.Fatalf("owner Serve error = %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("owner did not create socket")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	result, err := owner.db.Exec("INSERT INTO jobs(batch, task, ref, state, created_at) VALUES (?, ?, ?, 'running', ?)", "batch", "unit", strings.Repeat("a", 40), time.Now().UTC().Format(time.RFC3339))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicate, err := Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer duplicate.Close()
+	if err := duplicate.Serve(context.Background(), 1, time.Hour, socketPath); err == nil || !strings.Contains(err.Error(), "already owns socket") {
+		t.Fatalf("duplicate Serve error = %v", err)
+	}
+	var state string
+	if err := owner.db.QueryRow("SELECT state FROM jobs WHERE id = ?", id).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != "running" {
+		t.Fatalf("duplicate serve recovered live job as %q", state)
+	}
+	cancel()
+	select {
+	case err := <-ownerDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("owner did not stop")
+	}
+}
+
 func TestMCPReadOnlyTools(t *testing.T) {
 	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
 	stateDir := filepath.Join(t.TempDir(), "state")
