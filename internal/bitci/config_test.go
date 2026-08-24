@@ -911,6 +911,46 @@ func TestJobRunsInRecordedCheckoutSHA(t *testing.T) {
 	}
 }
 
+func TestJobRunsInRecordedSHA256Checkout(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("git", "-C", checkout, "init", "--object-format=sha256", "-q")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Skipf("Git does not support SHA-256 repositories: %s", output)
+	}
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	sha := git(t, checkout, "rev-parse", "HEAD")
+	if len(sha) != 64 {
+		t.Fatalf("SHA-256 checkout SHA length = %d, want 64", len(sha))
+	}
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	jobs, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].Ref != sha {
+		t.Fatalf("ref = %q, want recorded SHA-256 %q", jobs[0].Ref, sha)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	got, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].State != "passed" || got[0].TestedSHA != sha {
+		t.Fatalf("SHA-256 checkout job = %#v", got[0])
+	}
+}
+
 func TestSubmitPinsRecordedCheckoutSHA(t *testing.T) {
 	checkout := t.TempDir()
 	configPath := filepath.Join(checkout, "bitci.json")

@@ -449,7 +449,7 @@ func (controller *Controller) jobCheckout(ctx context.Context, job Job) (string,
 }
 
 func isCheckoutSHA(value string) bool {
-	if len(value) != 40 {
+	if len(value) != 40 && len(value) != 64 {
 		return false
 	}
 	for _, character := range value {
