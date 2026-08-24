@@ -12,11 +12,14 @@ available.
 
 1. Use `plan` before `submit`.
 2. Submit only returned configured task IDs.
-3. Use `status`, then `tail_logs` on failure.
+3. Use `status`, then `read_logs` with its cursor while a job runs.
 4. Use `search_logs` before `retry`.
 
 MCP starts read-only. The user must explicitly enable run-control tools. CLI
 fallback: validate, plan, submit, status, logs, cancel, and retry.
+
+`read_logs` returns capped complete lines, a cursor, and the job state. Pass its
+cursor to the next call. Use `tail_logs` for final context.
 
 Cancel only queued work. Retry only after inspecting the failure. A retry runs
 the configured task and dependencies again.

@@ -34,6 +34,12 @@ type LogParams struct {
 	Query string `json:"query"`
 }
 
+type LogCursorParams struct {
+	ID     int64 `json:"id"`
+	Cursor int64 `json:"cursor"`
+	Limit  int   `json:"limit"`
+}
+
 type SubmitParams struct {
 	TaskIDs []string `json:"task_ids"`
 	Ref     string   `json:"ref"`
@@ -146,6 +152,12 @@ func (controller *Controller) handleRPC(_ context.Context, request RPCRequest) R
 			return RPCResponse{Error: err.Error()}
 		}
 		return result(controller.SearchLog(params.ID, params.Query, params.Limit))
+	case "read_logs":
+		var params LogCursorParams
+		if err := json.Unmarshal(request.Params, &params); err != nil {
+			return RPCResponse{Error: err.Error()}
+		}
+		return result(controller.ReadLog(params.ID, params.Cursor, params.Limit))
 	case "doctor":
 		return result(map[string]string{"disk": "OK"}, controller.DiskOK())
 	case "submit":

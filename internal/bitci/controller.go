@@ -1035,6 +1035,73 @@ func (controller *Controller) SearchLog(id int64, query string, limit int) ([]st
 	return scanLog(file, limit, func(line string) bool { return strings.Contains(line, query) })
 }
 
+const maxLogReadBytes = 1024 * 1024
+
+type LogCursorOutput struct {
+	Lines  []string `json:"lines"`
+	Cursor int64    `json:"cursor"`
+	State  string   `json:"state"`
+}
+
+// ReadLog returns complete lines written after cursor. The cursor advances only
+// after a newline, so a later call can safely read a line still being written.
+func (controller *Controller) ReadLog(id, cursor int64, limit int) (LogCursorOutput, error) {
+	var logPath, state string
+	if err := controller.db.QueryRow("SELECT COALESCE(log_path, ''), state FROM jobs WHERE id = ?", id).Scan(&logPath, &state); err != nil {
+		return LogCursorOutput{}, err
+	}
+	output := LogCursorOutput{Lines: []string{}, Cursor: cursor, State: state}
+	if cursor < 0 {
+		return LogCursorOutput{}, fmt.Errorf("log cursor must not be negative")
+	}
+	if logPath == "" {
+		return output, nil
+	}
+	file, err := os.Open(logPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return output, nil
+		}
+		return LogCursorOutput{}, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return LogCursorOutput{}, err
+	}
+	if cursor > info.Size() {
+		return LogCursorOutput{}, fmt.Errorf("log cursor %d exceeds log size %d", cursor, info.Size())
+	}
+	if _, err := file.Seek(cursor, io.SeekStart); err != nil {
+		return LogCursorOutput{}, err
+	}
+	reader := bufio.NewReader(io.LimitReader(file, maxLogReadBytes))
+	readCursor := cursor
+	limit = logLimit(limit)
+	for len(output.Lines) < limit {
+		line, err := reader.ReadString('\n')
+		readCursor += int64(len(line))
+		if len(line) > 0 && strings.HasSuffix(line, "\n") {
+			output.Lines = append(output.Lines, strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r"))
+			output.Cursor = readCursor
+		} else if len(line) > 0 && err == io.EOF && terminalJobState(state) && readCursor == info.Size() {
+			output.Lines = append(output.Lines, strings.TrimSuffix(line, "\r"))
+			output.Cursor = readCursor
+		}
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return LogCursorOutput{}, err
+		}
+	}
+	return output, nil
+}
+
+func terminalJobState(state string) bool {
+	return state == "passed" || state == "failed" || state == "cancelled"
+}
+
 func (controller *Controller) logFile(id int64) (*os.File, error) {
 	var logPath string
 	if err := controller.db.QueryRow("SELECT COALESCE(log_path, '') FROM jobs WHERE id = ?", id).Scan(&logPath); err != nil {
