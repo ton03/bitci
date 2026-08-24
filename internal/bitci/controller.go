@@ -294,7 +294,7 @@ func checkoutSHA(directory string) (string, error) {
 }
 
 func (controller *Controller) jobCheckout(ctx context.Context, job Job) (string, func() error, error) {
-	cleanup := func() error { return nil }
+	cleanup := func() error { return controller.removeJobWorktree(job.ID) }
 	root := filepath.Join(controller.stateDir, "worktrees")
 	path := filepath.Join(root, fmt.Sprintf("job-%d", job.ID))
 	if err := os.MkdirAll(root, 0o700); err != nil {
@@ -307,23 +307,6 @@ func (controller *Controller) jobCheckout(ctx context.Context, job Job) (string,
 	}
 	if _, err := controller.db.Exec("UPDATE jobs SET cleanup_pending = 1 WHERE id = ?", job.ID); err != nil {
 		return "", cleanup, err
-	}
-	cleanup = func() error {
-		var failures []error
-		if _, err := os.Lstat(path); err == nil {
-			if _, err := controller.git(context.Background(), "worktree", "remove", "--force", path); err != nil {
-				failures = append(failures, err)
-			}
-		} else if !os.IsNotExist(err) {
-			failures = append(failures, err)
-		}
-		if err := os.RemoveAll(path); err != nil {
-			failures = append(failures, err)
-		}
-		if _, err := controller.git(context.Background(), "worktree", "prune"); err != nil {
-			failures = append(failures, err)
-		}
-		return errors.Join(failures...)
 	}
 	if _, err := controller.git(ctx, "worktree", "add", "--detach", path, job.Ref); err != nil {
 		return "", cleanup, fmt.Errorf("create job worktree: %w", err)

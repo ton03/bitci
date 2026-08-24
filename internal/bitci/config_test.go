@@ -731,6 +731,9 @@ func TestJobCheckoutFailureDoesNotPanicOnCleanup(t *testing.T) {
 	if stored[0].State != "failed" || stored[0].ExitCode == nil || *stored[0].ExitCode != 126 {
 		t.Fatalf("failed checkout job = %#v", stored[0])
 	}
+	if _, err := os.Lstat(filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", jobs[0].ID))); !os.IsNotExist(err) {
+		t.Fatalf("failed checkout worktree remains: %v", err)
+	}
 }
 
 func TestQueuedJobUsesSubmittedConfiguration(t *testing.T) {
