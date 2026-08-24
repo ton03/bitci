@@ -950,6 +950,25 @@ func TestServicePlist(t *testing.T) {
 	}
 }
 
+func TestServicePathUsesPrepareExecutable(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"prepare":["sh","-c","true"],"tasks":{"unit":{"run":["true"]}}}`)
+	config, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := servicePath(config, filepath.Dir(configPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(path, filepath.Dir(sh)) {
+		t.Fatalf("service PATH %q misses prepare command directory", path)
+	}
+}
+
 func TestServiceRefusesActiveJobs(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("launchd applies on macOS")

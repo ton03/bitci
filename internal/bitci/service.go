@@ -83,7 +83,10 @@ func servicePath(config Config, checkout string) (string, error) {
 			directories = append(directories, directory)
 		}
 	}
-	commands := append([]string(nil), config.Prepare...)
+	commands := make([]string, 0, len(config.Tasks)+1)
+	if len(config.Prepare) > 0 {
+		commands = append(commands, config.Prepare[0])
+	}
 	for _, name := range config.TaskNames() {
 		commands = append(commands, config.Tasks[name].Run[0])
 	}
