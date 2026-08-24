@@ -179,6 +179,13 @@ func (controller *Controller) handleRPC(_ context.Context, request RPCRequest) R
 			return RPCResponse{Error: err.Error()}
 		}
 		return result(controller.Retry(params.ID))
+	case "recover":
+		var params JobParams
+		if err := json.Unmarshal(request.Params, &params); err != nil {
+			return RPCResponse{Error: err.Error()}
+		}
+		recovered, err := controller.RecoverJob(params.ID)
+		return result(map[string]bool{"recovered": recovered}, err)
 	default:
 		return RPCResponse{Error: fmt.Sprintf("unknown method %q", request.Method)}
 	}

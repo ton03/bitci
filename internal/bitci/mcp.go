@@ -153,4 +153,11 @@ func addRunTools(server *mcp.Server, call func(string, any, any) error) {
 		}
 		return nil, result, nil
 	})
+	mcp.AddTool(server, &mcp.Tool{Name: "recover", Description: "Fail one running job only when its recorded task process is gone."}, func(_ context.Context, _ *mcp.CallToolRequest, input MCPJobInput) (*mcp.CallToolResult, map[string]bool, error) {
+		var result map[string]bool
+		if err := call("recover", JobParams{ID: input.ID}, &result); err != nil {
+			return nil, nil, err
+		}
+		return nil, result, nil
+	})
 }
