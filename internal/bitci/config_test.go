@@ -1,6 +1,7 @@
 package bitci
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -704,6 +705,22 @@ func TestRecoverJobRefusesLiveTaskProcess(t *testing.T) {
 	}
 	if recovered, err := controller.RecoverJob(job.ID); err == nil || recovered {
 		t.Fatalf("live process recovery = %v, %v", recovered, err)
+	}
+}
+
+func TestExecuteRejectsUnrecordedTaskProcessGroup(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	var output bytes.Buffer
+	if code := controller.executeCommand(context.Background(), 999999999, []string{"true"}, 0, &output, t.TempDir()); code != 127 {
+		t.Fatalf("unrecorded process group exit code = %d, want 127", code)
+	}
+	if !strings.Contains(output.String(), "could not record task process group") {
+		t.Fatalf("unrecorded process group output = %q", output.String())
 	}
 }
 

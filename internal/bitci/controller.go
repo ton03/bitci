@@ -1116,13 +1116,22 @@ func (controller *Controller) executeCommandWithEnv(parent context.Context, jobI
 		return 127
 	}
 	pid := command.Process.Pid
-	if _, err := controller.db.Exec("UPDATE jobs SET worker_pid = ? WHERE id = ? AND state = 'running'", pid, jobID); err != nil {
+	result, err := controller.db.Exec("UPDATE jobs SET worker_pid = ? WHERE id = ? AND state = 'running'", pid, jobID)
+	if err == nil {
+		updated, rowsErr := result.RowsAffected()
+		if rowsErr != nil {
+			err = rowsErr
+		} else if updated != 1 {
+			err = fmt.Errorf("job %d is no longer running", jobID)
+		}
+	}
+	if err != nil {
 		_ = syscall.Kill(-pid, syscall.SIGKILL)
 		_ = command.Wait()
 		fmt.Fprintf(output, "BitCI could not record task process group: %v\n", err)
 		return 127
 	}
-	err := command.Wait()
+	err = command.Wait()
 	if _, clearErr := controller.db.Exec("UPDATE jobs SET worker_pid = NULL WHERE id = ? AND worker_pid = ?", jobID, pid); clearErr != nil && err == nil {
 		fmt.Fprintf(output, "BitCI could not clear task process group: %v\n", clearErr)
 		return 127
