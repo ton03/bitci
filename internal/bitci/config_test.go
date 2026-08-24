@@ -1454,6 +1454,23 @@ func TestPathWithinUsesFilesystemIdentity(t *testing.T) {
 	}
 }
 
+func TestContainsCheckoutPathUsesFilesystemCaseAlias(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "BitCI")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(parent, "bitci")
+	if _, err := os.Stat(alias); os.IsNotExist(err) {
+		t.Skip("case-sensitive filesystem")
+	} else if err != nil {
+		t.Fatal(err)
+	}
+	if !containsCheckoutPath("--config="+filepath.Join(alias, "bitci.json"), root) {
+		t.Fatal("case alias should be treated as a checkout path")
+	}
+}
+
 func TestRecordedSHAPreparesEachWorktree(t *testing.T) {
 	checkout := t.TempDir()
 	configPath := filepath.Join(checkout, "bitci.json")
@@ -2436,6 +2453,36 @@ func TestStageProtectsCaseInsensitiveStatePath(t *testing.T) {
 	sha := git(t, checkout, "rev-parse", "HEAD")
 	if err := controller.protectStateFromTarget(context.Background(), sha); err == nil || !strings.Contains(err.Error(), "state files") {
 		t.Fatalf("case-insensitive state protection error = %v", err)
+	}
+}
+
+func TestGitTreeContainsNestedCaseAlias(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(checkout, ".BITCI", "nested"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, ".BITCI", "nested", "poison"), []byte("tracked target"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", ".")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	sha := git(t, checkout, "rev-parse", "HEAD")
+	contains, err := controller.gitTreeContainsCaseAlias(context.Background(), sha, ".bitci/nested")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains {
+		t.Fatal("nested case alias was not found")
 	}
 }
 

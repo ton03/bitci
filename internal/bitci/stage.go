@@ -89,11 +89,18 @@ func (controller *Controller) protectStateFromTarget(ctx context.Context, sha st
 	if !ok {
 		return nil
 	}
-	output, err := controller.git(ctx, "ls-tree", "-r", "--name-only", sha)
+	output, err := controller.git(ctx, "ls-tree", "-r", "--name-only", sha, "--", literalStatePathspec(relative))
 	if err != nil {
 		return err
 	}
-	if gitTreeContainsPath(output, relative) {
+	if strings.TrimSpace(output) != "" {
+		return fmt.Errorf("staged pull request must not contain tracked BitCI state files")
+	}
+	contains, err := controller.gitTreeContainsCaseAlias(ctx, sha, relative)
+	if err != nil {
+		return err
+	}
+	if contains {
 		return fmt.Errorf("staged pull request must not contain tracked BitCI state files")
 	}
 	return nil
@@ -231,14 +238,32 @@ func statePathspec(relative string) string {
 	return ":(top,icase,literal)" + filepath.ToSlash(relative)
 }
 
-func gitTreeContainsPath(output, relative string) bool {
-	relative = filepath.ToSlash(relative)
-	for _, path := range strings.Split(strings.TrimSpace(output), "\n") {
-		if strings.EqualFold(path, relative) || strings.HasPrefix(strings.ToLower(path), strings.ToLower(relative)+"/") {
-			return true
+func literalStatePathspec(relative string) string {
+	return ":(top,literal)" + filepath.ToSlash(relative)
+}
+
+// gitTreeContainsCaseAlias checks one tree level at a time. git ls-tree does
+// not support icase pathspecs on every supported Git version.
+func (controller *Controller) gitTreeContainsCaseAlias(ctx context.Context, sha, relative string) (bool, error) {
+	tree := sha
+	for _, part := range strings.Split(filepath.ToSlash(relative), "/") {
+		output, err := controller.git(ctx, "ls-tree", "-z", "--name-only", tree)
+		if err != nil {
+			return false, err
 		}
+		matched := ""
+		for _, entry := range strings.Split(strings.TrimSuffix(output, "\x00"), "\x00") {
+			if strings.EqualFold(entry, part) {
+				matched = entry
+				break
+			}
+		}
+		if matched == "" {
+			return false, nil
+		}
+		tree += ":" + matched
 	}
-	return false
+	return true, nil
 }
 
 func relativeLexicallyWithin(root, path string) (string, bool) {

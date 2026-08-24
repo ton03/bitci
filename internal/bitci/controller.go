@@ -832,7 +832,12 @@ func (controller *Controller) hasUnsafeCheckoutArgument(argv []string, checkoutR
 
 func containsCheckoutPath(value, checkoutRoot string) bool {
 	checkoutRoot = filepath.Clean(checkoutRoot)
-	return strings.Contains(value, checkoutRoot+string(filepath.Separator)) || value == checkoutRoot
+	if filepath.IsAbs(value) && pathWithin(checkoutRoot, value) {
+		return true
+	}
+	root := strings.ToLower(checkoutRoot)
+	value = strings.ToLower(value)
+	return value == root || strings.Contains(value, root+string(filepath.Separator))
 }
 
 func pathOrAncestorWithin(root, path string) bool {
