@@ -1,5 +1,6 @@
 {
   "version": 1,
+  "prepare": ["npm", "ci"],
   "resources": { "browser": 1 },
   "tasks": {
     "test": {

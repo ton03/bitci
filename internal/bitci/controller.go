@@ -222,7 +222,7 @@ func (controller *Controller) RunOnce(ctx context.Context, maxWorkers int) (bool
 	if err != nil || !claimed {
 		return false, err
 	}
-	_, task, err := controller.jobConfig(job)
+	config, task, err := controller.jobConfig(job)
 	if err != nil {
 		return true, controller.finish(job, 127)
 	}
@@ -244,11 +244,20 @@ func (controller *Controller) RunOnce(ctx context.Context, maxWorkers int) (bool
 			return true, controller.finish(job, 126)
 		}
 	}
-	code := 126
-	if isCheckoutSHA(job.Ref) && controller.isCheckoutExecutable(task.Run[0]) {
+	code := 0
+	if isCheckoutSHA(job.Ref) && len(config.Prepare) > 0 && controller.isCheckoutExecutable(config.Prepare[0]) {
+		fmt.Fprintln(logFile, "BitCI refuses a checkout-local absolute prepare executable for a recorded SHA job")
+		code = 126
+	} else if isCheckoutSHA(job.Ref) && controller.isCheckoutExecutable(task.Run[0]) {
 		fmt.Fprintln(logFile, "BitCI refuses a checkout-local absolute task executable for a recorded SHA job")
+		code = 126
 	} else {
-		code = controller.execute(ctx, task, logFile, workDir)
+		if isCheckoutSHA(job.Ref) && len(config.Prepare) > 0 {
+			code = controller.executeCommand(ctx, config.Prepare, task.Timeout, logFile, workDir)
+		}
+		if code == 0 {
+			code = controller.execute(ctx, task, logFile, workDir)
+		}
 	}
 	if err := cleanup(); err != nil {
 		fmt.Fprintln(logFile, "BitCI could not remove job worktree:", err)
@@ -606,17 +615,21 @@ func (controller *Controller) startLog(job *Job) (*os.File, error) {
 }
 
 func (controller *Controller) execute(parent context.Context, task Task, output io.Writer, directory string) int {
-	if len(task.Run) == 0 || task.Run[0] == "" {
+	return controller.executeCommand(parent, task.Run, task.Timeout, output, directory)
+}
+
+func (controller *Controller) executeCommand(parent context.Context, argv []string, timeout int, output io.Writer, directory string) int {
+	if len(argv) == 0 || argv[0] == "" {
 		fmt.Fprintln(output, "BitCI job has no configured command")
 		return 127
 	}
 	ctx := parent
 	var cancel context.CancelFunc
-	if task.Timeout > 0 {
-		ctx, cancel = context.WithTimeout(parent, time.Duration(task.Timeout)*time.Second)
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(parent, time.Duration(timeout)*time.Second)
 		defer cancel()
 	}
-	command := exec.CommandContext(ctx, task.Run[0], task.Run[1:]...)
+	command := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	command.Dir = directory
 	command.Stdout = output
 	command.Stderr = output

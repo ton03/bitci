@@ -138,7 +138,9 @@ bitci stage-pr --config /srv/project-ci/bitci.json --state-dir /var/lib/bitci/pr
 Copy an example for a [Go backend](examples/go-backend.bitci.json),
 [Node backend](examples/node-backend.bitci.json), or
 [Nx monorepo](examples/nx-monorepo.bitci.json). BitCI runs configured argv; it
-does not require a framework preset.
+does not require a framework preset. SHA-isolated jobs start with tracked files
+only. Use `prepare` for a safe, configured bootstrap that BitCI runs in each
+job worktree before its task; the Node and Nx examples use `npm ci`.
 
 Alpha tags use `v0.0.1-alpha.N`. Each tag builds macOS and Linux archives with
 checksums. See [SECURITY.md](SECURITY.md) before exposing a controller.

@@ -15,6 +15,7 @@ type Config struct {
 	Version      int             `json:"version"`
 	Resources    map[string]int  `json:"resources"`
 	MinFreeBytes uint64          `json:"min_free_bytes"`
+	Prepare      []string        `json:"prepare"`
 	Tasks        map[string]Task `json:"tasks"`
 }
 
@@ -56,6 +57,9 @@ func (config Config) Validate() error {
 	}
 	if len(config.Tasks) == 0 {
 		return fmt.Errorf("tasks must not be empty")
+	}
+	if len(config.Prepare) > 0 && config.Prepare[0] == "" {
+		return fmt.Errorf("prepare needs a command argv")
 	}
 	for name, limit := range config.Resources {
 		if name == "" || limit < 1 {

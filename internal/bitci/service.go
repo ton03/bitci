@@ -75,7 +75,7 @@ func servicePath(config Config, checkout string) (string, error) {
 	if path := os.Getenv("BITCI_PATH"); path != "" {
 		return path, nil
 	}
-	directories := make([]string, 0, len(config.Tasks)+5)
+	directories := make([]string, 0, len(config.Tasks)+6)
 	seen := map[string]bool{}
 	add := func(directory string) {
 		if directory != "" && !seen[directory] {
@@ -83,22 +83,25 @@ func servicePath(config Config, checkout string) (string, error) {
 			directories = append(directories, directory)
 		}
 	}
+	commands := append([]string(nil), config.Prepare...)
 	for _, name := range config.TaskNames() {
-		command := config.Tasks[name].Run[0]
+		commands = append(commands, config.Tasks[name].Run[0])
+	}
+	for _, command := range commands {
 		if strings.ContainsRune(command, filepath.Separator) {
 			if !filepath.IsAbs(command) {
 				command = filepath.Join(checkout, command)
 			}
 			info, err := os.Stat(command)
 			if err != nil || info.IsDir() {
-				return "", fmt.Errorf("resolve configured task command %q", config.Tasks[name].Run[0])
+				return "", fmt.Errorf("resolve configured command %q", command)
 			}
 			add(filepath.Dir(command))
 			continue
 		}
 		resolved, err := exec.LookPath(command)
 		if err != nil {
-			return "", fmt.Errorf("resolve configured task command %q: %w", command, err)
+			return "", fmt.Errorf("resolve configured command %q: %w", command, err)
 		}
 		add(filepath.Dir(resolved))
 	}

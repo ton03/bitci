@@ -1,5 +1,6 @@
 {
   "version": 1,
+  "prepare": ["npm", "ci"],
   "tasks": {
     "test": {
       "run": ["npm", "run", "test"],

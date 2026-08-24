@@ -566,6 +566,48 @@ func TestJobRunsInRecordedCheckoutSHA(t *testing.T) {
 	}
 }
 
+func TestRecordedSHAPreparesEachWorktree(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"prepare":["sh","bootstrap"],"tasks":{"unit":{"run":["sh","runner"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, ".gitignore"), []byte("ready\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, "bootstrap"), []byte(": > ready\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, "runner"), []byte("test -f ready\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json", ".gitignore", "bootstrap", "runner")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "passed" {
+		lines, _ := controller.TailLog(jobs[0].ID, 80)
+		t.Fatalf("prepared checkout job = %#v\n%s", jobs[0], strings.Join(lines, "\n"))
+	}
+	if _, err := os.Stat(filepath.Join(checkout, "ready")); !os.IsNotExist(err) {
+		t.Fatalf("prepare wrote mutable checkout: %v", err)
+	}
+}
+
 func TestJobRunsFromNestedConfigDirectoryWithRelativeState(t *testing.T) {
 	checkout := t.TempDir()
 	configDir := filepath.Join(checkout, "ci")
@@ -755,6 +797,36 @@ func TestNestedConfigChecksWholeCheckout(t *testing.T) {
 	}
 	if err := controller.cleanCheckout(context.Background()); err == nil {
 		t.Fatal("nested config missed root-level checkout dirt")
+	}
+}
+
+func TestCleanCheckoutRejectsTrackedStateFiles(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, ".gitignore"), []byte(".bitci/\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stateDir := filepath.Join(checkout, ".bitci")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stateDir, "tracked"), []byte("source"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json", ".gitignore")
+	git(t, checkout, "add", "-f", ".bitci/tracked")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if err := controller.cleanCheckout(context.Background()); err == nil || !strings.Contains(err.Error(), "tracked files") {
+		t.Fatalf("tracked state checkout error = %v", err)
 	}
 }
 
