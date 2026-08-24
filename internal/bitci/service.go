@@ -104,10 +104,10 @@ func servicePath(config Config, checkout string) (string, error) {
 	}
 	for _, configured := range commands {
 		command := configured.name
+		if !configured.requireExists {
+			continue
+		}
 		if strings.ContainsRune(command, filepath.Separator) {
-			if !configured.requireExists {
-				continue
-			}
 			if !filepath.IsAbs(command) {
 				command = filepath.Join(checkout, command)
 			}

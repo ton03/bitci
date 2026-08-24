@@ -180,7 +180,7 @@ func (controller *Controller) cleanCheckout(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if strings.TrimSpace(tracked) != "" {
+		if tracked != "" {
 			return fmt.Errorf("state directory must not contain tracked files")
 		}
 		args = append(args, "--", ":(top)", ":(top,exclude,icase,literal)"+filepath.ToSlash(relative))

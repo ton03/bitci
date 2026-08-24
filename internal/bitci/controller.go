@@ -92,7 +92,7 @@ func OpenState(configPath, stateDir string) (*Controller, error) {
 	if gitDirectory, err := gitCommonDirectory(configPath); err == nil && pathsOverlap(stateDir, gitDirectory) {
 		return nil, fmt.Errorf("state directory must not overlap Git metadata")
 	}
-	if stateInsideGitMetadata(stateDir) {
+	if stateInsideGitMetadata(resolvedPathForComparison(stateDir)) {
 		return nil, fmt.Errorf("state directory must not overlap Git metadata")
 	}
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
@@ -330,7 +330,10 @@ func (controller *Controller) RunOnce(ctx context.Context, maxWorkers int) (bool
 		worktreeRoot = filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", job.ID))
 	}
 	code := 0
-	if isCheckoutSHA(job.Ref) && len(config.Prepare) > 0 && controller.hasUnsafeCheckoutCommand(config.Prepare, job.checkoutRoot, worktreeRoot, workDir, nil) {
+	if isCheckoutSHA(job.Ref) && !controller.workDirWithinWorktree(worktreeRoot, workDir) {
+		fmt.Fprintln(logFile, "BitCI refuses a task work directory outside the recorded worktree")
+		code = 126
+	} else if isCheckoutSHA(job.Ref) && len(config.Prepare) > 0 && controller.hasUnsafeCheckoutCommand(config.Prepare, job.checkoutRoot, worktreeRoot, workDir, nil) {
 		fmt.Fprintln(logFile, "BitCI refuses an unsafe checkout-local prepare argument for a recorded SHA job")
 		code = 126
 	} else {
@@ -877,8 +880,8 @@ func (controller *Controller) isCheckoutExecutable(command, checkoutRoot, worktr
 	if relativeCheckoutPath && worktreeRoot != "" && !pathWithin(resolvedPathForComparison(worktreeRoot), resolvedPathForComparison(path)) {
 		return true
 	}
-	if worktreeRoot != "" && pathWithin(resolvedPathForComparison(worktreeRoot), resolvedPath) {
-		return false
+	if worktreeRoot != "" && pathWithin(worktreeRoot, path) {
+		return !pathWithin(resolvedPathForComparison(worktreeRoot), resolvedPath)
 	}
 	return pathWithin(root, resolvedPath)
 }
@@ -1205,11 +1208,9 @@ func (controller *Controller) finish(job Job, code int, cleanupPending bool) err
 	if err != nil {
 		return err
 	}
-	if err := controller.pruneLogs(); err != nil {
-		return err
-	}
-	_, err = controller.db.Exec("DELETE FROM leases WHERE job_id = ?", job.ID)
-	return err
+	pruneErr := controller.pruneLogs()
+	_, leaseErr := controller.db.Exec("DELETE FROM leases WHERE job_id = ?", job.ID)
+	return errors.Join(pruneErr, leaseErr)
 }
 
 func (controller *Controller) Jobs() ([]Job, error) {
@@ -1349,7 +1350,9 @@ func (controller *Controller) ReadLog(id, cursor int64, limit int) (LogCursorOut
 			output.Lines = append(output.Lines, redactLogLine(strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r"), redact))
 			output.Cursor = readCursor
 		} else if len(line) > 0 && err == io.EOF && terminalJobState(state) && readCursor == info.Size() {
-			output.Lines = append(output.Lines, redactLogLine(strings.TrimSuffix(line, "\r"), redact))
+			if consumed <= remaining {
+				output.Lines = append(output.Lines, redactLogLine(strings.TrimSuffix(line, "\r"), redact))
+			}
 			output.Cursor = readCursor
 		}
 		if err != nil {

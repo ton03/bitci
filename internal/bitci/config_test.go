@@ -227,6 +227,47 @@ func TestLogRetentionIgnoresJobsWithoutLogs(t *testing.T) {
 	}
 }
 
+func TestFinishReleasesLeaseWhenLogPruningFails(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"log_retention":1,"resources":{"cpu":1},"tasks":{"unit":{"run":["true"],"resources":["cpu"]}}}`)
+	stateDir := filepath.Join(t.TempDir(), "state")
+	controller, err := Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	oldLog := filepath.Join(stateDir, "logs", "cannot-remove")
+	if err := os.MkdirAll(oldLog, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(oldLog, "locked"), []byte("log"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.db.Exec("INSERT INTO jobs(batch, task, ref, state, created_at, finished_at, log_path) VALUES ('old', 'unit', '', 'passed', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', ?)", oldLog); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.Submit([]string{"unit"}, "manual"); err != nil {
+		t.Fatal(err)
+	}
+	job, claimed, err := controller.claim(1)
+	if err != nil || !claimed {
+		t.Fatalf("claim = %v, %v", claimed, err)
+	}
+	job.LogPath = filepath.Join(stateDir, "logs", "current.log")
+	if err := os.WriteFile(job.LogPath, []byte("log"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.finish(job, 0, false); err == nil {
+		t.Fatal("finish succeeded despite log pruning failure")
+	}
+	var leases int
+	if err := controller.db.QueryRow("SELECT COUNT(*) FROM leases WHERE job_id = ?", job.ID).Scan(&leases); err != nil {
+		t.Fatal(err)
+	}
+	if leases != 0 {
+		t.Fatalf("terminal job retains %d leases", leases)
+	}
+}
+
 func TestStackExamplesValidate(t *testing.T) {
 	root := filepath.Clean(filepath.Join("..", ".."))
 	for _, name := range []string{"go-backend", "node-backend", "nx-monorepo"} {
@@ -278,6 +319,24 @@ func TestOpenStateRejectsStateInsideGitMetadata(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(checkout, ".git", "bitci.db")); !os.IsNotExist(err) {
 		t.Fatalf("created rejected state database: %v", err)
+	}
+}
+
+func TestOpenStateRejectsStateSymlinkToOtherGitMetadata(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "missing-bitci.json")
+	otherCheckout := t.TempDir()
+	git(t, otherCheckout, "init", "-q")
+	stateLink := filepath.Join(t.TempDir(), "state")
+	if err := os.Symlink(filepath.Join(otherCheckout, ".git"), stateLink); err != nil {
+		t.Fatal(err)
+	}
+	controller, err := OpenState(configPath, stateLink)
+	if err == nil {
+		controller.Close()
+		t.Fatal("opened state through a Git metadata symlink")
+	}
+	if !strings.Contains(err.Error(), "state directory must not overlap Git metadata") {
+		t.Fatalf("OpenState error = %v", err)
 	}
 }
 
@@ -1182,6 +1241,35 @@ func TestReadLogKeepsLiveIncompleteCursorAtCap(t *testing.T) {
 	logs, err := controller.ReadLog(id, 0, 80)
 	if err != nil || len(logs.Lines) != 0 || logs.Cursor != 0 {
 		t.Fatalf("live capped log = %#v, %v", logs, err)
+	}
+}
+
+func TestReadLogSkipsOversizedTerminalPartialLine(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+	stateDir := filepath.Join(t.TempDir(), "state")
+	controller, err := Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	logPath := filepath.Join(stateDir, "logs", "terminal-capped.log")
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath, []byte(strings.Repeat("x", maxLogReadBytes+1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := controller.db.Exec("INSERT INTO jobs(batch, task, ref, state, created_at, log_path) VALUES ('batch', 'unit', '', 'passed', '2026-01-01T00:00:00Z', ?)", logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs, err := controller.ReadLog(id, 0, 80)
+	if err != nil || len(logs.Lines) != 0 || logs.Cursor <= maxLogReadBytes {
+		t.Fatalf("terminal capped log = %#v, %v", logs, err)
 	}
 }
 
@@ -2152,6 +2240,20 @@ func TestRecordedSHARejectsBareInterpreterScriptSymlink(t *testing.T) {
 	}
 }
 
+func TestRecordedSHARejectsPATHExecutableSymlinkOutsideWorktree(t *testing.T) {
+	worktree := t.TempDir()
+	external := filepath.Join(t.TempDir(), "runner")
+	if err := os.WriteFile(external, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(external, filepath.Join(worktree, "runner")); err != nil {
+		t.Fatal(err)
+	}
+	if !(&Controller{}).isCheckoutExecutable("runner", t.TempDir(), worktree, worktree, []string{"PATH=."}) {
+		t.Fatal("accepted PATH executable that escapes the recorded worktree")
+	}
+}
+
 func TestUnsafeTaskEnvironmentRejectsGitMetadataPaths(t *testing.T) {
 	for name, value := range map[string]string{
 		"GIT_DIR":        "../../../.git",
@@ -2762,6 +2864,14 @@ func TestServicePathUsesPrepareExecutable(t *testing.T) {
 func TestServicePathAllowsTaskExecutableCreatedByPrepare(t *testing.T) {
 	checkout := t.TempDir()
 	_, err := servicePath(Config{Prepare: []string{"true"}, Tasks: map[string]Task{"unit": {Run: []string{"./node_modules/.bin/unit"}}}}, checkout)
+	if err != nil {
+		t.Fatalf("service path error = %v", err)
+	}
+}
+
+func TestServicePathAllowsBareTaskExecutableCreatedByPrepare(t *testing.T) {
+	checkout := t.TempDir()
+	_, err := servicePath(Config{Prepare: []string{"true"}, Tasks: map[string]Task{"unit": {Run: []string{"unit"}, Env: map[string]string{"PATH": "."}}}}, checkout)
 	if err != nil {
 		t.Fatalf("service path error = %v", err)
 	}
