@@ -35,6 +35,10 @@ func NewService(configPath, stateDir string, maxWorkers int) (Service, error) {
 	if err != nil {
 		return Service{}, err
 	}
+	absoluteConfig, err = filepath.EvalSymlinks(absoluteConfig)
+	if err != nil {
+		return Service{}, fmt.Errorf("resolve config file: %w", err)
+	}
 	if stateDir == "" {
 		stateDir = DefaultStateDir(absoluteConfig, "")
 	}
@@ -106,7 +110,8 @@ func servicePath(config Config, checkout string) (string, error) {
 	for _, configured := range commands {
 		command := configured.name
 		if strings.ContainsRune(command, filepath.Separator) {
-			if !filepath.IsAbs(command) {
+			absolute := filepath.IsAbs(command)
+			if !absolute {
 				command = filepath.Join(checkout, command)
 			}
 			info, err := os.Stat(command)
@@ -119,17 +124,21 @@ func servicePath(config Config, checkout string) (string, error) {
 			if info.IsDir() {
 				return "", fmt.Errorf("configured command %q is a directory", command)
 			}
-			add(filepath.Dir(command))
+			if absolute {
+				add(filepath.Dir(command))
+			}
 			continue
 		}
-		resolved, err := lookPath(command, taskEnvironment(configured.environment), checkout)
+		resolved, err := lookPath(command, taskEnvironment(configured.environment, checkout), checkout)
 		if err != nil {
 			if !configured.requireExists && errors.Is(err, exec.ErrNotFound) {
 				continue
 			}
 			return "", fmt.Errorf("resolve configured command %q: %w", command, err)
 		}
-		add(filepath.Dir(resolved))
+		if _, configuredPath := configured.environment["PATH"]; !configuredPath {
+			add(filepath.Dir(resolved))
+		}
 	}
 	for _, directory := range []string{"/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"} {
 		add(directory)

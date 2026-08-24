@@ -96,14 +96,48 @@ func (controller *Controller) protectStateFromTarget(ctx context.Context, sha st
 	if output != "" {
 		return fmt.Errorf("staged pull request must not contain tracked BitCI state files")
 	}
-	output, err = controller.git(ctx, "ls-tree", "-r", "-z", "--name-only", sha)
-	if err != nil {
-		return err
-	}
-	if gitTreeContainsPath(output, relative) {
-		return fmt.Errorf("staged pull request must not contain tracked BitCI state files")
+	if caseInsensitiveFilesystem(controller.gitDirectory()) {
+		contains, err := controller.gitTreeContainsCaseFoldedPath(ctx, sha, relative)
+		if err != nil {
+			return err
+		}
+		if contains {
+			return fmt.Errorf("staged pull request must not contain tracked BitCI state files")
+		}
 	}
 	return nil
+}
+
+func (controller *Controller) gitTreeContainsCaseFoldedPath(ctx context.Context, sha, relative string) (bool, error) {
+	tree := sha + "^{tree}"
+	parts := strings.Split(filepath.ToSlash(relative), "/")
+	for index, part := range parts {
+		output, err := controller.git(ctx, "ls-tree", "-z", tree)
+		if err != nil {
+			return false, err
+		}
+		matched := false
+		for _, record := range strings.Split(output, "\x00") {
+			metadata, name, ok := strings.Cut(record, "\t")
+			fields := strings.Fields(metadata)
+			if !ok || len(fields) != 3 || !strings.EqualFold(name, part) {
+				continue
+			}
+			if index == len(parts)-1 {
+				return true, nil
+			}
+			if fields[1] != "tree" {
+				return false, nil
+			}
+			tree = fields[2]
+			matched = true
+			break
+		}
+		if !matched {
+			return false, nil
+		}
+	}
+	return false, nil
 }
 
 func (controller *Controller) noActiveJobs() error {
@@ -118,6 +152,9 @@ func (controller *Controller) noActiveJobs() error {
 }
 
 func (controller *Controller) cleanGeneratedNext(ctx context.Context) error {
+	if _, _, err := controller.checkoutStatePath(); err != nil {
+		return err
+	}
 	nextRelative := filepath.Join(controller.configRelative, ".next")
 	nextPath := filepath.Join(controller.gitDirectory(), nextRelative)
 	if pathsOverlap(nextPath, controller.stateDir) {
@@ -173,14 +210,19 @@ func (controller *Controller) cleanCheckout(ctx context.Context) error {
 		return err
 	}
 	if ok {
-		tracked, err := controller.git(ctx, "ls-files", "--", statePathspec(relative))
+		foldCase := caseInsensitiveFilesystem(controller.gitDirectory())
+		tracked, err := controller.git(ctx, "ls-files", "--", statePathspec(relative, foldCase))
 		if err != nil {
 			return err
 		}
 		if tracked != "" {
 			return fmt.Errorf("state directory must not contain tracked files")
 		}
-		args = append(args, "--", ":(top)", ":(top,exclude,icase,literal)"+filepath.ToSlash(relative))
+		exclude := ":(top,exclude,literal)" + filepath.ToSlash(relative)
+		if foldCase {
+			exclude = ":(top,exclude,icase,literal)" + filepath.ToSlash(relative)
+		}
+		args = append(args, "--", ":(top)", exclude)
 	}
 	output, err := controller.git(ctx, args...)
 	if err != nil {
@@ -234,21 +276,38 @@ func (controller *Controller) checkoutStatePath() (string, bool, error) {
 	return relative, true, nil
 }
 
-func statePathspec(relative string) string {
-	return ":(top,icase,literal)" + filepath.ToSlash(relative)
+func statePathspec(relative string, foldCase bool) string {
+	magic := ":(top,literal)"
+	if foldCase {
+		magic = ":(top,icase,literal)"
+	}
+	return magic + filepath.ToSlash(relative)
 }
 
-func gitTreeContainsPath(output, relative string) bool {
-	relative = filepath.ToSlash(relative)
-	for _, path := range strings.Split(output, "\x00") {
-		if path == "" {
-			continue
+func caseInsensitiveFilesystem(path string) bool {
+	path = resolvedPathForComparison(path)
+	for current := path; ; current = filepath.Dir(current) {
+		base := filepath.Base(current)
+		for index, character := range base {
+			var replacement rune
+			switch {
+			case 'a' <= character && character <= 'z':
+				replacement = character - ('a' - 'A')
+			case 'A' <= character && character <= 'Z':
+				replacement = character + ('a' - 'A')
+			default:
+				continue
+			}
+			alias := filepath.Join(filepath.Dir(current), base[:index]+string(replacement)+base[index+1:])
+			originalInfo, originalErr := os.Stat(current)
+			aliasInfo, aliasErr := os.Stat(alias)
+			return originalErr == nil && aliasErr == nil && os.SameFile(originalInfo, aliasInfo)
 		}
-		if strings.EqualFold(path, relative) || strings.HasPrefix(strings.ToLower(path), strings.ToLower(relative)+"/") {
-			return true
+		parent := filepath.Dir(current)
+		if parent == current {
+			return false
 		}
 	}
-	return false
 }
 
 func relativeLexicallyWithin(root, path string) (string, bool) {
