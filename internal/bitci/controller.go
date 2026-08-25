@@ -2153,13 +2153,13 @@ func (controller *Controller) terminateJobProcessGroup(id int64) error {
 		if errors.Is(err, syscall.ESRCH) {
 			return os.Remove(path)
 		}
-		if errors.Is(err, syscall.EPERM) {
+		if err == nil || errors.Is(err, syscall.EPERM) {
 			output, psErr := exec.Command("ps", "-o", "pid=,pgid=,stat=", "-g", strconv.Itoa(pid)).Output()
 			if psErr != nil || allProcessGroupEntriesZombie(output) {
 				return os.Remove(path)
 			}
 		}
-		if err != nil {
+		if err != nil && !errors.Is(err, syscall.EPERM) {
 			return fmt.Errorf("check recorded job process group: %w", err)
 		}
 		if time.Now().After(deadline) {
