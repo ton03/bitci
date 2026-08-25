@@ -48,10 +48,10 @@ Validate it:
 bitci validate
 ```
 
-For a quick local run, start the controller in one terminal:
+Start the local controller and dashboard:
 
 ```sh
-bitci serve --max-workers 2
+bitci serve --max-workers 2 --http 127.0.0.1:8787
 ```
 
 Then submit configured task IDs:
@@ -65,6 +65,11 @@ bitci logs --tail 80 1
 
 `serve` owns the queue. It starts only submitted tasks. Use the macOS service
 below when this project needs an always-on controller.
+
+Open `http://127.0.0.1:8787` for the local, read-only dashboard. It refreshes
+every three seconds and shows job state, tested SHA, timing, resource leases,
+disk space, capped logs, and the average duration of passing jobs in seven days.
+The dashboard only accepts the loopback address. It has no task controls.
 
 ## How it works
 
@@ -121,10 +126,13 @@ flags such as `sh -c` and `node -e` because they bypass path checks.
 Install BitCI once in a permanent location. Use `go install` above, or keep a
 Release binary at a permanent path.
 
-From the project root, this one command installs and starts the local service:
+From the project root, these commands install and start the local service:
 
 ```sh
-bitci service --max-workers 2 install
+mkdir -p "$HOME/.local/bin"
+go build -o "$HOME/.local/bin/bitci" ./cmd/bitci
+"$HOME/.local/bin/bitci" service --max-workers 2 --http 127.0.0.1:8787 install
+"$HOME/.local/bin/bitci" service status
 ```
 
 Run this only once per project. Running it again safely replaces the same

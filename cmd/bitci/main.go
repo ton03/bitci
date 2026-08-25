@@ -36,6 +36,7 @@ func run(args []string) error {
 	maxWorkers := flags.Int("max-workers", 1, "maximum running tasks")
 	interval := flags.Duration("interval", time.Second, "queue poll interval")
 	socketPath := flags.String("socket", "", "owner Unix socket path")
+	httpAddress := flags.String("http", "", "dashboard address (must be 127.0.0.1:PORT)")
 	allowRuns := flags.Bool("allow-runs", false, "enable MCP run-control tools")
 	jsonOutput := flags.Bool("json", false, "JSON output")
 	logLimit := flags.Int("tail", 80, "maximum log lines, capped at 80")
@@ -56,7 +57,7 @@ func run(args []string) error {
 		return err
 	}
 	if command == "service" {
-		return runService(flags.Args(), *configPath, *stateDir, *maxWorkers)
+		return runService(flags.Args(), *configPath, *stateDir, *maxWorkers, *httpAddress)
 	}
 	if command == "mcp" {
 		if flags.NArg() != 0 {
@@ -110,7 +111,7 @@ func run(args []string) error {
 	case "serve":
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
-		return controller.Serve(ctx, *maxWorkers, *interval, *socketPath)
+		return controller.Serve(ctx, *maxWorkers, *interval, *socketPath, *httpAddress)
 	case "status":
 		jobs, err := controller.Jobs()
 		if err != nil {
@@ -180,11 +181,11 @@ func run(args []string) error {
 	}
 }
 
-func runService(args []string, configPath, stateDir string, maxWorkers int) error {
+func runService(args []string, configPath, stateDir string, maxWorkers int, httpAddress string) error {
 	if len(args) != 1 {
 		return fmt.Errorf("service needs install, status, or uninstall")
 	}
-	service, err := bitci.NewService(configPath, stateDir, maxWorkers)
+	service, err := bitci.NewServiceWithHTTP(configPath, stateDir, maxWorkers, httpAddress)
 	if err != nil {
 		return err
 	}

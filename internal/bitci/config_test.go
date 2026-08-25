@@ -1012,6 +1012,19 @@ func TestDuplicateServeDoesNotRecoverRunningJobs(t *testing.T) {
 	}
 }
 
+func TestServeRejectsExtraDashboardAddresses(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	err = controller.Serve(context.Background(), 1, time.Second, "", "127.0.0.1:8181", "127.0.0.1:8182")
+	if err == nil || !strings.Contains(err.Error(), "at most one dashboard address") {
+		t.Fatalf("extra dashboard addresses error = %v", err)
+	}
+}
+
 func TestMCPReadOnlyTools(t *testing.T) {
 	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
 	stateDir := filepath.Join(t.TempDir(), "state")
@@ -1466,6 +1479,157 @@ func TestRetryPinsLegacyRecordedSHA(t *testing.T) {
 	pinned := git(t, checkout, "rev-parse", "--verify", "refs/bitci/jobs/"+retried[0].Batch+"^{commit}")
 	if pinned != original[0].Ref {
 		t.Fatalf("pinned retry SHA = %q, want %q", pinned, original[0].Ref)
+	}
+}
+
+func TestDashboardContract(t *testing.T) {
+	configPath := writeConfig(t, `{
+		"version":1,
+		"resources":{"browser":1},
+		"min_free_bytes":1048576,
+		"tasks":{"unit":{"run":["true"],"timeout_seconds":30,"resources":["browser"]}}
+	}`)
+	stateDir := filepath.Join(t.TempDir(), "state")
+	controller, err := Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	now := time.Now().UTC().Truncate(time.Second)
+	insert := func(state string, created, started, finished time.Time, sha, logPath string) int64 {
+		t.Helper()
+		result, err := controller.db.Exec(
+			"INSERT INTO jobs(batch, task, ref, tested_sha, state, created_at, started_at, finished_at, log_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			"batch", "unit", sha, sha, state, created.Format(time.RFC3339), started.Format(time.RFC3339), finished.Format(time.RFC3339), logPath,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, err := result.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	logPath := filepath.Join(stateDir, "logs", "job-1.log")
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath, []byte("first\nsecond\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	passedID := insert("passed", now.Add(-4*time.Minute), now.Add(-3*time.Minute), now.Add(-time.Minute), "0123456789012345678901234567890123456789", logPath)
+	insert("failed", now.Add(-3*time.Minute), now.Add(-2*time.Minute), now.Add(-90*time.Second), "abcdefabcdefabcdefabcdefabcdefabcdefabcd", "")
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	response := httptest.NewRecorder()
+	controller.DashboardHandler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("dashboard status = %d", response.Code)
+	}
+	body := response.Body.String()
+	for _, value := range []string{"Recent jobs", "0123456789012345678901234567890123456789", "2m0s", "avg passed · 7d (1)", "1.0 MiB", "0/1"} {
+		if !strings.Contains(body, value) {
+			t.Fatalf("dashboard missing %q: %s", value, body)
+		}
+	}
+	logRequest := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/jobs/%d/logs", passedID), nil)
+	logResponse := httptest.NewRecorder()
+	controller.DashboardHandler().ServeHTTP(logResponse, logRequest)
+	if logResponse.Code != http.StatusOK || logResponse.Body.String() != "first\nsecond" {
+		t.Fatalf("dashboard log = %d %q", logResponse.Code, logResponse.Body.String())
+	}
+}
+
+func TestDashboardUsesJobConfigSnapshot(t *testing.T) {
+	configPath := writeConfig(t, `{
+		"version":1,
+		"resources":{"current":1},
+		"tasks":{"unit":{"run":["true"],"timeout_seconds":60,"resources":["current"]}}
+	}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	oldConfig := Config{Version: 1, Resources: map[string]int{"previous": 2}, Tasks: map[string]Task{"unit": {Run: []string{"true"}, Timeout: 30, Resources: []string{"previous"}}}}
+	oldJSON, err := json.Marshal(oldConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknownConfig := Config{Version: 1, Tasks: map[string]Task{"other": {Run: []string{"true"}}}}
+	unknownJSON, err := json.Marshal(unknownConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, configJSON := range []string{string(oldJSON), string(unknownJSON)} {
+		if _, err := controller.db.Exec("INSERT INTO jobs(batch, task, ref, config_json, state, created_at) VALUES (?, ?, ?, ?, ?, ?)", "batch", "unit", "ref", configJSON, "queued", time.Now().UTC().Format(time.RFC3339)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	page, err := controller.dashboardData(time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := page.Jobs[0].Timeout, "30s"; got != want {
+		t.Fatalf("snapshot timeout = %q, want %q", got, want)
+	}
+	if got, want := page.Jobs[0].Resources, "previous"; got != want {
+		t.Fatalf("snapshot resources = %q, want %q", got, want)
+	}
+	if got, want := page.Jobs[1].Timeout, "unavailable"; got != want {
+		t.Fatalf("unknown task timeout = %q, want %q", got, want)
+	}
+	if got, want := page.Jobs[1].Resources, "unavailable"; got != want {
+		t.Fatalf("unknown task resources = %q, want %q", got, want)
+	}
+}
+
+func TestDashboardCountsCancelledJobs(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.db.Exec("INSERT INTO jobs(batch, task, ref, state, created_at, finished_at) VALUES (?, ?, ?, ?, ?, ?)", "batch", "unit", "ref", "cancelled", time.Now().UTC().Add(-time.Minute).Format(time.RFC3339), time.Now().UTC().Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	page, err := controller.dashboardData(time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, count := range page.Counts {
+		if count.State == "cancelled" {
+			if count.Count != 1 {
+				t.Fatalf("cancelled count = %d, want 1", count.Count)
+			}
+			return
+		}
+	}
+	t.Fatal("dashboard omitted cancelled count")
+}
+
+func TestDashboardBindsLoopbackOnly(t *testing.T) {
+	for _, address := range []string{"localhost:8787", "0.0.0.0:8787", "127.0.0.1:0", "127.0.0.1:not-a-port"} {
+		if listener, err := listenDashboard(address); err == nil {
+			listener.Close()
+			t.Fatalf("dashboard accepted %q", address)
+		}
+	}
+	reserved, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := reserved.Addr().String()
+	if err := reserved.Close(); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := listenDashboard(address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -3639,7 +3803,7 @@ func TestServicePlist(t *testing.T) {
 		t.Skip("launchd applies on macOS")
 	}
 	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
-	service, err := NewService(configPath, filepath.Join(t.TempDir(), "state"), 3)
+	service, err := NewServiceWithHTTP(configPath, filepath.Join(t.TempDir(), "state"), 3, "127.0.0.1:8787")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3651,7 +3815,7 @@ func TestServicePlist(t *testing.T) {
 		t.Fatalf("service PATH %q misses configured command directory", service.PathEnv)
 	}
 	plist := service.plist()
-	for _, value := range []string{"<key>KeepAlive</key><true/>", "<string>serve</string>", service.ConfigPath, service.StateDir, "<key>EnvironmentVariables</key><dict><key>PATH</key>", service.PathEnv} {
+	for _, value := range []string{"<key>KeepAlive</key><true/>", "<string>serve</string>", "<string>--http</string>", "<string>127.0.0.1:8787</string>", service.ConfigPath, service.StateDir, "<key>EnvironmentVariables</key><dict><key>PATH</key>", service.PathEnv} {
 		if !strings.Contains(plist, value) {
 			t.Fatalf("plist missing %q", value)
 		}

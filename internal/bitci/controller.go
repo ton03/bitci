@@ -12,6 +12,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -52,6 +54,9 @@ type Job struct {
 	Ref            string `json:"ref"`
 	TestedSHA      string `json:"tested_sha,omitempty"`
 	State          string `json:"state"`
+	CreatedAt      string `json:"created_at"`
+	StartedAt      string `json:"started_at,omitempty"`
+	FinishedAt     string `json:"finished_at,omitempty"`
 	ExitCode       *int   `json:"exit_code,omitempty"`
 	LogPath        string `json:"log_path,omitempty"`
 	configJSON     string
@@ -369,9 +374,10 @@ func (controller *Controller) submit(ctx context.Context, config Config, taskNam
 		return nil, err
 	}
 	for _, taskName := range ordered {
+		createdAt := timestamp()
 		result, err := transaction.Exec(
 			"INSERT INTO jobs(batch, task, ref, config_json, checkout_root, config_relative, state, created_at) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)",
-			batch, taskName, ref, configJSON, checkoutRoot, configRelative, timestamp(),
+			batch, taskName, ref, configJSON, checkoutRoot, configRelative, createdAt,
 		)
 		if err != nil {
 			return nil, err
@@ -380,7 +386,7 @@ func (controller *Controller) submit(ctx context.Context, config Config, taskNam
 		if err != nil {
 			return nil, err
 		}
-		jobs = append(jobs, Job{ID: id, Batch: batch, Task: taskName, Ref: ref, State: "queued", checkoutRoot: checkoutRoot, configRelative: configRelative})
+		jobs = append(jobs, Job{ID: id, Batch: batch, Task: taskName, Ref: ref, State: "queued", CreatedAt: createdAt, checkoutRoot: checkoutRoot, configRelative: configRelative})
 	}
 	refCreated := false
 	if recordedRef {
@@ -865,9 +871,12 @@ func timestamp() string {
 	return time.Now().UTC().Format(time.RFC3339Nano)
 }
 
-func (controller *Controller) Serve(ctx context.Context, maxWorkers int, interval time.Duration, socketPath string) error {
+func (controller *Controller) Serve(ctx context.Context, maxWorkers int, interval time.Duration, socketPath string, httpAddresses ...string) error {
 	if maxWorkers < 1 {
 		return fmt.Errorf("max-workers must be positive")
+	}
+	if len(httpAddresses) > 1 {
+		return fmt.Errorf("serve accepts at most one dashboard address")
 	}
 	release, err := controller.acquireOwner()
 	if err != nil {
@@ -882,12 +891,25 @@ func (controller *Controller) Serve(ctx context.Context, maxWorkers int, interva
 	if err := controller.RecoverInterrupted(); err != nil {
 		return err
 	}
+	httpAddress := ""
+	if len(httpAddresses) > 0 {
+		httpAddress = httpAddresses[0]
+	}
+	var dashboard *http.Server
+	var dashboardListener net.Listener
+	if httpAddress != "" {
+		dashboardListener, err = listenDashboard(httpAddress)
+		if err != nil {
+			return err
+		}
+		dashboard = &http.Server{Handler: controller.DashboardHandler(), ReadHeaderTimeout: 5 * time.Second}
+	}
 	if interval <= 0 {
 		interval = time.Second
 	}
 	runContext, cancel := context.WithCancel(ctx)
 	defer cancel()
-	errors := make(chan error, maxWorkers+1)
+	errors := make(chan error, maxWorkers+2)
 	var workers sync.WaitGroup
 	workers.Add(1)
 	go func() {
@@ -896,6 +918,14 @@ func (controller *Controller) Serve(ctx context.Context, maxWorkers int, interva
 			errors <- err
 		}
 	}()
+	if dashboard != nil {
+		go func() {
+			err := dashboard.Serve(dashboardListener)
+			if err != nil && err != http.ErrServerClosed {
+				errors <- err
+			}
+		}()
+	}
 	for worker := 0; worker < maxWorkers; worker++ {
 		workers.Add(1)
 		go func() {
@@ -906,6 +936,12 @@ func (controller *Controller) Serve(ctx context.Context, maxWorkers int, interva
 	shutdown := func() {
 		cancel()
 		_ = listener.Close()
+		if dashboard != nil {
+			shutdownContext, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = dashboard.Shutdown(shutdownContext)
+			shutdownCancel()
+			_ = dashboardListener.Close()
+		}
 		workers.Wait()
 	}
 	for {
@@ -2070,8 +2106,15 @@ func (controller *Controller) executeCommandWithEnv(parent context.Context, argv
 	command := exec.CommandContext(ctx, program, argv[1:]...)
 	command.Dir = directory
 	command.Env = env
-	command.Stdout = output
-	command.Stderr = output
+	if output == io.Discard {
+		// A non-file writer makes os/exec create pipes. A background descendant
+		// can keep those pipes open after the task exits and block Wait.
+		command.Stdout = nil
+		command.Stderr = nil
+	} else {
+		command.Stdout = output
+		command.Stderr = output
+	}
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := command.Start(); err != nil {
 		fmt.Fprintf(output, "BitCI could not start task: %v\n", err)
@@ -2228,7 +2271,7 @@ func (controller *Controller) finish(job Job, code int, cleanupPending bool) err
 }
 
 func (controller *Controller) Jobs() ([]Job, error) {
-	rows, err := controller.db.Query("SELECT id, batch, task, ref, COALESCE(tested_sha, ''), state, exit_code, COALESCE(log_path, '') FROM jobs ORDER BY id")
+	rows, err := controller.db.Query("SELECT id, batch, task, ref, COALESCE(tested_sha, ''), state, created_at, COALESCE(started_at, ''), COALESCE(finished_at, ''), exit_code, COALESCE(log_path, ''), COALESCE(config_json, '') FROM jobs ORDER BY id")
 	if err != nil {
 		return nil, err
 	}
@@ -2236,7 +2279,7 @@ func (controller *Controller) Jobs() ([]Job, error) {
 	var jobs []Job
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Batch, &job.Task, &job.Ref, &job.TestedSHA, &job.State, &job.ExitCode, &job.LogPath); err != nil {
+		if err := rows.Scan(&job.ID, &job.Batch, &job.Task, &job.Ref, &job.TestedSHA, &job.State, &job.CreatedAt, &job.StartedAt, &job.FinishedAt, &job.ExitCode, &job.LogPath, &job.configJSON); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, job)
