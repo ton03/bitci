@@ -77,7 +77,7 @@ The dashboard only accepts the loopback address. It has no task controls.
 bitci.json --plan/submit--> SQLite queue --claim--> serve
                                                |       |
                                                |       +--> resource leases
-                                               |       +--> recorded-SHA worktree
+                                               |       +--> recorded-SHA checkout
                                                |       +--> configured argv
                                                |       +--> capped local log
                                                v
@@ -90,8 +90,11 @@ human CLI --> local queue and logs
 - `plan` selects task IDs from changed paths.
 - `submit` records those task IDs, their config, and the source SHA.
 - `serve` claims FIFO jobs when worker, disk, and resource limits allow them.
-- SHA-backed jobs run in a detached worktree. Each result records `tested_sha`.
-- BitCI keeps each recorded SHA reachable with a private Git ref while it keeps its job record.
+- SHA-backed jobs run in a detached checkout with independent Git metadata.
+  The checkout reads source objects through Git alternates.
+  Its Git commands cannot change source refs or config.
+  Each result records `tested_sha`.
+- BitCI keeps each recorded SHA reachable with a private Git ref until its batch finishes.
 - `status`, `logs`, `cancel`, and `retry` inspect or control the queue.
 
 `cancel` affects queued work only. Retry only after reading logs. Never print
@@ -105,7 +108,11 @@ finished job logs; omit it or use `0` to keep all finished logs.
 
 Use `env` for fixed, task-specific values. BitCI inherits the controller
 environment, then applies these values. Agents cannot supply environment values.
-Do not put secrets in `bitci.json` or task output.
+BitCI sets `PWD` and `OLDPWD` to the job directory. Do not put secrets in
+`bitci.json` or task output.
+
+Use direct argv commands. SHA-backed jobs reject shell and language evaluator
+flags such as `sh -c` and `node -e` because they bypass path checks.
 
 ```json
 "unit": {
@@ -160,8 +167,10 @@ With it, agents may submit, cancel, or retry configured tasks. The agent flow is
 skill -> plan -> submit configured IDs -> status -> read_logs(cursor) -> retry only if needed
 ```
 
-`read_logs` returns capped complete lines and a cursor. Pass that cursor to the
-next call while a job runs. Use `tail_logs` for the final context.
+`read_logs` returns capped complete lines and a cursor. A finished job may return
+one final line without a newline. Oversized lines are skipped through bounded
+reads. Pass the cursor to the next call while a job runs. Use `tail_logs` for
+the final context.
 
 CLI fallback: `bitci logs --cursor 0 <job-id>` returns the same lines, cursor,
 and state.
@@ -192,7 +201,7 @@ Copy an example for a [Go backend](examples/go-backend.bitci.json),
 [Nx monorepo](examples/nx-monorepo.bitci.json). BitCI runs configured argv; it
 does not require a framework preset. SHA-isolated jobs start with tracked files
 only. Use `prepare` for a safe, configured bootstrap that BitCI runs in each
-job worktree before its task; the Node and Nx examples use `npm ci`.
+job checkout before its task; the Node and Nx examples use `npm ci`.
 
 Alpha tags use `v0.0.1-alpha.N`. Each tag builds macOS and Linux archives with
 checksums. See [SECURITY.md](SECURITY.md) before exposing a controller.
