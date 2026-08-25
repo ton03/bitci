@@ -104,6 +104,10 @@ duration, and terminal result.
 `cancel` affects queued work only. Retry only after reading logs. Never print
 secrets from tasks.
 
+If a running task process disappears, `serve` marks the job failed after a
+short grace period and releases its resources. Use `bitci recover <job-id>` for
+the same bounded check on one running job. Recovery never kills a process.
+
 Use literal `redact` values to hide known secrets from BitCI log reads. It does
 not change the retained files. Use `log_retention` to keep the newest N
 finished job logs; omit it or use `0` to keep all finished logs.
@@ -165,7 +169,7 @@ Start `serve`, then add this local MCP server to the agent client:
 ```
 
 Without `--allow-runs`, MCP only reads `status`, `plan`, logs, and disk health.
-With it, agents may submit, cancel, or retry configured tasks. The agent flow is:
+With it, agents may submit, cancel, retry, or recover configured tasks. The agent flow is:
 
 ```text
 skill -> plan -> submit configured IDs -> status -> read_logs(cursor) -> retry only if needed

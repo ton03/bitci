@@ -699,6 +699,119 @@ func TestRecoverInterruptedReleasesLease(t *testing.T) {
 	}
 }
 
+func TestRecoverOrphanedReleasesLeaseAndCancelsBatch(t *testing.T) {
+	configPath := writeConfig(t, `{
+		"version": 1,
+		"resources": {"browser": 1},
+		"tasks": {
+			"prepare": {"run": ["true"], "resources": ["browser"]},
+			"post": {"run": ["true"], "needs": ["prepare"]}
+		}
+	}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"post"}, "one"); err != nil {
+		t.Fatal(err)
+	}
+	first, claimed, err := controller.claim(1)
+	if err != nil || !claimed {
+		t.Fatalf("first claim = %v, %v", claimed, err)
+	}
+	deadPID := 999999999
+	if _, err := controller.db.Exec("UPDATE jobs SET worker_pid = ?, started_at = ? WHERE id = ?", deadPID, time.Now().Add(-orphanRecoveryGrace).UTC().Format(time.RFC3339), first.ID); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := controller.RecoverOrphaned()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered != 1 {
+		t.Fatalf("recovered jobs = %d, want 1", recovered)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 125 || jobs[0].WorkerPID != nil {
+		t.Fatalf("recovered job = %#v", jobs[0])
+	}
+	if jobs[1].State != "cancelled" {
+		t.Fatalf("dependent job = %#v", jobs[1])
+	}
+	if _, err := controller.Submit([]string{"prepare"}, "two"); err != nil {
+		t.Fatal(err)
+	}
+	if _, claimed, err := controller.claim(1); err != nil || !claimed {
+		t.Fatalf("claim after orphan recovery = %v, %v", claimed, err)
+	}
+}
+
+func TestRecoverJobRefusesLiveTaskProcess(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, "one"); err != nil {
+		t.Fatal(err)
+	}
+	job, claimed, err := controller.claim(1)
+	if err != nil || !claimed {
+		t.Fatalf("claim = %v, %v", claimed, err)
+	}
+	command := exec.Command("sh", "-c", "sleep 5")
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
+		_ = command.Wait()
+	})
+	if _, err := controller.db.Exec("UPDATE jobs SET worker_pid = ? WHERE id = ?", command.Process.Pid, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	if recovered, err := controller.RecoverJob(job.ID); err == nil || recovered {
+		t.Fatalf("live process recovery = %v, %v", recovered, err)
+	}
+}
+
+func TestRecoverOrphanedHandlesMissingStartedAt(t *testing.T) {
+	for _, startedAt := range []any{nil, "invalid"} {
+		t.Run(fmt.Sprint(startedAt), func(t *testing.T) {
+			configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+			controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer controller.Close()
+			jobs, err := controller.Submit([]string{"unit"}, "one")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, claimed, err := controller.claim(1); err != nil || !claimed {
+				t.Fatalf("claim = %v, %v", claimed, err)
+			}
+			if _, err := controller.db.Exec("UPDATE jobs SET worker_pid = ?, started_at = ? WHERE id = ?", 999999999, startedAt, jobs[0].ID); err != nil {
+				t.Fatal(err)
+			}
+			if recovered, err := controller.RecoverOrphaned(); err != nil || recovered != 1 {
+				t.Fatalf("recover orphaned = %d, %v", recovered, err)
+			}
+		})
+	}
+}
+
+func TestRecoveryIntervalCapsQueuePollInterval(t *testing.T) {
+	if got := recoveryInterval(30 * time.Second); got != orphanRecoveryGrace {
+		t.Fatalf("recovery interval = %v, want %v", got, orphanRecoveryGrace)
+	}
+}
+
 func TestRecoverInterruptedRemovesJobWorktree(t *testing.T) {
 	checkout := t.TempDir()
 	configPath := filepath.Join(checkout, "bitci.json")
@@ -1049,12 +1162,12 @@ func TestMCPReadOnlyTools(t *testing.T) {
 			t.Fatalf("MCP tool %q missing", name)
 		}
 	}
-	for _, name := range []string{"submit", "cancel", "retry"} {
+	for _, name := range []string{"submit", "cancel", "retry", "recover"} {
 		if readOnly[name] {
 			t.Fatalf("read-only MCP exposed %q", name)
 		}
 	}
-	for _, name := range []string{"submit", "cancel", "retry"} {
+	for _, name := range []string{"submit", "cancel", "retry", "recover"} {
 		if !mcpToolNames(t, socketPath, true)[name] {
 			t.Fatalf("run-control MCP tool %q missing", name)
 		}

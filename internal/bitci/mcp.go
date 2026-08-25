@@ -25,6 +25,7 @@ type MCPJob struct {
 	QueueWaitSeconds int    `json:"queue_wait_seconds"`
 	DurationSeconds  int    `json:"duration_seconds"`
 	TerminalResult   string `json:"terminal_result,omitempty"`
+	WorkerPID        *int   `json:"worker_pid,omitempty"`
 }
 
 type MCPStatus struct {
@@ -85,7 +86,7 @@ func RunMCP(ctx context.Context, options MCPOptions) error {
 		}
 		result := MCPStatus{Jobs: make([]MCPJob, 0, len(jobs))}
 		for _, job := range jobs {
-			result.Jobs = append(result.Jobs, MCPJob{ID: job.ID, Task: job.Task, Ref: job.Ref, TestedSHA: job.TestedSHA, State: job.State, ExitCode: job.ExitCode, Attempt: job.Attempt, RetryOf: job.RetryOf, RetryRoot: job.RetryRoot, PriorExitCode: job.PriorExitCode, QueueWaitSeconds: job.QueueWaitSeconds, DurationSeconds: job.DurationSeconds, TerminalResult: job.TerminalResult})
+			result.Jobs = append(result.Jobs, MCPJob{ID: job.ID, Task: job.Task, Ref: job.Ref, TestedSHA: job.TestedSHA, State: job.State, ExitCode: job.ExitCode, Attempt: job.Attempt, RetryOf: job.RetryOf, RetryRoot: job.RetryRoot, PriorExitCode: job.PriorExitCode, QueueWaitSeconds: job.QueueWaitSeconds, DurationSeconds: job.DurationSeconds, TerminalResult: job.TerminalResult, WorkerPID: job.WorkerPID})
 		}
 		return nil, result, nil
 	})
@@ -157,6 +158,13 @@ func addRunTools(server *mcp.Server, call func(string, any, any) error) {
 		result := MCPStatus{Jobs: make([]MCPJob, 0, len(jobs))}
 		for _, job := range jobs {
 			result.Jobs = append(result.Jobs, MCPJob{ID: job.ID, Task: job.Task, Ref: job.Ref, State: job.State})
+		}
+		return nil, result, nil
+	})
+	mcp.AddTool(server, &mcp.Tool{Name: "recover", Description: "Fail one running job only when its recorded task process is gone."}, func(_ context.Context, _ *mcp.CallToolRequest, input MCPJobInput) (*mcp.CallToolResult, map[string]bool, error) {
+		var result map[string]bool
+		if err := call("recover", JobParams{ID: input.ID}, &result); err != nil {
+			return nil, nil, err
 		}
 		return nil, result, nil
 	})

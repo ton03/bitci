@@ -24,7 +24,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("use version, validate, plan, submit, worker, serve, start, stop, service, status, cancel, retry, logs, doctor, mcp, or stage-pr")
+		return fmt.Errorf("use version, validate, plan, submit, worker, serve, start, stop, service, status, cancel, retry, recover, logs, doctor, mcp, or stage-pr")
 	}
 	command := args[0]
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
@@ -147,6 +147,16 @@ func run(args []string) error {
 			return err
 		}
 		return printValue(jobs, *jsonOutput)
+	case "recover":
+		id, err := jobID(flags.Args())
+		if err != nil {
+			return err
+		}
+		recovered, err := controller.RecoverJob(id)
+		if err != nil {
+			return err
+		}
+		return printValue(map[string]any{"id": id, "state": "failed", "recovered": recovered}, *jsonOutput)
 	case "logs":
 		id, err := jobID(flags.Args())
 		if err != nil {

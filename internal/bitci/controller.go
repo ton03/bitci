@@ -67,9 +67,11 @@ type Job struct {
 	QueueWaitSeconds int    `json:"queue_wait_seconds"`
 	DurationSeconds  int    `json:"duration_seconds"`
 	TerminalResult   string `json:"terminal_result,omitempty"`
+	WorkerPID        *int   `json:"worker_pid,omitempty"`
 	configJSON       string
 	checkoutRoot     string
 	configRelative   string
+	startedAt        string
 }
 
 func Open(configPath, stateDir string) (*Controller, error) {
@@ -247,7 +249,8 @@ func (controller *Controller) migrate() error {
 			prior_exit_code INTEGER,
 			queue_wait_seconds INTEGER NOT NULL DEFAULT 0,
 			duration_seconds INTEGER NOT NULL DEFAULT 0,
-			terminal_result TEXT
+			terminal_result TEXT,
+			worker_pid INTEGER
 		);
 		CREATE INDEX IF NOT EXISTS jobs_queue ON jobs(state, id);
 		CREATE TABLE IF NOT EXISTS leases (
@@ -285,6 +288,7 @@ func (controller *Controller) migrate() error {
 		{"queue_wait_seconds", "INTEGER NOT NULL DEFAULT 0"},
 		{"duration_seconds", "INTEGER NOT NULL DEFAULT 0"},
 		{"terminal_result", "TEXT"},
+		{"worker_pid", "INTEGER"},
 	} {
 		if err := controller.addJobColumn(column.name, column.definition); err != nil {
 			return err
@@ -548,7 +552,7 @@ func (controller *Controller) runOnce(ctx context.Context, maxWorkers int) (bool
 		code = 126
 	} else {
 		if isCheckoutSHA(job.Ref) && len(config.Prepare) > 0 {
-			code = controller.executeCommand(ctx, config.Prepare, task.Timeout, logFile, workDir)
+			code = controller.executeCommandForJob(ctx, job.ID, config.Prepare, task.Timeout, logFile, workDir)
 		}
 		if code == 0 && isCheckoutSHA(job.Ref) {
 			if err := controller.verifyJobWorktree(worktreeRoot, job.Ref, expectedOwner); err != nil {
@@ -565,7 +569,7 @@ func (controller *Controller) runOnce(ctx context.Context, maxWorkers int) (bool
 			code = 126
 		}
 		if code == 0 {
-			code = controller.execute(ctx, task, logFile, workDir)
+			code = controller.executeForJob(job.ID, ctx, task, logFile, workDir)
 		}
 		if code == 0 && isCheckoutSHA(job.Ref) {
 			if err := controller.verifyJobWorktree(worktreeRoot, job.Ref, expectedOwner); err != nil {
@@ -993,6 +997,7 @@ func (controller *Controller) Serve(ctx context.Context, maxWorkers int, interva
 			}
 		}()
 	}
+	go controller.serveRecovery(runContext, interval, errors)
 	for worker := 0; worker < maxWorkers; worker++ {
 		workers.Add(1)
 		go func() {
@@ -1023,6 +1028,166 @@ func (controller *Controller) Serve(ctx context.Context, maxWorkers int, interva
 			}
 		}
 	}
+}
+
+const orphanRecoveryGrace = 5 * time.Second
+
+func (controller *Controller) serveRecovery(ctx context.Context, interval time.Duration, errors chan<- error) {
+	ticker := time.NewTicker(recoveryInterval(interval))
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if _, err := controller.RecoverOrphaned(); err != nil {
+				errors <- err
+				return
+			}
+		}
+	}
+}
+
+func recoveryInterval(interval time.Duration) time.Duration {
+	if interval < time.Second {
+		return time.Second
+	}
+	if interval > orphanRecoveryGrace {
+		return orphanRecoveryGrace
+	}
+	return interval
+}
+
+// RecoverOrphaned fails running jobs whose recorded task process no longer exists.
+// It never kills a process and leaves live jobs untouched.
+func (controller *Controller) RecoverOrphaned() (int, error) {
+	rows, err := controller.db.Query("SELECT id, batch, ref, COALESCE(checkout_root, ''), worker_pid, COALESCE(started_at, '') FROM jobs WHERE state = 'running' AND worker_pid IS NOT NULL")
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	var orphaned []Job
+	for rows.Next() {
+		var job Job
+		if err := rows.Scan(&job.ID, &job.Batch, &job.Ref, &job.checkoutRoot, &job.WorkerPID, &job.startedAt); err != nil {
+			return 0, err
+		}
+		startedAt, parseErr := time.Parse(time.RFC3339, job.startedAt)
+		if parseErr == nil && time.Since(startedAt) < orphanRecoveryGrace {
+			continue
+		}
+		alive, err := processAlive(*job.WorkerPID)
+		if err != nil {
+			return 0, err
+		}
+		if !alive {
+			orphaned = append(orphaned, job)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	return controller.recoverJobs(orphaned, true)
+}
+
+// RecoverJob fails one running job only when its recorded task process is gone.
+func (controller *Controller) RecoverJob(id int64) (bool, error) {
+	var job Job
+	if err := controller.db.QueryRow("SELECT id, batch, ref, COALESCE(checkout_root, ''), worker_pid FROM jobs WHERE id = ? AND state = 'running'", id).Scan(&job.ID, &job.Batch, &job.Ref, &job.checkoutRoot, &job.WorkerPID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, fmt.Errorf("job %d is not running", id)
+		}
+		return false, err
+	}
+	if job.WorkerPID == nil {
+		return false, fmt.Errorf("job %d has no recorded task process", id)
+	}
+	alive, err := processAlive(*job.WorkerPID)
+	if err != nil {
+		return false, err
+	}
+	if alive {
+		return false, fmt.Errorf("job %d task process is still running", id)
+	}
+	recovered, err := controller.recoverJobs([]Job{job}, false)
+	return recovered == 1, err
+}
+
+func (controller *Controller) recoverJobs(jobs []Job, skipChanged bool) (int, error) {
+	if len(jobs) == 0 {
+		return 0, nil
+	}
+	transaction, err := controller.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer transaction.Rollback()
+	now := timestamp()
+	recovered := make([]Job, 0, len(jobs))
+	for _, job := range jobs {
+		result, err := transaction.Exec("UPDATE jobs SET state = 'failed', finished_at = ?, exit_code = 125, duration_seconds = COALESCE(CASE WHEN started_at IS NULL THEN 0 ELSE MAX(0, CAST(strftime('%s', ?) - strftime('%s', started_at) AS INTEGER)) END, 0), terminal_result = 'failed', worker_pid = NULL, cleanup_pending = ? WHERE id = ? AND state = 'running' AND worker_pid = ?", now, now, isCheckoutSHA(job.Ref), job.ID, *job.WorkerPID)
+		if err != nil {
+			return 0, err
+		}
+		updated, err := result.RowsAffected()
+		if err != nil {
+			return 0, err
+		}
+		if updated == 0 {
+			if skipChanged {
+				continue
+			}
+			return 0, fmt.Errorf("job %d changed before recovery", job.ID)
+		}
+		if _, err := transaction.Exec("DELETE FROM leases WHERE job_id = ?", job.ID); err != nil {
+			return 0, err
+		}
+		if _, err := transaction.Exec("UPDATE jobs SET state = 'cancelled', finished_at = ?, queue_wait_seconds = MAX(0, CAST(strftime('%s', ?) - strftime('%s', created_at) AS INTEGER)), duration_seconds = 0, terminal_result = 'cancelled' WHERE state = 'queued' AND batch = ?", now, now, job.Batch); err != nil {
+			return 0, err
+		}
+		recovered = append(recovered, job)
+	}
+	if err := transaction.Commit(); err != nil {
+		return 0, err
+	}
+	var failures []error
+	for _, job := range recovered {
+		if !isCheckoutSHA(job.Ref) {
+			continue
+		}
+		if err := controller.removeJobWorktree(job.ID, job.checkoutRoot); err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		if _, err := controller.db.Exec("UPDATE jobs SET cleanup_pending = 0 WHERE id = ?", job.ID); err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		if err := controller.releaseBatchRef(job.Batch, job.checkoutRoot); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	if err := controller.releaseFinishedBatchRefs(); err != nil {
+		failures = append(failures, err)
+	}
+	return len(recovered), errors.Join(failures...)
+}
+
+func processAlive(pid int) (bool, error) {
+	if pid <= 0 {
+		return false, nil
+	}
+	err := syscall.Kill(-pid, 0)
+	if err == nil || errors.Is(err, syscall.EPERM) {
+		return true, nil
+	}
+	if errors.Is(err, syscall.ESRCH) {
+		return false, nil
+	}
+	return false, err
 }
 
 func (controller *Controller) lockOwner() (func(), error) {
@@ -2143,14 +2308,26 @@ func (controller *Controller) pruneLogs() error {
 }
 
 func (controller *Controller) execute(parent context.Context, task Task, output io.Writer, directory string) int {
-	return controller.executeCommandWithEnv(parent, task.Run, task.Timeout, output, directory, task.Env)
+	return controller.executeCommandWithEnvForJob(parent, 0, task.Run, task.Timeout, output, directory, task.Env)
 }
 
 func (controller *Controller) executeCommand(parent context.Context, argv []string, timeout int, output io.Writer, directory string) int {
-	return controller.executeCommandWithEnv(parent, argv, timeout, output, directory, nil)
+	return controller.executeCommandWithEnvForJob(parent, 0, argv, timeout, output, directory, nil)
 }
 
 func (controller *Controller) executeCommandWithEnv(parent context.Context, argv []string, timeout int, output io.Writer, directory string, environment map[string]string) int {
+	return controller.executeCommandWithEnvForJob(parent, 0, argv, timeout, output, directory, environment)
+}
+
+func (controller *Controller) executeForJob(jobID int64, parent context.Context, task Task, output io.Writer, directory string) int {
+	return controller.executeCommandWithEnvForJob(parent, jobID, task.Run, task.Timeout, output, directory, task.Env)
+}
+
+func (controller *Controller) executeCommandForJob(parent context.Context, jobID int64, argv []string, timeout int, output io.Writer, directory string) int {
+	return controller.executeCommandWithEnvForJob(parent, jobID, argv, timeout, output, directory, nil)
+}
+
+func (controller *Controller) executeCommandWithEnvForJob(parent context.Context, jobID int64, argv []string, timeout int, output io.Writer, directory string, environment map[string]string) int {
 	if len(argv) == 0 || argv[0] == "" {
 		fmt.Fprintln(output, "BitCI job has no configured command")
 		return 127
@@ -2197,6 +2374,26 @@ func (controller *Controller) executeCommandWithEnv(parent context.Context, argv
 			return 127
 		}
 	}
+	if jobID > 0 {
+		result, err := controller.db.Exec("UPDATE jobs SET worker_pid = ? WHERE id = ? AND state = 'running'", command.Process.Pid, jobID)
+		if err == nil {
+			updated, rowsErr := result.RowsAffected()
+			if rowsErr != nil {
+				err = rowsErr
+			} else if updated != 1 {
+				err = fmt.Errorf("job %d is no longer running", jobID)
+			}
+		}
+		if err != nil {
+			_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
+			_ = command.Wait()
+			if persistProcess {
+				_ = os.Remove(processPath)
+			}
+			fmt.Fprintf(output, "BitCI could not record task process group: %v\n", err)
+			return 127
+		}
+	}
 	err := command.Wait()
 	groupErr := syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
 	if persistProcess && (groupErr == nil || errors.Is(groupErr, syscall.ESRCH)) {
@@ -2205,6 +2402,12 @@ func (controller *Controller) executeCommandWithEnv(parent context.Context, argv
 	if groupErr != nil && !errors.Is(groupErr, syscall.ESRCH) {
 		fmt.Fprintf(output, "BitCI could not stop task descendants: %v\n", groupErr)
 		if err == nil {
+			return 127
+		}
+	}
+	if jobID > 0 {
+		if _, clearErr := controller.db.Exec("UPDATE jobs SET worker_pid = NULL WHERE id = ? AND worker_pid = ?", jobID, command.Process.Pid); clearErr != nil && err == nil {
+			fmt.Fprintf(output, "BitCI could not clear task process group: %v\n", clearErr)
 			return 127
 		}
 	}
@@ -2325,12 +2528,26 @@ func (controller *Controller) finish(job Job, code int, cleanupPending bool) err
 		state = "failed"
 	}
 	now := timestamp()
-	_, err := controller.db.Exec(
-		"UPDATE jobs SET state = ?, finished_at = ?, exit_code = ?, log_path = ?, cleanup_pending = ?, duration_seconds = CASE WHEN started_at IS NULL THEN 0 ELSE MAX(0, CAST(strftime('%s', ?) - strftime('%s', started_at) AS INTEGER)) END, terminal_result = ? WHERE id = ?",
+	result, err := controller.db.Exec(
+		"UPDATE jobs SET state = ?, finished_at = ?, exit_code = ?, log_path = ?, cleanup_pending = ?, duration_seconds = CASE WHEN started_at IS NULL THEN 0 ELSE MAX(0, CAST(strftime('%s', ?) - strftime('%s', started_at) AS INTEGER)) END, terminal_result = ?, worker_pid = NULL WHERE id = ? AND state IN ('queued', 'running')",
 		state, now, code, job.LogPath, cleanupPending, now, state, job.ID,
 	)
 	if err != nil {
 		return err
+	}
+	if updated, err := result.RowsAffected(); err != nil {
+		return err
+	} else if updated == 0 {
+		var recoveredState string
+		var recoveredCode int
+		var recoveredPID *int
+		if err := controller.db.QueryRow("SELECT state, COALESCE(exit_code, 0), worker_pid FROM jobs WHERE id = ?", job.ID).Scan(&recoveredState, &recoveredCode, &recoveredPID); err != nil {
+			return err
+		}
+		if recoveredState == "failed" && recoveredCode == 125 && recoveredPID == nil {
+			return nil
+		}
+		return fmt.Errorf("job %d is no longer finishable", job.ID)
 	}
 	pruneErr := controller.pruneLogs()
 	_, leaseErr := controller.db.Exec("DELETE FROM leases WHERE job_id = ?", job.ID)
@@ -2340,7 +2557,7 @@ func (controller *Controller) finish(job Job, code int, cleanupPending bool) err
 }
 
 func (controller *Controller) Jobs() ([]Job, error) {
-	rows, err := controller.db.Query("SELECT id, batch, task, ref, COALESCE(tested_sha, ''), state, created_at, COALESCE(started_at, ''), COALESCE(finished_at, ''), exit_code, COALESCE(log_path, ''), COALESCE(config_json, ''), COALESCE(attempt, 1), retry_of, COALESCE(retry_root, id), prior_exit_code, COALESCE(queue_wait_seconds, 0), COALESCE(duration_seconds, 0), COALESCE(terminal_result, '') FROM jobs ORDER BY id")
+	rows, err := controller.db.Query("SELECT id, batch, task, ref, COALESCE(tested_sha, ''), state, created_at, COALESCE(started_at, ''), COALESCE(finished_at, ''), exit_code, COALESCE(log_path, ''), COALESCE(config_json, ''), COALESCE(attempt, 1), retry_of, COALESCE(retry_root, id), prior_exit_code, COALESCE(queue_wait_seconds, 0), COALESCE(duration_seconds, 0), COALESCE(terminal_result, ''), worker_pid FROM jobs ORDER BY id")
 	if err != nil {
 		return nil, err
 	}
@@ -2348,7 +2565,7 @@ func (controller *Controller) Jobs() ([]Job, error) {
 	var jobs []Job
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Batch, &job.Task, &job.Ref, &job.TestedSHA, &job.State, &job.CreatedAt, &job.StartedAt, &job.FinishedAt, &job.ExitCode, &job.LogPath, &job.configJSON, &job.Attempt, &job.RetryOf, &job.RetryRoot, &job.PriorExitCode, &job.QueueWaitSeconds, &job.DurationSeconds, &job.TerminalResult); err != nil {
+		if err := rows.Scan(&job.ID, &job.Batch, &job.Task, &job.Ref, &job.TestedSHA, &job.State, &job.CreatedAt, &job.StartedAt, &job.FinishedAt, &job.ExitCode, &job.LogPath, &job.configJSON, &job.Attempt, &job.RetryOf, &job.RetryRoot, &job.PriorExitCode, &job.QueueWaitSeconds, &job.DurationSeconds, &job.TerminalResult, &job.WorkerPID); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, job)
