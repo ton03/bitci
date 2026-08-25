@@ -19,6 +19,8 @@ type MCPJob struct {
 	State            string `json:"state"`
 	ExitCode         *int   `json:"exit_code,omitempty"`
 	Attempt          int    `json:"attempt"`
+	RetryOf          *int64 `json:"retry_of,omitempty"`
+	RetryRoot        int64  `json:"retry_root"`
 	PriorExitCode    *int   `json:"prior_exit_code,omitempty"`
 	QueueWaitSeconds int    `json:"queue_wait_seconds"`
 	DurationSeconds  int    `json:"duration_seconds"`
@@ -83,7 +85,7 @@ func RunMCP(ctx context.Context, options MCPOptions) error {
 		}
 		result := MCPStatus{Jobs: make([]MCPJob, 0, len(jobs))}
 		for _, job := range jobs {
-			result.Jobs = append(result.Jobs, MCPJob{ID: job.ID, Task: job.Task, Ref: job.Ref, TestedSHA: job.TestedSHA, State: job.State, ExitCode: job.ExitCode, Attempt: job.Attempt, PriorExitCode: job.PriorExitCode, QueueWaitSeconds: job.QueueWaitSeconds, DurationSeconds: job.DurationSeconds, TerminalResult: job.TerminalResult})
+			result.Jobs = append(result.Jobs, MCPJob{ID: job.ID, Task: job.Task, Ref: job.Ref, TestedSHA: job.TestedSHA, State: job.State, ExitCode: job.ExitCode, Attempt: job.Attempt, RetryOf: job.RetryOf, RetryRoot: job.RetryRoot, PriorExitCode: job.PriorExitCode, QueueWaitSeconds: job.QueueWaitSeconds, DurationSeconds: job.DurationSeconds, TerminalResult: job.TerminalResult})
 		}
 		return nil, result, nil
 	})
@@ -136,7 +138,7 @@ func addRunTools(server *mcp.Server, call func(string, any, any) error) {
 		}
 		result := MCPStatus{Jobs: make([]MCPJob, 0, len(jobs))}
 		for _, job := range jobs {
-			result.Jobs = append(result.Jobs, MCPJob{ID: job.ID, Task: job.Task, Ref: job.Ref, State: job.State, Attempt: job.Attempt, PriorExitCode: job.PriorExitCode, QueueWaitSeconds: job.QueueWaitSeconds, DurationSeconds: job.DurationSeconds, TerminalResult: job.TerminalResult})
+			result.Jobs = append(result.Jobs, MCPJob{ID: job.ID, Task: job.Task, Ref: job.Ref, State: job.State})
 		}
 		return nil, result, nil
 	})
@@ -154,7 +156,7 @@ func addRunTools(server *mcp.Server, call func(string, any, any) error) {
 		}
 		result := MCPStatus{Jobs: make([]MCPJob, 0, len(jobs))}
 		for _, job := range jobs {
-			result.Jobs = append(result.Jobs, MCPJob{ID: job.ID, Task: job.Task, Ref: job.Ref, State: job.State, Attempt: job.Attempt, PriorExitCode: job.PriorExitCode, QueueWaitSeconds: job.QueueWaitSeconds, DurationSeconds: job.DurationSeconds, TerminalResult: job.TerminalResult})
+			result.Jobs = append(result.Jobs, MCPJob{ID: job.ID, Task: job.Task, Ref: job.Ref, State: job.State})
 		}
 		return nil, result, nil
 	})

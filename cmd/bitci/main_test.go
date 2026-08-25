@@ -16,6 +16,7 @@ func TestVersionCommand(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer reader.Close()
 	os.Stdout = writer
 	defer func() { os.Stdout = original }()
 	if err := run([]string{"version"}); err != nil {
