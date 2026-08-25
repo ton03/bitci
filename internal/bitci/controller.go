@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -34,6 +35,7 @@ type Controller struct {
 	githubAPI      string
 	githubRepo     string
 	worktreeMu     sync.Mutex
+	configMu       sync.RWMutex
 	ownerMu        sync.Mutex
 	ownerRelease   func()
 	ownerCount     int
@@ -179,7 +181,13 @@ func pathHasGitMetadataAncestor(path string) bool {
 func (controller *Controller) Close() error { return controller.db.Close() }
 
 func (controller *Controller) Plan(changedPaths []string) ([]string, error) {
-	return controller.config.Plan(changedPaths)
+	return controller.configSnapshot().Plan(changedPaths)
+}
+
+func (controller *Controller) configSnapshot() Config {
+	controller.configMu.RLock()
+	defer controller.configMu.RUnlock()
+	return controller.config
 }
 
 func (controller *Controller) migrate() error {
@@ -307,7 +315,7 @@ func (controller *Controller) SubmitContext(ctx context.Context, taskNames []str
 	} else if isCheckoutSHA(ref) {
 		return nil, fmt.Errorf("cannot submit requested checkout SHA: %w", err)
 	}
-	return controller.submit(ctx, controller.config, taskNames, ref, checkoutRoot, configRelative)
+	return controller.submit(ctx, controller.configSnapshot(), taskNames, ref, checkoutRoot, configRelative)
 }
 
 func recordedDirectoryExists(checkoutRoot, ref, relative string) error {
@@ -714,6 +722,15 @@ func objectCacheRoot(stateDir, checkoutRoot, ref, objectFormat string) string {
 }
 
 func (controller *Controller) pruneObjectCaches() error {
+	releaseStage, err := controller.acquireStageLock(context.Background())
+	if err != nil {
+		return err
+	}
+	defer releaseStage()
+	return controller.pruneObjectCachesUnlocked()
+}
+
+func (controller *Controller) pruneObjectCachesUnlocked() error {
 	root := filepath.Join(controller.stateDir, "object-cache")
 	entries, err := os.ReadDir(root)
 	if os.IsNotExist(err) {
@@ -1075,6 +1092,10 @@ func (controller *Controller) RecoverInterrupted() error {
 	}
 	var failures []error
 	for _, job := range interrupted {
+		if err := controller.terminateJobProcessGroup(job.ID); err != nil {
+			failures = append(failures, err)
+			continue
+		}
 		if err := controller.removeJobWorktree(job.ID, job.checkoutRoot); err != nil {
 			failures = append(failures, err)
 			continue
@@ -1381,6 +1402,9 @@ func (controller *Controller) claimContext(ctx context.Context, maxWorkers int) 
 			}
 		}
 		job.State = "running"
+		if err := rows.Close(); err != nil {
+			return Job{}, false, err
+		}
 		if err := transaction.Commit(); err != nil {
 			return Job{}, false, err
 		}
@@ -1526,7 +1550,7 @@ func (controller *Controller) jobConfig(job Job) (Config, Task, error) {
 
 func (controller *Controller) snapshotConfig(snapshot string) (Config, error) {
 	if snapshot == "" {
-		return controller.config, nil
+		return controller.configSnapshot(), nil
 	}
 	var config Config
 	if err := json.Unmarshal([]byte(snapshot), &config); err != nil {
@@ -1975,10 +1999,11 @@ func (controller *Controller) startLog(job *Job) (*os.File, error) {
 }
 
 func (controller *Controller) pruneLogs() error {
-	if controller.config.LogRetention == 0 {
+	config := controller.configSnapshot()
+	if config.LogRetention == 0 {
 		return nil
 	}
-	rows, err := controller.db.Query("SELECT id, COALESCE(log_path, '') FROM jobs WHERE state IN ('passed', 'failed', 'cancelled') AND COALESCE(log_path, '') != '' ORDER BY finished_at DESC, id DESC LIMIT -1 OFFSET ?", controller.config.LogRetention)
+	rows, err := controller.db.Query("SELECT id, COALESCE(log_path, '') FROM jobs WHERE state IN ('passed', 'failed', 'cancelled') AND COALESCE(log_path, '') != '' ORDER BY finished_at DESC, id DESC LIMIT -1 OFFSET ?", config.LogRetention)
 	if err != nil {
 		return err
 	}
@@ -2052,8 +2077,20 @@ func (controller *Controller) executeCommandWithEnv(parent context.Context, argv
 		fmt.Fprintf(output, "BitCI could not start task: %v\n", err)
 		return 127
 	}
+	processPath, persistProcess := controller.processGroupPath(directory)
+	if persistProcess {
+		if err := os.WriteFile(processPath, []byte(strconv.Itoa(command.Process.Pid)), 0o600); err != nil {
+			_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
+			_ = command.Wait()
+			fmt.Fprintf(output, "BitCI could not record task process group: %v\n", err)
+			return 127
+		}
+	}
 	err := command.Wait()
 	groupErr := syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
+	if persistProcess && (groupErr == nil || errors.Is(groupErr, syscall.ESRCH)) {
+		_ = os.Remove(processPath)
+	}
 	if groupErr != nil && !errors.Is(groupErr, syscall.ESRCH) {
 		fmt.Fprintf(output, "BitCI could not stop task descendants: %v\n", groupErr)
 		if err == nil {
@@ -2068,6 +2105,82 @@ func (controller *Controller) executeCommandWithEnv(parent context.Context, argv
 	}
 	fmt.Fprintf(output, "BitCI could not start task: %v\n", err)
 	return 127
+}
+
+func (controller *Controller) processGroupPath(directory string) (string, bool) {
+	if controller.stateDir == "" {
+		return "", false
+	}
+	root := filepath.Join(controller.stateDir, "worktrees")
+	relative, err := filepath.Rel(root, filepath.Clean(directory))
+	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	parts := strings.Split(relative, string(filepath.Separator))
+	if len(parts) == 0 || !strings.HasPrefix(parts[0], "job-") {
+		return "", false
+	}
+	if _, err := strconv.ParseInt(strings.TrimPrefix(parts[0], "job-"), 10, 64); err != nil {
+		return "", false
+	}
+	jobRoot := filepath.Join(root, parts[0])
+	info, err := os.Lstat(jobRoot)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return "", false
+	}
+	return filepath.Join(jobRoot, "bitci-process-group"), true
+}
+
+func (controller *Controller) terminateJobProcessGroup(id int64) error {
+	path := filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", id), "bitci-process-group")
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid < 1 {
+		return fmt.Errorf("invalid recorded job process group")
+	}
+	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return fmt.Errorf("stop recorded job process group: %w", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		err := syscall.Kill(-pid, 0)
+		if errors.Is(err, syscall.ESRCH) {
+			return os.Remove(path)
+		}
+		if errors.Is(err, syscall.EPERM) {
+			output, psErr := exec.Command("ps", "-o", "pid=,pgid=,stat=", "-g", strconv.Itoa(pid)).Output()
+			if psErr != nil || allProcessGroupEntriesZombie(output) {
+				return os.Remove(path)
+			}
+		}
+		if err != nil {
+			return fmt.Errorf("check recorded job process group: %w", err)
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("recorded job process group %d did not stop", pid)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func allProcessGroupEntriesZombie(output []byte) bool {
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if len(lines) == 1 && lines[0] == "" {
+		return true
+	}
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) < 3 || !strings.HasPrefix(fields[2], "Z") {
+			return false
+		}
+	}
+	return true
 }
 
 func taskEnvironment(overrides map[string]string, directory string) []string {
@@ -2166,7 +2279,7 @@ func (controller *Controller) RetryContext(ctx context.Context, id int64) ([]Job
 	if err := controller.db.QueryRow("SELECT task, ref, COALESCE(config_json, ''), COALESCE(checkout_root, ''), COALESCE(config_relative, '') FROM jobs WHERE id = ?", id).Scan(&task, &ref, &configJSON, &checkoutRoot, &configRelative); err != nil {
 		return nil, err
 	}
-	config := controller.config
+	config := controller.configSnapshot()
 	if configJSON != "" {
 		config = Config{}
 		if err := json.Unmarshal([]byte(configJSON), &config); err != nil {
@@ -2181,6 +2294,9 @@ func (controller *Controller) RetryContext(ctx context.Context, id int64) ([]Job
 		checkoutRoot, configRelative, err = controller.checkoutLocation()
 		if err != nil {
 			return nil, fmt.Errorf("find checkout for retried SHA: %w", err)
+		}
+		if err := recordedDirectoryExists(checkoutRoot, ref, configRelative); err != nil {
+			return nil, fmt.Errorf("validate retried checkout configuration: %w", err)
 		}
 	}
 	return controller.submit(ctx, config, []string{task}, ref, checkoutRoot, configRelative)
@@ -2290,6 +2406,10 @@ func (controller *Controller) ReadLog(id, cursor int64, limit int) (LogCursorOut
 			}
 			output.Cursor = readCursor
 		}
+		if !complete && !terminalJobState(state) && err == bufio.ErrBufferFull {
+			output.Cursor = readCursor - consumed
+			break
+		}
 		if err != nil {
 			if err == bufio.ErrBufferFull {
 				output.Cursor = readCursor
@@ -2352,7 +2472,7 @@ func (controller *Controller) logRedaction(configJSON string) ([]string, error) 
 		return nil, err
 	}
 	redact := append([]string{}, config.Redact...)
-	redact = append(redact, controller.config.Redact...)
+	redact = append(redact, controller.configSnapshot().Redact...)
 	sort.SliceStable(redact, func(left, right int) bool { return len(redact[left]) > len(redact[right]) })
 	return redact, nil
 }
@@ -2396,7 +2516,7 @@ func logLimit(limit int) int {
 }
 
 func (controller *Controller) DiskOK() error {
-	return controller.diskOK(controller.config.MinFreeBytes)
+	return controller.diskOK(controller.configSnapshot().MinFreeBytes)
 }
 
 func (controller *Controller) diskOK(minFreeBytes uint64) error {

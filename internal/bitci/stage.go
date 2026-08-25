@@ -83,6 +83,13 @@ func (controller *Controller) StagePR(ctx context.Context, number int, token str
 	if err != nil || sha != pull.Head.SHA {
 		return Stage{}, fmt.Errorf("checked out SHA does not match GitHub")
 	}
+	stagedConfig, err := LoadConfig(controller.configPath)
+	if err != nil {
+		return Stage{}, fmt.Errorf("load staged BitCI configuration: %w", err)
+	}
+	controller.configMu.Lock()
+	controller.config = stagedConfig
+	controller.configMu.Unlock()
 	return Stage{PR: number, SHA: sha}, nil
 }
 

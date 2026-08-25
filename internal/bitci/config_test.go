@@ -276,9 +276,20 @@ func TestFinishReleasesLeaseWhenLogPruningFails(t *testing.T) {
 
 func TestStackExamplesValidate(t *testing.T) {
 	root := filepath.Clean(filepath.Join("..", ".."))
-	for _, name := range []string{"go-backend", "node-backend", "nx-monorepo"} {
-		if _, err := LoadConfig(filepath.Join(root, "examples", name+".bitci.json")); err != nil {
+	expected := map[string]map[string]string{
+		"go-backend":   {"test": "go", "vet": "go"},
+		"node-backend": {"test": "npm", "typecheck": "npm"},
+		"nx-monorepo":  {"test": "npx", "e2e": "npx"},
+	}
+	for name, tasks := range expected {
+		config, err := LoadConfig(filepath.Join(root, "examples", name+".bitci.json"))
+		if err != nil {
 			t.Fatalf("%s example: %v", name, err)
+		}
+		for taskName, command := range tasks {
+			if got := config.Tasks[taskName].Run[0]; got != command {
+				t.Fatalf("%s %s command = %q, want %q", name, taskName, got, command)
+			}
 		}
 	}
 }
@@ -1297,7 +1308,7 @@ func TestReadLogSkipsLiveOversizedLineInBoundedReads(t *testing.T) {
 		t.Fatal(err)
 	}
 	logs, err := controller.ReadLog(id, 0, 80)
-	if err != nil || len(logs.Lines) != 0 || logs.Cursor != maxLogReadBytes {
+	if err != nil || len(logs.Lines) != 0 || logs.Cursor != 0 {
 		t.Fatalf("live capped log = %#v, %v", logs, err)
 	}
 }
@@ -3823,6 +3834,31 @@ func TestExecuteStopsBackgroundDescendants(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("background descendant survived command completion")
+}
+
+func TestRecoverInterruptedStopsRecordedProcessGroup(t *testing.T) {
+	stateDir := t.TempDir()
+	jobRoot := filepath.Join(stateDir, "worktrees", "job-7")
+	if err := os.MkdirAll(jobRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("sleep", "30")
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(jobRoot, "bitci-process-group"), []byte(strconv.Itoa(command.Process.Pid)), 0o600); err != nil {
+		_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
+		_ = command.Wait()
+		t.Fatal(err)
+	}
+	controller := &Controller{stateDir: stateDir}
+	if err := controller.terminateJobProcessGroup(7); err != nil {
+		t.Fatal(err)
+	}
+	if err := command.Wait(); err == nil {
+		t.Fatal("process group command survived recovery")
+	}
 }
 
 func TestServeWaitsForRunningJobCleanup(t *testing.T) {
