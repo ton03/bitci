@@ -2,6 +2,7 @@ package bitci
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"html"
 	"os"
@@ -30,7 +31,7 @@ func NewService(configPath, stateDir string, maxWorkers int) (Service, error) {
 	if err != nil {
 		return Service{}, err
 	}
-	absoluteConfig, err := filepath.Abs(configPath)
+	absoluteConfig, err := canonicalConfigPath(configPath, true)
 	if err != nil {
 		return Service{}, err
 	}
@@ -75,6 +76,14 @@ func servicePath(config Config, checkout string) (string, error) {
 	if path := os.Getenv("BITCI_PATH"); path != "" {
 		return path, nil
 	}
+	gitRoot := ""
+	verifiedCommit := false
+	if output, err := exec.Command("git", "-C", checkout, "rev-parse", "--show-toplevel").Output(); err == nil {
+		gitRoot = filepath.Clean(strings.TrimSpace(string(output)))
+		if _, err := exec.Command("git", "-C", gitRoot, "rev-parse", "--verify", "HEAD^{commit}").Output(); err == nil {
+			verifiedCommit = true
+		}
+	}
 	directories := make([]string, 0, len(config.Tasks)+6)
 	seen := map[string]bool{}
 	add := func(directory string) {
@@ -83,46 +92,62 @@ func servicePath(config Config, checkout string) (string, error) {
 			directories = append(directories, directory)
 		}
 	}
+	addOutsideCheckout := func(directory string) {
+		if gitRoot == "" || !pathWithin(gitRoot, directory) {
+			add(directory)
+		}
+	}
 	commands := make([]struct {
 		name          string
 		requireExists bool
+		environment   map[string]string
 	}, 0, len(config.Tasks)+1)
 	if len(config.Prepare) > 0 {
 		commands = append(commands, struct {
 			name          string
 			requireExists bool
+			environment   map[string]string
 		}{name: config.Prepare[0], requireExists: true})
 	}
 	for _, name := range config.TaskNames() {
 		commands = append(commands, struct {
 			name          string
 			requireExists bool
-		}{name: config.Tasks[name].Run[0], requireExists: len(config.Prepare) == 0})
+			environment   map[string]string
+		}{name: config.Tasks[name].Run[0], requireExists: len(config.Prepare) == 0 || !verifiedCommit, environment: config.Tasks[name].Env})
 	}
 	for _, configured := range commands {
 		command := configured.name
 		if strings.ContainsRune(command, filepath.Separator) {
-			if !configured.requireExists {
-				continue
-			}
-			if !filepath.IsAbs(command) {
+			absolute := filepath.IsAbs(command)
+			if !absolute {
 				command = filepath.Join(checkout, command)
 			}
 			info, err := os.Stat(command)
 			if err != nil {
+				if !configured.requireExists && os.IsNotExist(err) {
+					continue
+				}
 				return "", fmt.Errorf("stat configured command %q: %w", command, err)
 			}
 			if info.IsDir() {
 				return "", fmt.Errorf("configured command %q is a directory", command)
 			}
-			add(filepath.Dir(command))
+			if absolute {
+				addOutsideCheckout(filepath.Dir(command))
+			}
 			continue
 		}
-		resolved, err := exec.LookPath(command)
+		resolved, err := lookPath(command, taskEnvironment(configured.environment, checkout), checkout)
 		if err != nil {
+			if !configured.requireExists && errors.Is(err, exec.ErrNotFound) {
+				continue
+			}
 			return "", fmt.Errorf("resolve configured command %q: %w", command, err)
 		}
-		add(filepath.Dir(resolved))
+		if _, configuredPath := configured.environment["PATH"]; !configuredPath {
+			addOutsideCheckout(filepath.Dir(resolved))
+		}
 	}
 	for _, directory := range []string{"/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"} {
 		add(directory)
