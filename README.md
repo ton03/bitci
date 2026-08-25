@@ -149,6 +149,13 @@ environment, then applies these values. Agents cannot supply environment values.
 BitCI sets `PWD` and `OLDPWD` to the job directory. Do not put secrets in
 `bitci.json` or task output.
 
+Every running job also receives read-only run metadata: `BITCI_JOB_ID`,
+`BITCI_WORKTREE`, `BITCI_LOG_PATH`, `BITCI_STATE_DIR`,
+`BITCI_SUBMITTED_SHA`, and `BITCI_TESTED_SHA`. Use these values to place
+ports, temporary services, profiles, and reports under one job namespace.
+BitCI sets them after task configuration, so a task cannot spoof its own
+identity.
+
 Use direct argv commands. SHA-backed jobs reject shell and language evaluator
 flags such as `sh -c` and `node -e` because they bypass path checks.
 

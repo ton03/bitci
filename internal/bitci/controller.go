@@ -614,8 +614,9 @@ func (controller *Controller) runOnce(ctx context.Context, maxWorkers int) (bool
 		fmt.Fprintln(logFile, "BitCI refuses an unsafe checkout-local prepare argument for a recorded SHA job")
 		code = 126
 	} else {
+		runEnvironment := controller.jobRunEnvironment(job, workDir, worktreeRoot)
 		if isCheckoutSHA(job.Ref) && len(config.Prepare) > 0 {
-			code = controller.executeCommandForJob(ctx, job.ID, config.Prepare, task.Timeout, logFile, workDir)
+			code = controller.executeCommandForJobWithRunEnvironment(ctx, job.ID, config.Prepare, task.Timeout, logFile, workDir, runEnvironment)
 		}
 		if code == 0 && isCheckoutSHA(job.Ref) {
 			if err := controller.verifyJobWorktree(worktreeRoot, job.Ref, expectedOwner); err != nil {
@@ -632,7 +633,7 @@ func (controller *Controller) runOnce(ctx context.Context, maxWorkers int) (bool
 			code = 126
 		}
 		if code == 0 {
-			code = controller.executeForJob(job.ID, ctx, task, logFile, workDir)
+			code = controller.executeForJobWithRunEnvironment(job.ID, ctx, task, logFile, workDir, runEnvironment)
 		}
 		if code == 0 && isCheckoutSHA(job.Ref) {
 			if err := controller.verifyJobWorktree(worktreeRoot, job.Ref, expectedOwner); err != nil {
@@ -2481,11 +2482,23 @@ func (controller *Controller) executeForJob(jobID int64, parent context.Context,
 	return controller.executeCommandWithEnvForJob(parent, jobID, task.Run, task.Timeout, output, directory, task.Env)
 }
 
+func (controller *Controller) executeForJobWithRunEnvironment(jobID int64, parent context.Context, task Task, output io.Writer, directory string, runEnvironment map[string]string) int {
+	return controller.executeCommandWithRunEnvironment(parent, jobID, task.Run, task.Timeout, output, directory, task.Env, runEnvironment)
+}
+
 func (controller *Controller) executeCommandForJob(parent context.Context, jobID int64, argv []string, timeout int, output io.Writer, directory string) int {
 	return controller.executeCommandWithEnvForJob(parent, jobID, argv, timeout, output, directory, nil)
 }
 
+func (controller *Controller) executeCommandForJobWithRunEnvironment(parent context.Context, jobID int64, argv []string, timeout int, output io.Writer, directory string, runEnvironment map[string]string) int {
+	return controller.executeCommandWithRunEnvironment(parent, jobID, argv, timeout, output, directory, nil, runEnvironment)
+}
+
 func (controller *Controller) executeCommandWithEnvForJob(parent context.Context, jobID int64, argv []string, timeout int, output io.Writer, directory string, environment map[string]string) int {
+	return controller.executeCommandWithRunEnvironment(parent, jobID, argv, timeout, output, directory, environment, nil)
+}
+
+func (controller *Controller) executeCommandWithRunEnvironment(parent context.Context, jobID int64, argv []string, timeout int, output io.Writer, directory string, environment, runEnvironment map[string]string) int {
 	if len(argv) == 0 || argv[0] == "" {
 		fmt.Fprintln(output, "BitCI job has no configured command")
 		return 127
@@ -2497,6 +2510,9 @@ func (controller *Controller) executeCommandWithEnvForJob(parent context.Context
 		defer cancel()
 	}
 	env := taskEnvironment(environment, directory)
+	for name, value := range runEnvironment {
+		env = setEnvironmentValue(env, name, value)
+	}
 	program := argv[0]
 	if !strings.ContainsRune(program, filepath.Separator) {
 		resolved, err := lookPath(program, env, directory)
@@ -2613,6 +2629,20 @@ func (controller *Controller) processGroupPath(directory string) (string, bool) 
 	return filepath.Join(jobRoot, "bitci-process-group"), true
 }
 
+func (controller *Controller) jobRunEnvironment(job Job, directory, worktreeRoot string) map[string]string {
+	if worktreeRoot == "" {
+		worktreeRoot = directory
+	}
+	return map[string]string{
+		"BITCI_JOB_ID":        strconv.FormatInt(job.ID, 10),
+		"BITCI_WORKTREE":      worktreeRoot,
+		"BITCI_LOG_PATH":      job.LogPath,
+		"BITCI_STATE_DIR":     controller.stateDir,
+		"BITCI_SUBMITTED_SHA": job.SubmittedRef,
+		"BITCI_TESTED_SHA":    job.TestedSHA,
+	}
+}
+
 func (controller *Controller) terminateJobProcessGroup(id int64) error {
 	path := filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", id), "bitci-process-group")
 	data, err := os.ReadFile(path)
@@ -2688,6 +2718,17 @@ func taskEnvironment(overrides map[string]string, directory string) []string {
 		environment = append(environment, name+"="+values[name])
 	}
 	return environment
+}
+
+func setEnvironmentValue(environment []string, name, value string) []string {
+	prefix := name + "="
+	for index, item := range environment {
+		if strings.HasPrefix(item, prefix) {
+			environment[index] = prefix + value
+			return environment
+		}
+	}
+	return append(environment, prefix+value)
 }
 
 func (controller *Controller) finish(job Job, code int, cleanupPending bool) error {

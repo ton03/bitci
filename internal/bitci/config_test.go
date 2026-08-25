@@ -490,6 +490,29 @@ func TestConfiguredTaskEnvironment(t *testing.T) {
 	}
 }
 
+func TestJobRunEnvironment(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["sh","-c","test \"$BITCI_JOB_ID\" = 1 && test \"$BITCI_WORKTREE\" = \"$PWD\" && test -n \"$BITCI_LOG_PATH\" && test -n \"$BITCI_STATE_DIR\""],"env":{"BITCI_JOB_ID":"spoof"}}}}`)
+	stateDir := filepath.Join(t.TempDir(), "state")
+	controller, err := Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 || jobs[0].State != "passed" {
+		t.Fatalf("run environment job = %#v", jobs)
+	}
+}
+
 func TestTaskEnvironmentPathControlsCommandLookup(t *testing.T) {
 	tools := t.TempDir()
 	tool := filepath.Join(tools, "bitci-test-tool")
