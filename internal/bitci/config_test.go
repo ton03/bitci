@@ -1985,20 +1985,14 @@ func TestPathWithinUsesFilesystemIdentity(t *testing.T) {
 func TestRecordedSHAPreparesEachWorktree(t *testing.T) {
 	checkout := t.TempDir()
 	configPath := filepath.Join(checkout, "bitci.json")
-	if err := os.WriteFile(configPath, []byte(`{"version":1,"prepare":["sh","bootstrap"],"tasks":{"unit":{"run":["sh","runner"]}}}`), 0o600); err != nil {
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"prepare":["touch","ready"],"tasks":{"unit":{"run":["test","-f","ready"]}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(checkout, ".gitignore"), []byte("ready\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(checkout, "bootstrap"), []byte(": > ready\n"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(checkout, "runner"), []byte("test -f ready\n"), 0o700); err != nil {
-		t.Fatal(err)
-	}
 	git(t, checkout, "init", "-q")
-	git(t, checkout, "add", "bitci.json", ".gitignore", "bootstrap", "runner")
+	git(t, checkout, "add", "bitci.json", ".gitignore")
 	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
 	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
 	if err != nil {

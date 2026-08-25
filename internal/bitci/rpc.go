@@ -170,7 +170,7 @@ func (controller *Controller) ServeRPC(ctx context.Context, listener net.Listene
 	}
 }
 
-func (controller *Controller) handleRPC(_ context.Context, request RPCRequest) RPCResponse {
+func (controller *Controller) handleRPC(ctx context.Context, request RPCRequest) RPCResponse {
 	result := func(value any, err error) RPCResponse {
 		if err != nil {
 			return RPCResponse{Error: err.Error()}
@@ -215,7 +215,7 @@ func (controller *Controller) handleRPC(_ context.Context, request RPCRequest) R
 		if err := json.Unmarshal(request.Params, &params); err != nil {
 			return RPCResponse{Error: err.Error()}
 		}
-		return result(controller.Submit(params.TaskIDs, params.Ref))
+		return result(controller.SubmitContext(ctx, params.TaskIDs, params.Ref))
 	case "cancel":
 		var params JobParams
 		if err := json.Unmarshal(request.Params, &params); err != nil {
@@ -228,7 +228,7 @@ func (controller *Controller) handleRPC(_ context.Context, request RPCRequest) R
 		if err := json.Unmarshal(request.Params, &params); err != nil {
 			return RPCResponse{Error: err.Error()}
 		}
-		return result(controller.Retry(params.ID))
+		return result(controller.RetryContext(ctx, params.ID))
 	default:
 		return RPCResponse{Error: fmt.Sprintf("unknown method %q", request.Method)}
 	}

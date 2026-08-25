@@ -37,7 +37,8 @@ type Controller struct {
 	ownerMu        sync.Mutex
 	ownerRelease   func()
 	ownerCount     int
-	stageMu        sync.Mutex
+	stageInit      sync.Once
+	stageGate      chan struct{}
 	recoveryMu     sync.Mutex
 	recovered      bool
 }
@@ -110,6 +111,7 @@ func OpenState(configPath, stateDir string) (*Controller, error) {
 	}
 	db.SetMaxOpenConns(1)
 	controller := &Controller{configPath: configPath, stateDir: stateDir, db: db}
+	controller.initStageGate()
 	if err := controller.migrate(); err != nil {
 		db.Close()
 		return nil, err
@@ -281,6 +283,10 @@ func (controller *Controller) addBatchRefColumn(name, definition string) error {
 }
 
 func (controller *Controller) Submit(taskNames []string, ref string) ([]Job, error) {
+	return controller.SubmitContext(context.Background(), taskNames, ref)
+}
+
+func (controller *Controller) SubmitContext(ctx context.Context, taskNames []string, ref string) ([]Job, error) {
 	if isCheckoutSHA(ref) {
 		ref = strings.ToLower(ref)
 	}
@@ -301,7 +307,7 @@ func (controller *Controller) Submit(taskNames []string, ref string) ([]Job, err
 	} else if isCheckoutSHA(ref) {
 		return nil, fmt.Errorf("cannot submit requested checkout SHA: %w", err)
 	}
-	return controller.submit(controller.config, taskNames, ref, checkoutRoot, configRelative)
+	return controller.submit(ctx, controller.config, taskNames, ref, checkoutRoot, configRelative)
 }
 
 func recordedDirectoryExists(checkoutRoot, ref, relative string) error {
@@ -315,8 +321,8 @@ func recordedDirectoryExists(checkoutRoot, ref, relative string) error {
 	return nil
 }
 
-func (controller *Controller) submit(config Config, taskNames []string, ref, checkoutRoot, configRelative string) ([]Job, error) {
-	releaseStage, err := controller.acquireStageLock(context.Background())
+func (controller *Controller) submit(ctx context.Context, config Config, taskNames []string, ref, checkoutRoot, configRelative string) ([]Job, error) {
+	releaseStage, err := controller.acquireStageLock(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("lock checkout for submit: %w", err)
 	}
@@ -414,7 +420,7 @@ func (controller *Controller) runOnce(ctx context.Context, maxWorkers int) (bool
 	if ctx.Err() != nil {
 		return false, nil
 	}
-	job, claimed, err := controller.claim(maxWorkers)
+	job, claimed, err := controller.claimContext(ctx, maxWorkers)
 	if err != nil || !claimed {
 		return false, err
 	}
@@ -456,7 +462,7 @@ func (controller *Controller) runOnce(ctx context.Context, maxWorkers int) (bool
 	if isCheckoutSHA(job.Ref) && !controller.workDirWithinWorktree(worktreeRoot, workDir) {
 		fmt.Fprintln(logFile, "BitCI refuses a task work directory outside the recorded worktree")
 		code = 126
-	} else if isCheckoutSHA(job.Ref) && len(config.Prepare) > 0 && controller.hasUnsafeCheckoutCommand(config.Prepare, job.checkoutRoot, worktreeRoot, workDir, nil) {
+	} else if isCheckoutSHA(job.Ref) && len(config.Prepare) > 0 && controller.hasUnsafePrepareCommand(config.Prepare, job.checkoutRoot, worktreeRoot, workDir) {
 		fmt.Fprintln(logFile, "BitCI refuses an unsafe checkout-local prepare argument for a recorded SHA job")
 		code = 126
 	} else {
@@ -683,6 +689,7 @@ func copyRecordedObjects(ctx context.Context, checkoutRoot, ref, stateDir, objec
 	var indexError bytes.Buffer
 	index.Stderr = &indexError
 	if err := index.Start(); err != nil {
+		_ = packOutput.Close()
 		return "", fmt.Errorf("start recorded checkout object import: %w", err)
 	}
 	if err := pack.Start(); err != nil {
@@ -777,6 +784,10 @@ func verifyJobGitMetadata(gitDirectory string) error {
 }
 
 func (controller *Controller) verifyJobWorktree(worktreeRoot, ref string, expectedOwner []byte) error {
+	rootInfo, err := os.Lstat(worktreeRoot)
+	if err != nil || !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("worktree root changed")
+	}
 	gitDirectory := filepath.Join(worktreeRoot, ".git")
 	info, err := os.Lstat(gitDirectory)
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
@@ -914,21 +925,26 @@ func (controller *Controller) lockOwner() (func(), error) {
 }
 
 func (controller *Controller) acquireStageLock(ctx context.Context) (func(), error) {
-	controller.stageMu.Lock()
+	controller.initStageGate()
+	select {
+	case <-controller.stageGate:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	gitMetadata, err := gitCommonDirectory(controller.configPath)
 	if err != nil {
-		controller.stageMu.Unlock()
+		controller.stageGate <- struct{}{}
 		return func() {}, nil
 	}
 	file, err := os.OpenFile(filepath.Join(gitMetadata, "bitci-stage.lock"), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		controller.stageMu.Unlock()
+		controller.stageGate <- struct{}{}
 		return nil, err
 	}
 	release := func() {
 		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
 		_ = file.Close()
-		controller.stageMu.Unlock()
+		controller.stageGate <- struct{}{}
 	}
 	for {
 		err = syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
@@ -950,6 +966,13 @@ func (controller *Controller) acquireStageLock(ctx context.Context) (func(), err
 		case <-timer.C:
 		}
 	}
+}
+
+func (controller *Controller) initStageGate() {
+	controller.stageInit.Do(func() {
+		controller.stageGate = make(chan struct{}, 1)
+		controller.stageGate <- struct{}{}
+	})
 }
 
 func (controller *Controller) acquireOwner() (func(), error) {
@@ -1143,6 +1166,15 @@ func (controller *Controller) cleanupOrphanBatchRefs() error {
 }
 
 func (controller *Controller) releaseBatchRef(batch, checkoutRoot string) error {
+	releaseStage, err := controller.acquireStageLock(context.Background())
+	if err != nil {
+		return err
+	}
+	defer releaseStage()
+	return controller.releaseBatchRefUnlocked(batch, checkoutRoot)
+}
+
+func (controller *Controller) releaseBatchRefUnlocked(batch, checkoutRoot string) error {
 	var protected int
 	if err := controller.db.QueryRow("SELECT COUNT(*) FROM jobs WHERE batch = ? AND (state IN ('queued', 'running') OR cleanup_pending = 1)", batch).Scan(&protected); err != nil || protected != 0 {
 		return err
@@ -1175,6 +1207,15 @@ func (controller *Controller) releaseBatchRef(batch, checkoutRoot string) error 
 }
 
 func (controller *Controller) releaseFinishedBatchRefs() error {
+	releaseStage, err := controller.acquireStageLock(context.Background())
+	if err != nil {
+		return err
+	}
+	defer releaseStage()
+	return controller.releaseFinishedBatchRefsUnlocked()
+}
+
+func (controller *Controller) releaseFinishedBatchRefsUnlocked() error {
 	rows, err := controller.db.Query("SELECT batch, COALESCE(checkout_root, '') FROM jobs GROUP BY batch HAVING SUM(CASE WHEN state IN ('queued', 'running') OR cleanup_pending = 1 THEN 1 ELSE 0 END) = 0")
 	if err != nil {
 		return err
@@ -1197,7 +1238,7 @@ func (controller *Controller) releaseFinishedBatchRefs() error {
 		return err
 	}
 	for _, item := range batches {
-		if err := controller.releaseBatchRef(item.batch, item.checkoutRoot); err != nil {
+		if err := controller.releaseBatchRefUnlocked(item.batch, item.checkoutRoot); err != nil {
 			return err
 		}
 	}
@@ -1218,6 +1259,10 @@ func (controller *Controller) removeJobWorktree(id int64, _ string) error {
 	} else if err != nil {
 		return err
 	}
+	rootInfo, err := os.Lstat(path)
+	if err != nil || !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refuse to remove changed job worktree root")
+	}
 	owner, err := os.ReadFile(jobCheckoutOwnerPath(path))
 	if err != nil || !bytes.Equal(owner, jobCheckoutOwner(Job{ID: id, Ref: ref})) {
 		return fmt.Errorf("refuse to remove unverified job worktree")
@@ -1233,7 +1278,11 @@ func (controller *Controller) removeJobWorktree(id int64, _ string) error {
 }
 
 func (controller *Controller) claim(maxWorkers int) (Job, bool, error) {
-	releaseStage, err := controller.acquireStageLock(context.Background())
+	return controller.claimContext(context.Background(), maxWorkers)
+}
+
+func (controller *Controller) claimContext(ctx context.Context, maxWorkers int) (Job, bool, error) {
+	releaseStage, err := controller.acquireStageLock(ctx)
 	if err != nil {
 		return Job{}, false, fmt.Errorf("lock checkout for claim: %w", err)
 	}
@@ -1331,7 +1380,7 @@ func (controller *Controller) claim(maxWorkers int) (Job, bool, error) {
 		if err := transaction.Commit(); err != nil {
 			return Job{}, false, err
 		}
-		return Job{}, false, controller.releaseFinishedBatchRefs()
+		return Job{}, false, controller.releaseFinishedBatchRefsUnlocked()
 	}
 	return Job{}, false, nil
 }
@@ -1523,6 +1572,16 @@ func (controller *Controller) hasUnsafeCheckoutCommand(argv []string, checkoutRo
 		}
 	}
 	return false
+}
+
+func (controller *Controller) hasUnsafePrepareCommand(argv []string, checkoutRoot, worktreeRoot, workDir string) bool {
+	if controller.hasUnsafeCheckoutCommand(argv, checkoutRoot, worktreeRoot, workDir, nil) {
+		return true
+	}
+	if worktreeRoot == "" || len(argv) == 0 {
+		return false
+	}
+	return interpreterCommand(argv) || filepath.IsAbs(argv[0]) || strings.ContainsRune(argv[0], filepath.Separator)
 }
 
 func (controller *Controller) isCheckoutScript(script, checkoutRoot, worktreeRoot, workDir string, environment []string) bool {
@@ -2059,6 +2118,10 @@ func (controller *Controller) Cancel(id int64) (bool, error) {
 }
 
 func (controller *Controller) Retry(id int64) ([]Job, error) {
+	return controller.RetryContext(context.Background(), id)
+}
+
+func (controller *Controller) RetryContext(ctx context.Context, id int64) ([]Job, error) {
 	var task, ref, configJSON, checkoutRoot, configRelative string
 	if err := controller.db.QueryRow("SELECT task, ref, COALESCE(config_json, ''), COALESCE(checkout_root, ''), COALESCE(config_relative, '') FROM jobs WHERE id = ?", id).Scan(&task, &ref, &configJSON, &checkoutRoot, &configRelative); err != nil {
 		return nil, err
@@ -2080,7 +2143,7 @@ func (controller *Controller) Retry(id int64) ([]Job, error) {
 			return nil, fmt.Errorf("find checkout for retried SHA: %w", err)
 		}
 	}
-	return controller.submit(config, []string{task}, ref, checkoutRoot, configRelative)
+	return controller.submit(ctx, config, []string{task}, ref, checkoutRoot, configRelative)
 }
 
 func (controller *Controller) TailLog(id int64, limit int) ([]string, error) {
