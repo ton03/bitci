@@ -1178,10 +1178,14 @@ func (controller *Controller) releaseBatchRefContext(ctx context.Context, batch,
 		return err
 	}
 	defer releaseStage()
-	return controller.releaseBatchRefUnlocked(batch, checkoutRoot)
+	return controller.releaseBatchRefUnlockedContext(ctx, batch, checkoutRoot)
 }
 
 func (controller *Controller) releaseBatchRefUnlocked(batch, checkoutRoot string) error {
+	return controller.releaseBatchRefUnlockedContext(context.Background(), batch, checkoutRoot)
+}
+
+func (controller *Controller) releaseBatchRefUnlockedContext(ctx context.Context, batch, checkoutRoot string) error {
 	var protected int
 	if err := controller.db.QueryRow("SELECT COUNT(*) FROM jobs WHERE batch = ? AND (state IN ('queued', 'running') OR cleanup_pending = 1)", batch).Scan(&protected); err != nil || protected != 0 {
 		return err
@@ -1202,11 +1206,11 @@ func (controller *Controller) releaseBatchRefUnlocked(batch, checkoutRoot string
 		}
 	}
 	ref := batchRef(batch)
-	actual, err := gitAt(context.Background(), checkoutRoot, "rev-parse", "--verify", ref+"^{commit}")
+	actual, err := gitAt(ctx, checkoutRoot, "rev-parse", "--verify", ref+"^{commit}")
 	if err != nil || !strings.EqualFold(strings.TrimSpace(actual), expected) {
 		return nil
 	}
-	_, err = gitAt(context.Background(), checkoutRoot, "update-ref", "-d", ref)
+	_, err = gitAt(ctx, checkoutRoot, "update-ref", "-d", ref)
 	if err == nil {
 		_, _ = controller.db.Exec("DELETE FROM batch_refs WHERE batch = ?", batch)
 	}
@@ -1360,7 +1364,7 @@ func (controller *Controller) claimContext(ctx context.Context, maxWorkers int) 
 			continue
 		}
 		if isCheckoutSHA(job.Ref) {
-			created, err := controller.pinClaimedJob(transaction, &job)
+			created, err := controller.pinClaimedJob(ctx, transaction, &job)
 			if err != nil {
 				return Job{}, false, err
 			}
@@ -1395,7 +1399,7 @@ func (controller *Controller) claimContext(ctx context.Context, maxWorkers int) 
 	return Job{}, false, nil
 }
 
-func (controller *Controller) pinClaimedJob(transaction *sql.Tx, job *Job) (bool, error) {
+func (controller *Controller) pinClaimedJob(ctx context.Context, transaction *sql.Tx, job *Job) (bool, error) {
 	if job.checkoutRoot == "" {
 		root, relative, err := controller.checkoutLocation()
 		if err != nil {
@@ -1417,7 +1421,7 @@ func (controller *Controller) pinClaimedJob(transaction *sql.Tx, job *Job) (bool
 	} else if !strings.EqualFold(existing, job.Ref) {
 		return false, fmt.Errorf("batch %s has unexpected recorded ref", job.Batch)
 	}
-	actual, err := gitAt(context.Background(), job.checkoutRoot, "rev-parse", "--verify", batchRef(job.Batch)+"^{commit}")
+	actual, err := gitAt(ctx, job.checkoutRoot, "rev-parse", "--verify", batchRef(job.Batch)+"^{commit}")
 	if err == nil {
 		if !strings.EqualFold(strings.TrimSpace(actual), job.Ref) {
 			return false, fmt.Errorf("batch %s ref changed unexpectedly", job.Batch)
@@ -1428,7 +1432,7 @@ func (controller *Controller) pinClaimedJob(transaction *sql.Tx, job *Job) (bool
 	if _, err := transaction.Exec("INSERT OR REPLACE INTO batch_refs(batch, checkout_root, ref) VALUES (?, ?, ?)", job.Batch, job.checkoutRoot, job.Ref); err != nil {
 		return false, err
 	}
-	if _, err := gitAt(context.Background(), job.checkoutRoot, "update-ref", batchRef(job.Batch), job.Ref); err != nil {
+	if _, err := gitAt(ctx, job.checkoutRoot, "update-ref", batchRef(job.Batch), job.Ref); err != nil {
 		return false, fmt.Errorf("pin recorded checkout SHA: %w", err)
 	}
 	return created, nil
