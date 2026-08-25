@@ -130,6 +130,10 @@ func OpenState(configPath, stateDir string) (*Controller, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
+	if _, err := db.Exec("PRAGMA busy_timeout = 5000"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("configure SQLite busy timeout: %w", err)
+	}
 	controller := &Controller{configPath: configPath, stateDir: stateDir, db: db}
 	controller.initStageGate()
 	if err := controller.migrate(); err != nil {

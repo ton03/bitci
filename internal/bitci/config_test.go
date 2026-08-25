@@ -320,6 +320,22 @@ func TestDefaultStateDirStaysOutsideCheckout(t *testing.T) {
 	}
 }
 
+func TestOpenStateConfiguresSQLiteBusyTimeout(t *testing.T) {
+	controller, err := OpenState(filepath.Join(t.TempDir(), "bitci.json"), filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+
+	var timeout int
+	if err := controller.db.QueryRow("PRAGMA busy_timeout").Scan(&timeout); err != nil {
+		t.Fatal(err)
+	}
+	if timeout < 5000 {
+		t.Fatalf("SQLite busy timeout = %d, want at least 5000 ms", timeout)
+	}
+}
+
 func TestOpenRejectsStateInsideGitMetadata(t *testing.T) {
 	checkout := t.TempDir()
 	configPath := filepath.Join(checkout, "bitci.json")
