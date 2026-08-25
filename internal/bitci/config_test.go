@@ -1,8 +1,13 @@
 package bitci
 
 import (
+	"bufio"
 	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -10,7 +15,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -40,13 +47,249 @@ func TestConfigContract(t *testing.T) {
 	if _, err := LoadConfig(writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["x"],"raw":"no"}}}`)); err == nil {
 		t.Fatal("unknown config key passed")
 	}
+	if _, err := LoadConfig(writeConfig(t, `{"version":1,"log_retention":-1,"tasks":{"unit":{"run":["x"]}}}`)); err == nil {
+		t.Fatal("negative log retention passed")
+	}
+	if _, err := LoadConfig(writeConfig(t, `{"version":1,"redact":[""],"tasks":{"unit":{"run":["x"]}}}`)); err == nil {
+		t.Fatal("empty redaction value passed")
+	}
+	if _, err := LoadConfig(writeConfig(t, `{"version":1,"redact":["first\nsecond"],"tasks":{"unit":{"run":["x"]}}}`)); err == nil {
+		t.Fatal("multiline redaction value passed")
+	}
+	if _, err := LoadConfig(writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["x"],"env":{"BAD-NAME":"value"}}}}`)); err == nil {
+		t.Fatal("invalid environment variable passed")
+	}
+	if _, err := LoadConfig(writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["x"],"env":{"VALUE":"bad\u0000value"}}}}`)); err == nil {
+		t.Fatal("NUL environment value passed")
+	}
+	if _, err := LoadConfig(writeConfig(t, `{"version":1,"resources":{"cpu":1},"tasks":{"unit":{"run":["x"],"resources":["cpu","cpu"]}}}`)); err == nil {
+		t.Fatal("duplicate task resource passed")
+	}
+}
+
+func TestLogsRedactConfiguredValues(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"redact":["secret-value"],"tasks":{"unit":{"run":["printf","secret-value\\n"]}}}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	jobs, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	lines, err := controller.TailLog(jobs[0].ID, 80)
+	if err != nil || strings.Join(lines, "") != "[REDACTED]" {
+		t.Fatalf("redacted logs = %q, %v", lines, err)
+	}
+}
+
+func TestLogsRedactLongestConfiguredValueFirst(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"redact":["secret","secret-value"],"tasks":{"unit":{"run":["printf","secret-value\\n"]}}}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	jobs, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	lines, err := controller.TailLog(jobs[0].ID, 80)
+	if err != nil || strings.Join(lines, "") != "[REDACTED]" {
+		t.Fatalf("redacted logs = %q, %v", lines, err)
+	}
+}
+
+func TestLogReadsUsePersistedRedaction(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"redact":["stored-secret"],"tasks":{"unit":{"run":["printf","stored-secret marker\\n"]}}}`)
+	stateDir := filepath.Join(t.TempDir(), "state")
+	controller, err := Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	if err := controller.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"redact":["new-secret"],"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	controller, err = Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	lines, err := controller.TailLog(jobs[0].ID, 80)
+	if err != nil || strings.Join(lines, "") != "[REDACTED] marker" {
+		t.Fatalf("tail with persisted redaction = %q, %v", lines, err)
+	}
+	lines, err = controller.SearchLog(jobs[0].ID, "marker", 80)
+	if err != nil || strings.Join(lines, "") != "[REDACTED] marker" {
+		t.Fatalf("search with persisted redaction = %q, %v", lines, err)
+	}
+	lines, err = controller.SearchLog(jobs[0].ID, "stored-secret", 80)
+	if err != nil || strings.Join(lines, "") != "[REDACTED] marker" {
+		t.Fatalf("secret search with persisted redaction = %q, %v", lines, err)
+	}
+	output, err := controller.ReadLog(jobs[0].ID, 0, 80)
+	if err != nil || strings.Join(output.Lines, "") != "[REDACTED] marker" {
+		t.Fatalf("cursor read with persisted redaction = %#v, %v", output, err)
+	}
+}
+
+func TestLogRetentionPrunesFinishedLogs(t *testing.T) {
+	for _, retention := range []int{2, 0} {
+		t.Run(fmt.Sprintf("keeps-%d", retention), func(t *testing.T) {
+			configPath := writeConfig(t, fmt.Sprintf(`{"version":1,"log_retention":%d,"tasks":{"unit":{"run":["true"]}}}`, retention))
+			stateDir := filepath.Join(t.TempDir(), "state")
+			controller, err := Open(configPath, stateDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer controller.Close()
+
+			paths := make([]string, 3)
+			for index := range paths {
+				path := filepath.Join(stateDir, "logs", fmt.Sprintf("retention-%d.log", index))
+				if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte("log"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				paths[index] = path
+				if _, err := controller.db.Exec("INSERT INTO jobs(batch, task, ref, state, created_at, finished_at, log_path) VALUES (?, ?, ?, 'passed', ?, ?, ?)", "batch", "unit", "", fmt.Sprintf("2026-01-01T00:00:0%dZ", index), fmt.Sprintf("2026-01-01T00:00:1%dZ", index), path); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if err := controller.pruneLogs(); err != nil {
+				t.Fatal(err)
+			}
+			jobs, err := controller.Jobs()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for index, job := range jobs {
+				wantRetained := retention == 0 || index >= len(jobs)-retention
+				if got := job.LogPath != ""; got != wantRetained {
+					t.Fatalf("job %d retained metadata = %v, want %v", job.ID, got, wantRetained)
+				}
+				_, err := os.Stat(paths[index])
+				if got := err == nil; got != wantRetained {
+					t.Fatalf("job %d retained file = %v, want %v", job.ID, got, wantRetained)
+				}
+			}
+		})
+	}
+}
+
+func TestLogRetentionIgnoresJobsWithoutLogs(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"log_retention":1,"tasks":{"unit":{"run":["true"]}}}`)
+	stateDir := filepath.Join(t.TempDir(), "state")
+	controller, err := Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	path := filepath.Join(stateDir, "logs", "retained.log")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("log"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.db.Exec("INSERT INTO jobs(batch, task, ref, state, created_at, finished_at, log_path) VALUES (?, ?, ?, 'passed', ?, ?, ?)", "batch", "unit", "", "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z", path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.db.Exec("INSERT INTO jobs(batch, task, ref, state, created_at, finished_at, log_path) VALUES (?, ?, ?, 'failed', ?, ?, ?)", "batch", "unit", "", "2026-01-01T00:00:01Z", "2026-01-01T00:00:01Z", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.pruneLogs(); err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := jobs[0].LogPath; got != path {
+		t.Fatalf("retained log path = %q, want %q", got, path)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFinishReleasesLeaseWhenLogPruningFails(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"log_retention":1,"resources":{"cpu":1},"tasks":{"unit":{"run":["true"],"resources":["cpu"]}}}`)
+	stateDir := filepath.Join(t.TempDir(), "state")
+	controller, err := Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	oldLog := filepath.Join(stateDir, "logs", "cannot-remove")
+	if err := os.MkdirAll(oldLog, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(oldLog, "locked"), []byte("log"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.db.Exec("INSERT INTO jobs(batch, task, ref, state, created_at, finished_at, log_path) VALUES ('old', 'unit', '', 'passed', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', ?)", oldLog); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.Submit([]string{"unit"}, "manual"); err != nil {
+		t.Fatal(err)
+	}
+	job, claimed, err := controller.claim(1)
+	if err != nil || !claimed {
+		t.Fatalf("claim = %v, %v", claimed, err)
+	}
+	job.LogPath = filepath.Join(stateDir, "logs", "current.log")
+	if err := os.WriteFile(job.LogPath, []byte("log"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.finish(job, 0, false); err == nil {
+		t.Fatal("finish succeeded despite log pruning failure")
+	}
+	var leases int
+	if err := controller.db.QueryRow("SELECT COUNT(*) FROM leases WHERE job_id = ?", job.ID).Scan(&leases); err != nil {
+		t.Fatal(err)
+	}
+	if leases != 0 {
+		t.Fatalf("terminal job retains %d leases", leases)
+	}
 }
 
 func TestStackExamplesValidate(t *testing.T) {
 	root := filepath.Clean(filepath.Join("..", ".."))
-	for _, name := range []string{"go-backend", "node-backend", "nx-monorepo"} {
-		if _, err := LoadConfig(filepath.Join(root, "examples", name+".bitci.json")); err != nil {
+	expected := map[string]map[string]string{
+		"go-backend":   {"test": "go", "vet": "go"},
+		"node-backend": {"test": "npm", "typecheck": "npm"},
+		"nx-monorepo":  {"test": "npx", "e2e": "npx"},
+	}
+	for name, tasks := range expected {
+		config, err := LoadConfig(filepath.Join(root, "examples", name+".bitci.json"))
+		if err != nil {
 			t.Fatalf("%s example: %v", name, err)
+		}
+		for taskName, command := range tasks {
+			if got := config.Tasks[taskName].Run[0]; got != command {
+				t.Fatalf("%s %s command = %q, want %q", name, taskName, got, command)
+			}
 		}
 	}
 }
@@ -56,6 +299,100 @@ func TestDefaultStateDirStaysOutsideCheckout(t *testing.T) {
 	stateDir := DefaultStateDir(configPath, "")
 	if strings.HasPrefix(stateDir, filepath.Dir(configPath)+string(filepath.Separator)) {
 		t.Fatalf("state directory %q is inside checkout", stateDir)
+	}
+}
+
+func TestOpenRejectsStateInsideGitMetadata(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	controller, err := Open(configPath, filepath.Join(checkout, ".git"))
+	if err == nil {
+		controller.Close()
+		t.Fatal("opened state inside Git metadata")
+	}
+	if !strings.Contains(err.Error(), "state directory must not overlap Git metadata") {
+		t.Fatalf("Open error = %v", err)
+	}
+}
+
+func TestOpenStateRejectsStateInsideGitMetadata(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	controller, err := OpenState(configPath, filepath.Join(checkout, ".git"))
+	if err == nil {
+		controller.Close()
+		t.Fatal("opened state inside Git metadata")
+	}
+	if !strings.Contains(err.Error(), "state directory must not overlap Git metadata") {
+		t.Fatalf("OpenState error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(checkout, ".git", "bitci.db")); !os.IsNotExist(err) {
+		t.Fatalf("created rejected state database: %v", err)
+	}
+}
+
+func TestOpenStateRejectsCaseAliasOfGitMetadata(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "missing-bitci.json")
+	git(t, checkout, "init", "-q")
+	controller, err := OpenState(configPath, filepath.Join(checkout, ".GIT", "new-state"))
+	if err == nil {
+		controller.Close()
+		t.Fatal("opened state inside a case alias of Git metadata")
+	}
+	if !strings.Contains(err.Error(), "state directory must not overlap Git metadata") {
+		t.Fatalf("OpenState error = %v", err)
+	}
+}
+
+func TestOpenStateRejectsStateSymlinkToOtherGitMetadata(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "missing-bitci.json")
+	otherCheckout := t.TempDir()
+	git(t, otherCheckout, "init", "-q")
+	stateLink := filepath.Join(t.TempDir(), "state")
+	if err := os.Symlink(filepath.Join(otherCheckout, ".git"), stateLink); err != nil {
+		t.Fatal(err)
+	}
+	controller, err := OpenState(configPath, stateLink)
+	if err == nil {
+		controller.Close()
+		t.Fatal("opened state through a Git metadata symlink")
+	}
+	if !strings.Contains(err.Error(), "state directory must not overlap Git metadata") {
+		t.Fatalf("OpenState error = %v", err)
+	}
+}
+
+func TestOpenRejectsStateInsideGitMetadataThroughUncreatedSymlinkDescendant(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	link := filepath.Join(checkout, "meta")
+	if err := os.Symlink(".git", link); err != nil {
+		t.Fatal(err)
+	}
+	stateDir := filepath.Join(link, "new-state")
+	controller, err := Open(configPath, stateDir)
+	if err == nil {
+		controller.Close()
+		t.Fatal("opened state inside Git metadata through a symlink")
+	}
+	if !strings.Contains(err.Error(), "state directory must not overlap Git metadata") {
+		t.Fatalf("Open error = %v", err)
+	}
+	if _, err := os.Stat(stateDir); !os.IsNotExist(err) {
+		t.Fatalf("created rejected state directory: %v", err)
 	}
 }
 
@@ -96,6 +433,75 @@ func TestQueueContract(t *testing.T) {
 	}
 }
 
+func TestConfiguredTaskEnvironment(t *testing.T) {
+	t.Setenv("BITCI_TASK_ENV", "inherited")
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["sh","-c","test \"$BITCI_TASK_ENV\" = configured"],"env":{"BITCI_TASK_ENV":"configured"}}}}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "passed" {
+		t.Fatalf("configured environment job = %#v", jobs[0])
+	}
+}
+
+func TestTaskEnvironmentPathControlsCommandLookup(t *testing.T) {
+	tools := t.TempDir()
+	tool := filepath.Join(tools, "bitci-test-tool")
+	if err := os.WriteFile(tool, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := writeConfig(t, fmt.Sprintf(`{"version":1,"tasks":{"unit":{"run":["bitci-test-tool"],"env":{"PATH":%q}}}}`, tools))
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil || jobs[0].State != "passed" {
+		t.Fatalf("PATH override job = %#v, %v", jobs, err)
+	}
+}
+
+func TestInvalidLegacyJobDoesNotBlockQueue(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.db.Exec("INSERT INTO jobs(batch, task, ref, state, created_at) VALUES ('legacy', 'removed', '', 'queued', '2026-01-01T00:00:00Z')"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil || jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 127 || jobs[1].State != "passed" {
+		t.Fatalf("legacy queue recovery = %#v, %v", jobs, err)
+	}
+}
+
 func TestResourceLeaseBlocksSecondClaim(t *testing.T) {
 	configPath := writeConfig(t, `{
 		"version": 1,
@@ -118,6 +524,130 @@ func TestResourceLeaseBlocksSecondClaim(t *testing.T) {
 	}
 	if _, claimed, err := controller.claim(2); err != nil || claimed {
 		t.Fatalf("second claim = %v, %v", claimed, err)
+	}
+}
+
+func TestRecordedSHAJobsOverlapWithMultipleWorkers(t *testing.T) {
+	controller, events := recordedSHAConcurrentController(t, false)
+	defer controller.Close()
+
+	jobs, err := controller.Submit([]string{"first"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstSHA := jobs[0].Ref
+	jobs, err = controller.Submit([]string{"second"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].Ref != firstSHA {
+		t.Fatalf("recorded SHA = %q, want %q", jobs[0].Ref, firstSHA)
+	}
+
+	results := make(chan error, 2)
+	for range 2 {
+		go func() {
+			ran, err := controller.RunOnce(context.Background(), 2)
+			if err == nil && !ran {
+				err = fmt.Errorf("worker did not run a queued job")
+			}
+			results <- err
+		}()
+	}
+	awaitFile(t, filepath.Join(events, "first.started"))
+	awaitFile(t, filepath.Join(events, "second.started"))
+
+	stored, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 2 {
+		t.Fatalf("job count = %d, want 2", len(stored))
+	}
+	for _, job := range stored {
+		if job.State != "running" || job.TestedSHA != firstSHA {
+			t.Fatalf("overlapping recorded SHA job = %#v", job)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(events, "release"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertJobsPassed(t, controller)
+}
+
+func TestRecordedSHAJobsWithSameResourceSerialize(t *testing.T) {
+	controller, events := recordedSHAConcurrentController(t, true)
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"first"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.Submit([]string{"second"}, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		ran, err := controller.RunOnce(context.Background(), 2)
+		if err == nil && !ran {
+			err = fmt.Errorf("worker did not run the first queued job")
+		}
+		result <- err
+	}()
+	awaitFile(t, filepath.Join(events, "first.started"))
+	if ran, err := controller.RunOnce(context.Background(), 2); err != nil || ran {
+		t.Fatalf("same-resource claim = %v, %v", ran, err)
+	}
+	stored, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored) != 2 {
+		t.Fatalf("job count = %d, want 2", len(stored))
+	}
+	if stored[0].State != "running" || stored[1].State != "queued" {
+		t.Fatalf("same-resource jobs = %#v", stored)
+	}
+
+	if err := os.WriteFile(filepath.Join(events, "release"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 2); err != nil || !ran {
+		t.Fatalf("run serialized job = %v, %v", ran, err)
+	}
+	assertJobsPassed(t, controller)
+}
+
+func TestResourceLeaseUsesLowestActiveSnapshotLimit(t *testing.T) {
+	configPath := writeConfig(t, `{
+		"version": 1,
+		"resources": {"browser": 1},
+		"tasks": {"browser": {"run": ["true"], "resources": ["browser"]}}
+	}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"browser"}, "one"); err != nil {
+		t.Fatal(err)
+	}
+	if _, claimed, err := controller.claim(2); err != nil || !claimed {
+		t.Fatalf("first claim = %v, %v", claimed, err)
+	}
+	newer := `{"version":1,"resources":{"browser":2},"tasks":{"browser":{"run":["true"],"resources":["browser"]}}}`
+	if _, err := controller.db.Exec("INSERT INTO jobs(batch, task, ref, config_json, state, created_at) VALUES ('newer', 'browser', 'two', ?, 'queued', ?)", newer, time.Now().UTC().Format(time.RFC3339)); err != nil {
+		t.Fatal(err)
+	}
+	if _, claimed, err := controller.claim(2); err != nil || claimed {
+		t.Fatalf("newer snapshot bypassed held limit = %v, %v", claimed, err)
 	}
 }
 
@@ -163,6 +693,171 @@ func TestRecoverInterruptedReleasesLease(t *testing.T) {
 	}
 	if _, claimed, err := controller.claim(1); err != nil || !claimed {
 		t.Fatalf("claim after recovery = %v, %v", claimed, err)
+	}
+}
+
+func TestRecoverInterruptedRemovesJobWorktree(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	jobs, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, claimed, err := controller.claim(1); err != nil || !claimed {
+		t.Fatalf("claim = %v, %v", claimed, err)
+	}
+	path := filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", jobs[0].ID))
+	if _, _, err := controller.jobCheckout(context.Background(), jobs[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.RecoverInterrupted(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Fatalf("interrupted worktree remains: %v", err)
+	}
+}
+
+func TestRecoverInterruptedRemovesWorktreeAfterCheckoutDisappears(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		controller.Close()
+		t.Fatal(err)
+	}
+	if _, claimed, err := controller.claim(1); err != nil || !claimed {
+		controller.Close()
+		t.Fatalf("claim = %v, %v", claimed, err)
+	}
+	path := filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", jobs[0].ID))
+	if _, _, err := controller.jobCheckout(context.Background(), jobs[0]); err != nil {
+		controller.Close()
+		t.Fatal(err)
+	}
+	if err := controller.Close(); err != nil {
+		t.Fatal(err)
+	}
+	movedCheckout := checkout + "-moved"
+	if err := os.Rename(checkout, movedCheckout); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(checkout, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	git(t, filepath.Dir(checkout), "init", "-q")
+	controller, err = OpenState(configPath, filepath.Join(filepath.Dir(path), ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if err := controller.RecoverInterrupted(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Fatalf("worktree remains after replaced checkout: %v", err)
+	}
+	var pending int
+	if err := controller.db.QueryRow("SELECT cleanup_pending FROM jobs WHERE id = ?", jobs[0].ID).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	if pending != 0 {
+		t.Fatalf("cleanup pending after replaced checkout = %d", pending)
+	}
+}
+
+func TestRecoverInterruptedRemovesPendingWorktree(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	jobs, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", jobs[0].ID))
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := controller.jobCheckout(context.Background(), jobs[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.finish(jobs[0], 125, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.RecoverInterrupted(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Fatalf("pending worktree remains: %v", err)
+	}
+	var pending int
+	if err := controller.db.QueryRow("SELECT cleanup_pending FROM jobs WHERE id = ?", jobs[0].ID).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	if pending != 0 {
+		t.Fatalf("cleanup pending = %d, want 0", pending)
+	}
+}
+
+func TestOpenStateMigratesLegacyJobs(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), "state")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	database, err := sql.Open("sqlite", filepath.Join(stateDir, "bitci.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = database.Exec(`CREATE TABLE jobs (id INTEGER PRIMARY KEY, batch TEXT NOT NULL, task TEXT NOT NULL, ref TEXT NOT NULL, state TEXT NOT NULL, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, exit_code INTEGER, log_path TEXT); INSERT INTO jobs(batch, task, ref, state, created_at) VALUES ('batch', 'unit', 'ref', 'passed', '2026-01-01T00:00:00Z');`)
+	if err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	controller, err := OpenState(filepath.Join(t.TempDir(), "bitci.json"), stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 || jobs[0].TestedSHA != "" {
+		t.Fatalf("migrated jobs = %#v", jobs)
 	}
 }
 
@@ -212,6 +907,108 @@ func TestOwnerSocketRPCAndStaleRecovery(t *testing.T) {
 	}
 }
 
+func TestServeRPCDoesNotBlockOnIdleClient(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	socketPath := fmt.Sprintf("/tmp/bitci-%d.sock", time.Now().UnixNano())
+	defer os.Remove(socketPath)
+	listener, err := controller.Listen(socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- controller.ServeRPC(ctx, listener) }()
+	idle, err := net.Dial("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idle.Close()
+	var jobs []Job
+	if err := Call(socketPath, "status", struct{}{}, &jobs); err != nil {
+		t.Fatalf("status behind idle client: %v", err)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("RPC server did not stop after cancelling idle client")
+	}
+}
+
+func TestDuplicateServeDoesNotRecoverRunningJobs(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+	stateDir := filepath.Join(t.TempDir(), "state")
+	owner, err := Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close()
+	socketPath := fmt.Sprintf("/tmp/bitci-%d.sock", time.Now().UnixNano())
+	defer os.Remove(socketPath)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ownerDone := make(chan error, 1)
+	go func() { ownerDone <- owner.Serve(ctx, 1, time.Hour, socketPath) }()
+	deadline := time.Now().Add(time.Second)
+	for {
+		var jobs []Job
+		if Call(socketPath, "status", struct{}{}, &jobs) == nil {
+			break
+		}
+		select {
+		case err := <-ownerDone:
+			t.Fatalf("owner Serve error = %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("owner did not accept status requests")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	result, err := owner.db.Exec("INSERT INTO jobs(batch, task, ref, state, created_at) VALUES (?, ?, ?, 'running', ?)", "batch", "unit", strings.Repeat("a", 40), time.Now().UTC().Format(time.RFC3339))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicate, err := Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer duplicate.Close()
+	duplicateSocket := socketPath + ".duplicate"
+	defer os.Remove(duplicateSocket)
+	if err := duplicate.Serve(context.Background(), 1, time.Hour, duplicateSocket); err == nil || !strings.Contains(err.Error(), "owns state directory") {
+		t.Fatalf("duplicate Serve error = %v", err)
+	}
+	var state string
+	if err := owner.db.QueryRow("SELECT state FROM jobs WHERE id = ?", id).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != "running" {
+		t.Fatalf("duplicate serve recovered live job as %q", state)
+	}
+	cancel()
+	select {
+	case err := <-ownerDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("owner did not stop")
+	}
+}
+
 func TestMCPReadOnlyTools(t *testing.T) {
 	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
 	stateDir := filepath.Join(t.TempDir(), "state")
@@ -231,7 +1028,7 @@ func TestMCPReadOnlyTools(t *testing.T) {
 	ownerDone := make(chan error, 1)
 	go func() { ownerDone <- controller.ServeRPC(ctx, listener) }()
 	readOnly := mcpToolNames(t, socketPath, false)
-	for _, name := range []string{"status", "plan", "tail_logs", "search_logs", "doctor"} {
+	for _, name := range []string{"status", "plan", "tail_logs", "search_logs", "read_logs", "doctor"} {
 		if !readOnly[name] {
 			t.Fatalf("MCP tool %q missing", name)
 		}
@@ -258,6 +1055,74 @@ func TestMCPReadOnlyTools(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("owner RPC server did not stop")
 	}
+}
+
+func TestMCPStatusIncludesTestedSHA(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+	stateDir := filepath.Join(t.TempDir(), "state")
+	controller, err := Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	sha := "0123456789012345678901234567890123456789"
+	if _, err := controller.db.Exec("INSERT INTO jobs(batch, task, ref, tested_sha, state, created_at) VALUES ('batch', 'unit', ?, ?, 'passed', '2026-01-01T00:00:00Z')", sha, sha); err != nil {
+		t.Fatal(err)
+	}
+	socketPath := fmt.Sprintf("/tmp/bitci-%d.sock", time.Now().UnixNano())
+	defer os.Remove(socketPath)
+	listener, err := controller.Listen(socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ownerDone := make(chan error, 1)
+	go func() { ownerDone <- controller.ServeRPC(ctx, listener) }()
+	status := mcpStatus(t, socketPath)
+	if len(status.Jobs) != 1 || status.Jobs[0].TestedSHA != sha {
+		t.Fatalf("MCP status = %#v", status)
+	}
+	cancel()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-ownerDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("owner RPC server did not stop")
+	}
+}
+
+func mcpStatus(t *testing.T, socketPath string) MCPStatus {
+	t.Helper()
+	command := exec.Command(os.Args[0], "-test.run=TestMCPHelper", "--")
+	command.Env = append(os.Environ(), "GO_WANT_MCP_HELPER=1", "BITCI_TEST_SOCKET="+socketPath, "BITCI_TEST_ALLOW_RUNS=0")
+	client := mcp.NewClient(&mcp.Implementation{Name: "bitci-test", Version: "0.1.0"}, nil)
+	session, err := client.Connect(context.Background(), &mcp.CommandTransport{Command: command}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	result, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "status"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := result.GetError(); err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(result.StructuredContent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var status MCPStatus
+	if err := json.Unmarshal(encoded, &status); err != nil {
+		t.Fatal(err)
+	}
+	return status
 }
 
 func mcpToolNames(t *testing.T, socketPath string, allowRuns bool) map[string]bool {
@@ -346,6 +1211,290 @@ func TestRunControlAndLogs(t *testing.T) {
 	if got, want := strings.Join(lines, ","), "error second"; got != want {
 		t.Fatalf("search = %q, want %q", got, want)
 	}
+	first, err := controller.ReadLog(retried[0].ID, 0, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(first.Lines, ","), "first,error second"; got != want {
+		t.Fatalf("first log read = %q, want %q", got, want)
+	}
+	if first.Cursor == 0 || first.State != "passed" {
+		t.Fatalf("first log read = %#v", first)
+	}
+	second, err := controller.ReadLog(retried[0].ID, first.Cursor, 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(second.Lines, ","), "third"; got != want {
+		t.Fatalf("second log read = %q, want %q", got, want)
+	}
+	if second.Cursor <= first.Cursor {
+		t.Fatalf("cursor did not advance: %d <= %d", second.Cursor, first.Cursor)
+	}
+}
+
+func TestReadLogAdvancesAcrossOversizedLine(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+	stateDir := filepath.Join(t.TempDir(), "state")
+	controller, err := Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	logPath := filepath.Join(stateDir, "logs", "capped.log")
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath, []byte(strings.Repeat("x", maxLogReadBytes)+"\nnext\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := controller.db.Exec("INSERT INTO jobs(batch, task, ref, state, created_at, log_path) VALUES ('batch', 'unit', '', 'passed', '2026-01-01T00:00:00Z', ?)", logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs, err := controller.ReadLog(id, 0, 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs.Lines) != 0 || logs.Cursor != maxLogReadBytes || logs.State != "passed" {
+		t.Fatalf("capped log read = %#v", logs)
+	}
+	next, err := controller.ReadLog(id, logs.Cursor, 80)
+	if err != nil || strings.Join(next.Lines, ",") != "next" {
+		t.Fatalf("next capped log read = %#v, %v", next, err)
+	}
+	encoded, err := json.Marshal(logs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"lines":[]`) {
+		t.Fatalf("empty log lines encoded as %s", encoded)
+	}
+}
+
+func TestReadLogLineCapsIncompleteLine(t *testing.T) {
+	reader := bufio.NewReaderSize(strings.NewReader(strings.Repeat("x", maxLogReadBytes*2)), 1024)
+	_, consumed, complete, err := readLogLine(reader, maxLogReadBytes)
+	if complete || !errors.Is(err, bufio.ErrBufferFull) || consumed > maxLogReadBytes+1024 {
+		t.Fatalf("capped partial line = complete:%v consumed:%d err:%v", complete, consumed, err)
+	}
+}
+
+func TestReadLogSkipsLiveOversizedLineInBoundedReads(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+	stateDir := filepath.Join(t.TempDir(), "state")
+	controller, err := Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	logPath := filepath.Join(stateDir, "logs", "live-capped.log")
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath, []byte(strings.Repeat("x", maxLogReadBytes*2)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := controller.db.Exec("INSERT INTO jobs(batch, task, ref, state, created_at, log_path) VALUES ('batch', 'unit', '', 'running', '2026-01-01T00:00:00Z', ?)", logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs, err := controller.ReadLog(id, 0, 80)
+	if err != nil || len(logs.Lines) != 0 || logs.Cursor != 0 {
+		t.Fatalf("live capped log = %#v, %v", logs, err)
+	}
+}
+
+func TestReadLogSkipsOversizedTerminalPartialLine(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+	stateDir := filepath.Join(t.TempDir(), "state")
+	controller, err := Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	logPath := filepath.Join(stateDir, "logs", "terminal-capped.log")
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath, []byte(strings.Repeat("x", maxLogReadBytes+8192)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := controller.db.Exec("INSERT INTO jobs(batch, task, ref, state, created_at, log_path) VALUES ('batch', 'unit', '', 'passed', '2026-01-01T00:00:00Z', ?)", logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs, err := controller.ReadLog(id, 0, 80)
+	if err != nil || len(logs.Lines) != 0 || logs.Cursor != maxLogReadBytes {
+		t.Fatalf("terminal capped log = %#v, %v", logs, err)
+	}
+	next, err := controller.ReadLog(id, logs.Cursor, 80)
+	if err != nil || len(next.Lines) != 0 || next.Cursor != maxLogReadBytes+8192 {
+		t.Fatalf("terminal capped continuation = %#v, %v", next, err)
+	}
+}
+
+func TestReadLogReturnsTerminalPartialLineAtExactCap(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+	stateDir := filepath.Join(t.TempDir(), "state")
+	controller, err := Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	logPath := filepath.Join(stateDir, "logs", "exact-cap.log")
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(logPath, []byte(strings.Repeat("x", maxLogReadBytes)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := controller.db.Exec("INSERT INTO jobs(batch, task, ref, state, created_at, log_path) VALUES ('batch', 'unit', '', 'passed', '2026-01-01T00:00:00Z', ?)", logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := result.LastInsertId()
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs, err := controller.ReadLog(id, 0, 80)
+	if err != nil || len(logs.Lines) != 1 || len(logs.Lines[0]) != maxLogReadBytes || logs.Cursor != maxLogReadBytes {
+		t.Fatalf("exact-cap terminal log = %#v, %v", logs, err)
+	}
+}
+
+func TestRetryPreservesRecordedSHAAndConfiguration(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	initialConfig := `{"version":1,"tasks":{"unit":{"run":["grep","-qx","initial","marker"]}}}`
+	if err := os.WriteFile(configPath, []byte(initialConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, "marker"), []byte("initial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", ".")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	stateDir := filepath.Join(t.TempDir(), "state")
+	controller, err := Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["false"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, "marker"), []byte("changed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "add", ".")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "changed")
+	controller, err = Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	retried, err := controller.Retry(original[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retried[0].Ref != original[0].Ref || retried[0].checkoutRoot != original[0].checkoutRoot || retried[0].configRelative != original[0].configRelative {
+		t.Fatalf("retry changed recorded checkout: %#v", retried[0])
+	}
+	if cancelled, err := controller.Cancel(original[0].ID); err != nil || !cancelled {
+		t.Fatalf("cancel original = %v, %v", cancelled, err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run retry = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[1].State != "passed" {
+		t.Fatalf("retried job = %#v", jobs[1])
+	}
+}
+
+func TestRetryPinsLegacyRecordedSHA(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	original, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.db.Exec("UPDATE jobs SET checkout_root = '', config_relative = '' WHERE id = ?", original[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	retried, err := controller.Retry(original[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinned := git(t, checkout, "rev-parse", "--verify", "refs/bitci/jobs/"+retried[0].Batch+"^{commit}")
+	if pinned != original[0].Ref {
+		t.Fatalf("pinned retry SHA = %q, want %q", pinned, original[0].Ref)
+	}
+}
+
+func TestClaimPinsLegacyQueuedRecordedSHA(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	jobs, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "update-ref", "-d", "refs/bitci/jobs/"+jobs[0].Batch)
+	if _, err := controller.db.Exec("UPDATE jobs SET checkout_root = '', config_relative = '' WHERE id = ?", jobs[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, claimed, err := controller.claim(1); err != nil || !claimed {
+		t.Fatalf("legacy claim = %v, %v", claimed, err)
+	}
+	pinned := git(t, checkout, "rev-parse", "--verify", "refs/bitci/jobs/"+jobs[0].Batch+"^{commit}")
+	if pinned != jobs[0].Ref {
+		t.Fatalf("legacy claim pin = %q, want %q", pinned, jobs[0].Ref)
+	}
 }
 
 func TestLiveLogAvailableBeforeJobFinishes(t *testing.T) {
@@ -386,14 +1535,80 @@ func TestLiveLogAvailableBeforeJobFinishes(t *testing.T) {
 	}
 }
 
-func TestSubmitRecordsAndVerifiesCheckoutSHA(t *testing.T) {
+func TestLiveLogCursorWaitsForCompleteLine(t *testing.T) {
+	releasePath := filepath.Join(t.TempDir(), "release")
+	t.Setenv("GO_WANT_HELPER_PROCESS", "1")
+	t.Setenv("GO_WANT_LIVE_LOG_PARTIAL", "1")
+	t.Setenv("GO_WANT_LIVE_LOG_RELEASE", releasePath)
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["`+os.Args[0]+`","-test.run=TestHelperProcess","--"]}}}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	jobs, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := controller.RunOnce(context.Background(), 1)
+		done <- err
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		stored, err := controller.Jobs()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(stored) == 1 && stored[0].LogPath != "" {
+			contents, err := os.ReadFile(stored[0].LogPath)
+			if err == nil && strings.Contains(string(contents), "BitCI live log partial") {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("live partial line was not written")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	partial, err := controller.ReadLog(jobs[0].ID, 0, 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if partial.State != "running" || len(partial.Lines) != 0 || partial.Cursor != 0 {
+		t.Fatalf("partial live log = %#v", partial)
+	}
+	if err := os.WriteFile(releasePath, []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	complete, err := controller.ReadLog(jobs[0].ID, partial.Cursor, 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := strings.Join(complete.Lines, ","), "BitCI live log partial line"; got != want {
+		t.Fatalf("complete live log = %q, want %q", got, want)
+	}
+	if complete.State != "passed" || complete.Cursor == 0 {
+		t.Fatalf("complete live log = %#v", complete)
+	}
+}
+
+func TestJobRunsInRecordedCheckoutSHA(t *testing.T) {
 	checkout := t.TempDir()
 	configPath := filepath.Join(checkout, "bitci.json")
-	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["grep","-qx","initial","marker"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, "marker"), []byte("initial"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	git(t, checkout, "init", "-q")
-	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "add", "bitci.json", "marker")
 	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
 	sha := git(t, checkout, "rev-parse", "HEAD")
 	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
@@ -420,8 +1635,1849 @@ func TestSubmitRecordsAndVerifiesCheckoutSHA(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got[0].State != "failed" || got[0].ExitCode == nil || *got[0].ExitCode != 126 {
-		t.Fatalf("mismatched checkout job = %#v", got[0])
+	if got[0].State != "passed" || got[0].TestedSHA != sha {
+		lines, _ := controller.TailLog(got[0].ID, 80)
+		t.Fatalf("recorded checkout job = %#v\n%s", got[0], strings.Join(lines, "\n"))
+	}
+	if _, err := os.Stat(filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", jobs[0].ID))); !os.IsNotExist(err) {
+		t.Fatalf("job worktree remains: %v", err)
+	}
+}
+
+func TestRecordedSHAAllowsInheritedCheckoutPWD(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	t.Setenv("PWD", checkout)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "passed" {
+		lines, _ := controller.TailLog(jobs[0].ID, 80)
+		t.Fatalf("inherited PWD job = %#v\n%s", jobs[0], strings.Join(lines, "\n"))
+	}
+}
+
+func TestJobRunsInRecordedSHA256Checkout(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("git", "-C", checkout, "init", "--object-format=sha256", "-q")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Skipf("Git does not support SHA-256 repositories: %s", output)
+	}
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	sha := git(t, checkout, "rev-parse", "HEAD")
+	if len(sha) != 64 {
+		t.Fatalf("SHA-256 checkout SHA length = %d, want 64", len(sha))
+	}
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	jobs, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].Ref != sha {
+		t.Fatalf("ref = %q, want recorded SHA-256 %q", jobs[0].Ref, sha)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	got, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].State != "passed" || got[0].TestedSHA != sha {
+		t.Fatalf("SHA-256 checkout job = %#v", got[0])
+	}
+}
+
+func TestRecordedDirectoryExistsRejectsBlob(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	sha := git(t, checkout, "rev-parse", "HEAD")
+	if err := recordedDirectoryExists(checkout, sha, "bitci.json"); err == nil {
+		t.Fatal("accepted blob as recorded config directory")
+	}
+}
+
+func TestSubmitRejectsRequestedSHAWithoutMatchingCheckout(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	requested := git(t, checkout, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(checkout, "marker"), []byte("changed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "add", "marker")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "changed")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, requested); err == nil || !strings.Contains(err.Error(), "does not match checkout HEAD") {
+		t.Fatalf("submit mismatched SHA error = %v", err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("mismatched SHA queued jobs = %#v", jobs)
+	}
+}
+
+func TestSubmitRejectsRequestedSHAWithoutCheckout(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	requested := strings.Repeat("A", 40)
+	if _, err := controller.Submit([]string{"unit"}, requested); err == nil || !strings.Contains(err.Error(), "cannot submit requested checkout SHA") {
+		t.Fatalf("submit without checkout error = %v", err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 0 {
+		t.Fatalf("unavailable checkout queued jobs = %#v", jobs)
+	}
+}
+
+func TestSubmitNormalizesUppercaseRecordedSHA(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	sha := git(t, checkout, "rev-parse", "HEAD")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	jobs, err := controller.Submit([]string{"unit"}, strings.ToUpper(sha))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].Ref != sha {
+		t.Fatalf("normalized SHA = %q, want %q", jobs[0].Ref, sha)
+	}
+}
+
+func TestSubmitPinsRecordedCheckoutSHA(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	jobs, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pinned := git(t, checkout, "rev-parse", "--verify", "refs/bitci/jobs/"+jobs[0].Batch+"^{commit}")
+	if pinned != jobs[0].Ref {
+		t.Fatalf("pinned SHA = %q, want %q", pinned, jobs[0].Ref)
+	}
+}
+
+func TestFinishedBatchReleasesRecordedSHARef(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	jobs, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	if refs := git(t, checkout, "for-each-ref", "refs/bitci/jobs/"+jobs[0].Batch); refs != "" {
+		t.Fatalf("finished batch retained ref: %q", refs)
+	}
+}
+
+func TestFailedDependencyCancelsBatchAndReleasesRef(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	config := `{"version":1,"tasks":{"build":{"run":["false"]},"test":{"run":["true"],"needs":["build"]}}}`
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	jobs, err := controller.Submit([]string{"test"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run dependency = %v, %v", ran, err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || ran {
+		t.Fatalf("cancel blocked job = %v, %v", ran, err)
+	}
+	stored, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored[0].State != "failed" || stored[1].State != "cancelled" {
+		t.Fatalf("failed dependency batch = %#v", stored)
+	}
+	if refs := git(t, checkout, "for-each-ref", "refs/bitci/jobs/"+jobs[0].Batch); refs != "" {
+		t.Fatalf("failed dependency batch retained ref: %q", refs)
+	}
+}
+
+func TestRecoveryReleasesFinishedBatchRef(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	sha := git(t, checkout, "rev-parse", "HEAD")
+	git(t, checkout, "update-ref", "refs/bitci/jobs/finished", sha)
+	if _, err := controller.db.Exec("INSERT INTO jobs(batch, task, ref, checkout_root, state, created_at, finished_at) VALUES ('finished', 'unit', ?, ?, 'passed', '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z')", sha, checkout); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.RecoverInterrupted(); err != nil {
+		t.Fatal(err)
+	}
+	if refs := git(t, checkout, "for-each-ref", "refs/bitci/jobs/finished"); refs != "" {
+		t.Fatalf("recovery retained finished ref: %q", refs)
+	}
+}
+
+func TestCleanupDoesNotPruneUnrelatedWorktree(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	unrelated := filepath.Join(t.TempDir(), "unrelated")
+	git(t, checkout, "worktree", "add", "-q", "--detach", unrelated, "HEAD")
+	if err := os.RemoveAll(unrelated); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "config", "gc.worktreePruneExpire", "now")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	if worktrees := git(t, checkout, "worktree", "list", "--porcelain"); !strings.Contains(worktrees, unrelated) {
+		t.Fatalf("cleanup pruned unrelated worktree:\n%s", worktrees)
+	}
+}
+
+func TestSubmitRejectsEmptyTaskListBeforePinningSHA(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{}, ""); err == nil || !strings.Contains(err.Error(), "at least one task") {
+		t.Fatalf("empty submit error = %v", err)
+	}
+	if refs := git(t, checkout, "for-each-ref", "refs/bitci/jobs"); refs != "" {
+		t.Fatalf("empty submit pinned refs: %q", refs)
+	}
+}
+
+func TestPathWithinUsesFilesystemIdentity(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "BitCI")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(parent, "bitci")
+	if _, err := os.Stat(alias); os.IsNotExist(err) {
+		t.Skip("case-sensitive filesystem")
+	} else if err != nil {
+		t.Fatal(err)
+	}
+	if !pathWithin(root, filepath.Join(alias, "missing")) {
+		t.Fatal("case alias should be inside checkout")
+	}
+	if relative, ok := relativeWithin(root, filepath.Join(alias, "state")); !ok || relative != "state" {
+		t.Fatalf("relative case alias = %q, %v", relative, ok)
+	}
+}
+
+func TestRecordedSHAPreparesEachWorktree(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"prepare":["touch","ready"],"tasks":{"unit":{"run":["test","-f","ready"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, ".gitignore"), []byte("ready\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json", ".gitignore")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "passed" {
+		lines, _ := controller.TailLog(jobs[0].ID, 80)
+		t.Fatalf("prepared checkout job = %#v\n%s", jobs[0], strings.Join(lines, "\n"))
+	}
+	if _, err := os.Stat(filepath.Join(checkout, "ready")); !os.IsNotExist(err) {
+		t.Fatalf("prepare wrote mutable checkout: %v", err)
+	}
+}
+
+func TestRecordedSHARechecksTaskExecutableAfterPrepare(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	primaryExecutable := filepath.Join(checkout, "escape")
+	prepare, err := json.Marshal([]string{"sh", "-c", fmt.Sprintf("ln -sf %q runner", primaryExecutable)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := fmt.Sprintf(`{"version":1,"prepare":%s,"tasks":{"unit":{"run":["./runner"]}}}`, prepare)
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, "runner"), []byte("exit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json", "runner")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	if err := os.WriteFile(primaryExecutable, []byte("touch escaped\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 126 {
+		lines, _ := controller.TailLog(jobs[0].ID, 80)
+		t.Fatalf("replaced executable job = %#v\n%s", jobs[0], strings.Join(lines, "\n"))
+	}
+	if _, err := os.Stat(filepath.Join(checkout, "escaped")); !os.IsNotExist(err) {
+		t.Fatalf("task executed mutable checkout target: %v", err)
+	}
+}
+
+func TestRecordedSHARejectsShellPrimaryCheckoutPath(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	primaryExecutable := filepath.Join(checkout, "escape")
+	if err := os.WriteFile(configPath, []byte(fmt.Sprintf(`{"version":1,"tasks":{"unit":{"run":["sh","-c","exec %s"]}}}`, primaryExecutable)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(primaryExecutable, []byte("touch escaped\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 126 {
+		t.Fatalf("shell escape job = %#v", jobs[0])
+	}
+	if _, err := os.Stat(filepath.Join(checkout, "escaped")); !os.IsNotExist(err) {
+		t.Fatalf("shell executed mutable checkout target: %v", err)
+	}
+}
+
+func TestRecordedSHARejectsPrepareThatChangesWorktreeSHA(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"prepare":["git","reset","--hard","HEAD~1"],"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "prepare")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 126 {
+		t.Fatalf("mutated worktree job = %#v", jobs[0])
+	}
+}
+
+func TestRecordedSHARejectsTaskThatChangesWorktree(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(filepath.Join(checkout, "marker"), []byte("initial\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["sh","-c","printf changed > marker"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json", "marker")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 126 {
+		t.Fatalf("mutated task job = %#v", jobs[0])
+	}
+}
+
+func TestRecordedSHARejectsEvaluatorGitMetadataWrite(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["sh","-c","git update-ref refs/heads/main HEAD~1"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "branch", "-M", "main")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	if err := os.WriteFile(filepath.Join(checkout, "marker"), []byte("second"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "add", "marker")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "second")
+	wantRef := git(t, checkout, "rev-parse", "refs/heads/main")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 126 {
+		t.Fatalf("evaluator Git job = %#v", jobs[0])
+	}
+	if got := git(t, checkout, "rev-parse", "refs/heads/main"); got != wantRef {
+		t.Fatalf("main ref = %q, want %q", got, wantRef)
+	}
+}
+
+func TestRecordedSHARejectsWrappedEvaluator(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["env","sh","-c","true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 126 {
+		t.Fatalf("wrapped evaluator job = %#v", jobs[0])
+	}
+}
+
+func TestRecordedSHARejectsGitOutputOutsideWorktree(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["git","diff","--output=../poison"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 126 {
+		t.Fatalf("Git output job = %#v", jobs[0])
+	}
+	if _, err := os.Stat(filepath.Join(controller.stateDir, "worktrees", "poison")); !os.IsNotExist(err) {
+		t.Fatalf("Git output escaped worktree: %v", err)
+	}
+}
+
+func TestRecordedSHAVerifiesGitFileContents(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["cp","fake-git",".git/bitci-owner"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, "fake-git"), []byte("gitdir: /tmp/not-bitci\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", ".")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 126 {
+		t.Fatalf("Git file mutation job = %#v", jobs[0])
+	}
+}
+
+func TestRecordedSHAChildPWDMatchesWorktree(t *testing.T) {
+	t.Setenv("GO_WANT_HELPER_PROCESS", "1")
+	t.Setenv("GO_WANT_PWD_CHECK", "1")
+	checkout := t.TempDir()
+	t.Setenv("PWD", checkout)
+	configPath := filepath.Join(checkout, "bitci.json")
+	config := fmt.Sprintf(`{"version":1,"tasks":{"unit":{"run":[%q,"-test.run=TestHelperProcess","--"]}}}`, os.Args[0])
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "passed" {
+		lines, _ := controller.TailLog(jobs[0].ID, 80)
+		t.Fatalf("PWD job = %#v\n%s", jobs[0], strings.Join(lines, "\n"))
+	}
+}
+
+func TestRecordedSHARejectsSymlinkedPathOperand(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	external := filepath.Join(t.TempDir(), "external")
+	if err := os.WriteFile(external, []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, "input"), []byte("changed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(external, filepath.Join(checkout, "destination")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["cp","input","destination"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json", "input", "destination")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 126 {
+		t.Fatalf("symlink operand job = %#v", jobs[0])
+	}
+	if data, err := os.ReadFile(external); err != nil || string(data) != "original" {
+		t.Fatalf("external file = %q, %v", data, err)
+	}
+}
+
+func TestJobRunsFromNestedConfigDirectoryWithRelativeState(t *testing.T) {
+	checkout := t.TempDir()
+	configDir := filepath.Join(checkout, "ci")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(configDir, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["grep","-qx","nested","marker"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "marker"), []byte("nested"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "ci")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "nested")
+	originalDirectory, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateParent := t.TempDir()
+	if err := os.Chdir(stateParent); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(originalDirectory) })
+	controller, err := Open(configPath, "state")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if !filepath.IsAbs(controller.stateDir) {
+		t.Fatalf("state directory is relative: %q", controller.stateDir)
+	}
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "passed" {
+		lines, _ := controller.TailLog(jobs[0].ID, 80)
+		t.Fatalf("nested config job = %#v\n%s", jobs[0], strings.Join(lines, "\n"))
+	}
+}
+
+func TestOpenCapturesRelativeNestedConfig(t *testing.T) {
+	checkout := t.TempDir()
+	configDir := filepath.Join(checkout, "ci")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "bitci.json"), []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "ci")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	originalDirectory, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(checkout); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(originalDirectory)
+	controller, err := Open(filepath.Join("ci", "bitci.json"), filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if controller.configRelative != "ci" {
+		t.Fatalf("config relative = %q", controller.configRelative)
+	}
+}
+
+func TestRecordedSHAUsesSubmittedCheckoutLocation(t *testing.T) {
+	checkout := t.TempDir()
+	configDir := filepath.Join(checkout, "ci")
+	configPath := filepath.Join(configDir, "bitci.json")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["grep","-qx","initial","marker"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "marker"), []byte("initial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "ci")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "rm", "-qr", "ci")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=BitCI@example.test", "commit", "-qm", "remove config")
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "passed" {
+		lines, _ := controller.TailLog(jobs[0].ID, 80)
+		t.Fatalf("captured checkout job = %#v\n%s", jobs[0], strings.Join(lines, "\n"))
+	}
+}
+
+func TestRecordedSHAAllowsWorktreeExecutableInsideCheckoutState(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(filepath.Join(checkout, ".gitignore"), []byte(".bitci/\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["./runner"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, "runner"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", ".")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(checkout, ".bitci"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "passed" {
+		lines, _ := controller.TailLog(jobs[0].ID, 80)
+		t.Fatalf("in-checkout state job = %#v\n%s", jobs[0], strings.Join(lines, "\n"))
+	}
+}
+
+func TestJobCheckoutFailureDoesNotPanicOnCleanup(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	jobs, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", jobs[0].ID)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	stored, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored[0].State != "failed" || stored[0].ExitCode == nil || *stored[0].ExitCode != 126 {
+		t.Fatalf("failed checkout job = %#v", stored[0])
+	}
+	if _, err := os.Lstat(filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", jobs[0].ID))); err != nil {
+		t.Fatalf("failed checkout collision was removed: %v", err)
+	}
+}
+
+func TestQueuedJobUsesSubmittedConfiguration(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	initial := `{"version":1,"tasks":{"unit":{"run":["grep","-qx","initial","marker"]}}}`
+	if err := os.WriteFile(configPath, []byte(initial), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, "marker"), []byte("initial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json", "marker")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	stateDir := filepath.Join(t.TempDir(), "state")
+	controller, err := Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		controller.Close()
+		t.Fatal(err)
+	}
+	if err := controller.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["false"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	controller, err = Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "passed" {
+		t.Fatalf("submitted configuration job = %#v", jobs[0])
+	}
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run current config = %v, %v", ran, err)
+	}
+	jobs, err = controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[1].State != "failed" {
+		t.Fatalf("current configuration job = %#v", jobs[1])
+	}
+}
+
+func TestQueuedJobUsesSubmittedDiskGuard(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"min_free_bytes":18446744073709551615,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		controller.Close()
+		t.Fatal(err)
+	}
+	stateDir := controller.stateDir
+	if err := controller.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	controller, err = Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if ran, err := controller.RunOnce(context.Background(), 1); ran || err == nil || !strings.Contains(err.Error(), "disk guard") {
+		t.Fatalf("run with submitted disk guard = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "queued" {
+		t.Fatalf("disk-guarded job = %#v", jobs[0])
+	}
+}
+
+func TestRecordedSHARejectsCheckoutAbsoluteExecutable(t *testing.T) {
+	checkout := t.TempDir()
+	runner := filepath.Join(checkout, "runner")
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(runner, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(fmt.Sprintf(`{"version":1,"tasks":{"unit":{"run":[%q]}}}`, runner)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json", "runner")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 126 {
+		t.Fatalf("absolute executable job = %#v", jobs[0])
+	}
+}
+
+func TestRecordedSHARejectsInterpreterScriptFromSubmittedCheckout(t *testing.T) {
+	checkout := t.TempDir()
+	runner := filepath.Join(checkout, "runner")
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(runner, []byte("touch escaped\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(fmt.Sprintf(`{"version":1,"tasks":{"unit":{"run":["sh",%q]}}}`, runner)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json", "runner")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 126 {
+		t.Fatalf("interpreter script job = %#v", jobs[0])
+	}
+	if _, err := os.Stat(filepath.Join(checkout, "escaped")); !os.IsNotExist(err) {
+		t.Fatalf("task executed mutable checkout script: %v", err)
+	}
+}
+
+func TestRecordedSHARejectsRelativeInterpreterScriptSymlink(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	primaryScript := filepath.Join(checkout, "primary-script")
+	if err := os.Mkdir(filepath.Join(checkout, "scripts"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(primaryScript, []byte("touch escaped\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(primaryScript, filepath.Join(checkout, "scripts", "runner")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["sh","scripts/runner"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json", "scripts/runner")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 126 {
+		t.Fatalf("relative interpreter script job = %#v", jobs[0])
+	}
+	if _, err := os.Stat(filepath.Join(checkout, "escaped")); !os.IsNotExist(err) {
+		t.Fatalf("task executed mutable checkout script: %v", err)
+	}
+}
+
+func TestRecordedSHARejectsBareInterpreterScriptSymlink(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	primaryScript := filepath.Join(checkout, "primary-script")
+	if err := os.WriteFile(primaryScript, []byte("touch escaped\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(primaryScript, filepath.Join(checkout, "runner")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["sh","runner"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json", "runner")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 126 {
+		t.Fatalf("bare interpreter script job = %#v", jobs[0])
+	}
+	if _, err := os.Stat(filepath.Join(checkout, "escaped")); !os.IsNotExist(err) {
+		t.Fatalf("task executed mutable checkout script: %v", err)
+	}
+}
+
+func TestRecordedSHARejectsPATHExecutableSymlinkOutsideWorktree(t *testing.T) {
+	worktree := t.TempDir()
+	external := filepath.Join(t.TempDir(), "runner")
+	if err := os.WriteFile(external, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(external, filepath.Join(worktree, "runner")); err != nil {
+		t.Fatal(err)
+	}
+	if !(&Controller{}).isCheckoutExecutable("runner", t.TempDir(), worktree, worktree, []string{"PATH=."}) {
+		t.Fatal("accepted PATH executable that escapes the recorded worktree")
+	}
+}
+
+func TestUnsafeTaskEnvironmentRejectsGitMetadataPaths(t *testing.T) {
+	for name, value := range map[string]string{
+		"GIT_DIR":        "../../../.git",
+		"GIT_WORK_TREE":  "../../..",
+		"GIT_INDEX_FILE": ".git-index",
+	} {
+		checkout := t.TempDir()
+		if !unsafeTaskEnvironment([]string{name + "=" + value}, nil, checkout, checkout, checkout) {
+			t.Fatalf("accepted unsafe %s=%q", name, value)
+		}
+	}
+}
+
+func TestUnsafeCommandEnvironmentRejectsGitOverrides(t *testing.T) {
+	checkout := t.TempDir()
+	if !unsafeCommandEnvironment([]string{"env", "GIT_DIR=../../../.git", "git", "status"}, checkout) {
+		t.Fatal("accepted command-local Git metadata path")
+	}
+	if !unsafeCommandEnvironment([]string{"env", "GIT_EXTERNAL_DIFF=tool", "git", "diff"}, checkout) {
+		t.Fatal("accepted command-local Git executable")
+	}
+	if !unsafeCommandEnvironment([]string{"nice", "env", "GIT_DIR=../../../.git", "git", "status"}, checkout) {
+		t.Fatal("accepted wrapped command-local Git metadata path")
+	}
+}
+
+func TestTaskEnvironmentStripsInheritedGitExecutables(t *testing.T) {
+	t.Setenv("GIT_PAGER", "cat")
+	for _, item := range taskEnvironment(nil, t.TempDir()) {
+		if strings.HasPrefix(item, "GIT_PAGER=") {
+			t.Fatal("inherited Git pager reached task environment")
+		}
+	}
+}
+
+func TestUnsafeTaskEnvironmentRejectsCheckoutPATH(t *testing.T) {
+	checkout := t.TempDir()
+	worktree := t.TempDir()
+	if !unsafeTaskEnvironment([]string{"PATH=" + checkout}, nil, checkout, worktree, worktree) {
+		t.Fatal("accepted checkout PATH entry")
+	}
+}
+
+func TestUnsafeTaskEnvironmentAllowsInheritedCheckoutPWD(t *testing.T) {
+	checkout := t.TempDir()
+	worktree := t.TempDir()
+	if unsafeTaskEnvironment([]string{"PWD=" + checkout, "PATH=/usr/bin:/bin"}, nil, checkout, worktree, worktree) {
+		t.Fatal("rejected inherited checkout PWD")
+	}
+	if !unsafeTaskEnvironment([]string{"PROJECT_ROOT=" + checkout, "PATH=/usr/bin:/bin"}, map[string]string{"PROJECT_ROOT": checkout}, checkout, worktree, worktree) {
+		t.Fatal("accepted configured checkout environment path")
+	}
+}
+
+func TestUnsafeGitCommandRejectsMetadataWrites(t *testing.T) {
+	if !unsafeGitCommand([]string{"git", "update-ref", "refs/heads/main", "HEAD"}) {
+		t.Fatal("accepted Git metadata write")
+	}
+	if !unsafeGitCommand([]string{"env", "git", "update-ref", "refs/heads/main", "HEAD"}) {
+		t.Fatal("accepted wrapped Git metadata write")
+	}
+	if !unsafeGitCommand([]string{"git", "remote", "set-url", "origin", "example"}) {
+		t.Fatal("accepted unlisted Git metadata write")
+	}
+	if !unsafeGitCommand([]string{"git", "-c", "diff.external=tool", "diff"}) {
+		t.Fatal("accepted Git configuration override")
+	}
+	if !unsafeGitCommand([]string{"git", "diff", "--output=../poison"}) {
+		t.Fatal("accepted Git output option")
+	}
+	if unsafeGitCommand([]string{"git", "status", "--short"}) {
+		t.Fatal("rejected read-only Git command")
+	}
+}
+
+func TestUnsafeEvaluatorCommandRejectsUnknownWrapper(t *testing.T) {
+	if !unsafeEvaluatorCommand([]string{"sudo", "sh", "-c", "git update-ref refs/heads/main HEAD"}) {
+		t.Fatal("accepted evaluator behind an unknown wrapper")
+	}
+	if !unsafeEvaluatorCommand([]string{"env", "-C", "/tmp", "true"}) {
+		t.Fatal("accepted env working-directory override")
+	}
+}
+
+func TestUnsafeEvaluatorCommandRecognizesInterpreterVariants(t *testing.T) {
+	for _, argv := range [][]string{
+		{"python3.12", "-c", "print(1)"},
+		{"sh", "-c'echo unsafe'"},
+		{"python", "--eval=print(1)"},
+		{"busybox", "ash", "-c", "echo unsafe"},
+	} {
+		if !unsafeEvaluatorCommand(argv) {
+			t.Fatalf("accepted evaluator variant: %#v", argv)
+		}
+	}
+}
+
+func TestUnsafeTaskEnvironmentRejectsGitConfigParameters(t *testing.T) {
+	if !unsafeTaskEnvironment([]string{"GIT_CONFIG_PARAMETERS=diff.external=tool"}, nil, t.TempDir(), t.TempDir(), t.TempDir()) {
+		t.Fatal("accepted Git configuration parameter override")
+	}
+}
+
+func TestUnsafePathOperandRejectsAttachedOptionPath(t *testing.T) {
+	worktree := t.TempDir()
+	if !unsafePathOperand("-t../outside", t.TempDir(), worktree, worktree) {
+		t.Fatal("accepted attached option path")
+	}
+	if err := os.Symlink(t.TempDir(), filepath.Join(worktree, "outside")); err != nil {
+		t.Fatal(err)
+	}
+	if !unsafePathOperand("-toutside", t.TempDir(), worktree, worktree) {
+		t.Fatal("accepted attached option symlink")
+	}
+	if err := os.Symlink(t.TempDir(), filepath.Join(worktree, "destination")); err != nil {
+		t.Fatal(err)
+	}
+	if !unsafePathOperand("of=destination", t.TempDir(), worktree, worktree) {
+		t.Fatal("accepted path-valued option symlink")
+	}
+}
+
+func TestRecordedSHARejectsExecutableFromSubmittedCheckout(t *testing.T) {
+	checkout := t.TempDir()
+	runner := filepath.Join(checkout, "runner")
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(runner, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(fmt.Sprintf(`{"version":1,"tasks":{"unit":{"run":[%q]}}}`, runner)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json", "runner")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	controller.checkoutRoot = t.TempDir()
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 126 {
+		t.Fatalf("submitted checkout executable job = %#v", jobs[0])
+	}
+}
+
+func TestRecordedSHARejectsCheckoutPathExecutable(t *testing.T) {
+	checkout := t.TempDir()
+	runner := filepath.Join(checkout, "runner")
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(runner, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["runner"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json", "runner")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	t.Setenv("PATH", checkout+string(os.PathListSeparator)+os.Getenv("PATH"))
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 126 {
+		t.Fatalf("PATH executable job = %#v", jobs[0])
+	}
+}
+
+func TestRecordedSHARejectsCheckoutSymlinkExecutable(t *testing.T) {
+	checkout := t.TempDir()
+	runner := filepath.Join(checkout, "runner")
+	truePath, err := exec.LookPath("true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(truePath, runner); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(fmt.Sprintf(`{"version":1,"tasks":{"unit":{"run":[%q]}}}`, runner)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json", "runner")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 126 {
+		t.Fatalf("symlink executable job = %#v", jobs[0])
+	}
+}
+
+func TestRecordedSHARejectsCheckoutSymlinkDirectoryExecutable(t *testing.T) {
+	checkout := t.TempDir()
+	tools := filepath.Join(checkout, "tools")
+	truePath, err := exec.LookPath("true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Dir(truePath), tools); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(fmt.Sprintf(`{"version":1,"tasks":{"unit":{"run":[%q]}}}`, filepath.Join(tools, filepath.Base(truePath)))), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json", "tools")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 126 {
+		t.Fatalf("symlink directory executable job = %#v", jobs[0])
+	}
+}
+
+func TestRecordedSHARejectsRelativeExecutableOutsideWorktree(t *testing.T) {
+	checkout := t.TempDir()
+	configDir := filepath.Join(checkout, "ci")
+	configPath := filepath.Join(configDir, "bitci.json")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["../../outside"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, "outside"), []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "ci", "outside")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 126 {
+		t.Fatalf("relative executable job = %#v", jobs[0])
+	}
+}
+
+func TestNestedConfigChecksWholeCheckout(t *testing.T) {
+	checkout := t.TempDir()
+	configDir := filepath.Join(checkout, "ci")
+	configPath := filepath.Join(configDir, "bitci.json")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, ".gitignore"), []byte(".bitci[[]local]/\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", ".")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(checkout, ".bitci[local]"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if err := controller.cleanCheckout(context.Background()); err != nil {
+		t.Fatalf("clean nested checkout = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, "outside"), []byte("dirty"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.cleanCheckout(context.Background()); err == nil {
+		t.Fatal("nested config missed root-level checkout dirt")
+	}
+}
+
+func TestCheckoutStatePathRejectsExternalSymlinkAlias(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	stateTarget := filepath.Join(checkout, ".bitci")
+	if err := os.MkdirAll(stateTarget, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stateAlias := filepath.Join(t.TempDir(), "state")
+	if err := os.Symlink(stateTarget, stateAlias); err != nil {
+		t.Fatal(err)
+	}
+	controller, err := Open(configPath, stateAlias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, _, err := controller.checkoutStatePath(); err == nil {
+		t.Fatal("accepted external state symlink into checkout")
+	}
+}
+
+func TestCleanCheckoutRejectsTrackedStateFiles(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, ".gitignore"), []byte(".bitci/\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stateDir := filepath.Join(checkout, ".bitci")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stateDir, "tracked"), []byte("source"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json", ".gitignore")
+	git(t, checkout, "add", "-f", ".bitci/tracked")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if err := controller.cleanCheckout(context.Background()); err == nil || !strings.Contains(err.Error(), "tracked files") {
+		t.Fatalf("tracked state checkout error = %v", err)
+	}
+}
+
+func TestStageProtectsStateFromTargetTree(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	stateDir := filepath.Join(checkout, ".bitci[local]")
+	if err := os.WriteFile(filepath.Join(checkout, ".gitignore"), []byte(".bitci[[]local]/\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", ".")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if err := os.WriteFile(filepath.Join(stateDir, "poison"), []byte("tracked target"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "add", "-f", ".bitci[local]/poison")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "target state")
+	sha := git(t, checkout, "rev-parse", "HEAD")
+	if err := controller.protectStateFromTarget(context.Background(), sha); err == nil || !strings.Contains(err.Error(), "state files") {
+		t.Fatalf("target state protection error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "bitci.db")); err != nil {
+		t.Fatalf("BitCI state was replaced: %v", err)
+	}
+}
+
+func TestStageProtectsStateFromTrackedParent(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, ".gitignore"), []byte("cache/bitci/\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", ".")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	if err := os.WriteFile(filepath.Join(checkout, "cache"), []byte("tracked parent"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "add", "cache")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "target")
+	target := git(t, checkout, "rev-parse", "HEAD")
+	git(t, checkout, "checkout", "-q", "HEAD~1")
+	controller, err := Open(configPath, filepath.Join(checkout, "cache", "bitci"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if err := controller.protectStateFromTarget(context.Background(), target); err == nil || !strings.Contains(err.Error(), "state files") {
+		t.Fatalf("tracked state parent error = %v", err)
+	}
+}
+
+func TestCleanGeneratedNextUsesNestedConfigDirectory(t *testing.T) {
+	checkout := t.TempDir()
+	configDir := filepath.Join(checkout, "ci")
+	configPath := filepath.Join(configDir, "bitci.json")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, ".gitignore"), []byte("ci/.next/\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", ".")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	if err := os.MkdirAll(filepath.Join(configDir, ".next"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, ".next", "stale"), []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if err := controller.cleanGeneratedNext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(configDir, ".next")); !os.IsNotExist(err) {
+		t.Fatalf("nested generated files remain: %v", err)
+	}
+}
+
+func TestCleanGeneratedNextRejectsStateOverlap(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(filepath.Join(checkout, ".gitignore"), []byte(".next/\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", ".")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(checkout, ".next"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if err := controller.cleanGeneratedNext(context.Background()); err == nil || !strings.Contains(err.Error(), "overlap") {
+		t.Fatalf("state overlap error = %v", err)
+	}
+}
+
+func TestStageRejectsSymlinkedInCheckoutState(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(filepath.Join(checkout, ".gitignore"), []byte(".bitci/\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", ".")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	stateTarget := filepath.Join(t.TempDir(), "state")
+	if err := os.MkdirAll(stateTarget, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stateDir := filepath.Join(checkout, ".bitci")
+	if err := os.Symlink(stateTarget, stateDir); err != nil {
+		t.Fatal(err)
+	}
+	controller, err := Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if err := controller.cleanCheckout(context.Background()); err == nil || !strings.Contains(err.Error(), "must not use a symlink") {
+		t.Fatalf("clean checkout error = %v", err)
+	}
+	sha := git(t, checkout, "rev-parse", "HEAD")
+	if err := controller.protectStateFromTarget(context.Background(), sha); err == nil || !strings.Contains(err.Error(), "must not use a symlink") {
+		t.Fatalf("target state protection error = %v", err)
+	}
+}
+
+func TestStageRejectsSymlinkedStateWithExternalConfigAlias(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	alias := filepath.Join(t.TempDir(), "checkout")
+	if err := os.Symlink(checkout, alias); err != nil {
+		t.Fatal(err)
+	}
+	stateTarget := filepath.Join(t.TempDir(), "state")
+	if err := os.MkdirAll(stateTarget, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stateDir := filepath.Join(checkout, ".bitci")
+	if err := os.Symlink(stateTarget, stateDir); err != nil {
+		t.Fatal(err)
+	}
+	controller, err := Open(filepath.Join(alias, "bitci.json"), stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	sha := git(t, checkout, "rev-parse", "HEAD")
+	if err := controller.protectStateFromTarget(context.Background(), sha); err == nil || !strings.Contains(err.Error(), "must not use a symlink") {
+		t.Fatalf("aliased state protection error = %v", err)
+	}
+}
+
+func TestStageProtectsCaseInsensitiveStatePath(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, ".gitignore"), []byte(".bitci/\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stateDir := filepath.Join(checkout, ".bitci")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(checkout, ".BITCI")); os.IsNotExist(err) {
+		t.Skip("case-sensitive filesystem")
+	} else if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, ".BITCI", "poison"), []byte("tracked target"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json", ".gitignore")
+	git(t, checkout, "add", "-f", ".BITCI/poison")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	sha := git(t, checkout, "rev-parse", "HEAD")
+	if err := controller.protectStateFromTarget(context.Background(), sha); err == nil || !strings.Contains(err.Error(), "state files") {
+		t.Fatalf("case-insensitive state protection error = %v", err)
+	}
+}
+
+func TestStageProtectsStateWithSymlinkedConfigDirectory(t *testing.T) {
+	checkout := t.TempDir()
+	configDir := filepath.Join(checkout, "ci", "nested")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, ".gitignore"), []byte(".bitci/\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(configDir, "bitci.json"), []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", ".")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	if err := os.Symlink(filepath.Join("ci", "nested"), filepath.Join(checkout, "alias")); err != nil {
+		t.Fatal(err)
+	}
+	stateDir := filepath.Join(checkout, ".bitci")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stateDir, "poison"), []byte("tracked target"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "add", "-f", ".bitci/poison")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "target state")
+	controller, err := Open(filepath.Join(checkout, "alias", "bitci.json"), stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	sha := git(t, checkout, "rev-parse", "HEAD")
+	if err := controller.protectStateFromTarget(context.Background(), sha); err == nil || !strings.Contains(err.Error(), "state files") {
+		t.Fatalf("target state protection error = %v", err)
 	}
 }
 
@@ -464,7 +3520,7 @@ func TestStagePRChecksTrustAndCleansNext(t *testing.T) {
 		fmt.Fprintf(writer, `{"head":{"sha":%q,"repo":{"full_name":"owner/repo"}},"base":{"repo":{"full_name":"owner/repo"}}}`, prSHA)
 	}))
 	defer server.Close()
-	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	controller, err := Open(configPath, filepath.Join(checkout, ".bitci"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -508,6 +3564,73 @@ func TestStagePRRejectsFork(t *testing.T) {
 	}
 }
 
+func TestOpenStateRejectsCustomGitMetadataWithMissingConfig(t *testing.T) {
+	parent := t.TempDir()
+	checkout := filepath.Join(parent, "checkout")
+	gitDirectory := filepath.Join(parent, "metadata")
+	if err := os.MkdirAll(checkout, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	git(t, parent, "init", "-q", "--separate-git-dir", gitDirectory, checkout)
+	_, err := OpenState(filepath.Join(checkout, "missing.json"), filepath.Join(gitDirectory, "state"))
+	if err == nil || !strings.Contains(err.Error(), "Git metadata") {
+		t.Fatalf("custom metadata state error = %v", err)
+	}
+}
+
+func TestOpenResolvesConfigFileSymlink(t *testing.T) {
+	checkout := t.TempDir()
+	configDirectory := filepath.Join(checkout, "ci")
+	if err := os.MkdirAll(configDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(configDirectory, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", ".")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	alias := filepath.Join(t.TempDir(), "bitci.json")
+	if err := os.Symlink(configPath, alias); err != nil {
+		t.Fatal(err)
+	}
+	controller, err := Open(alias, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if !samePath(controller.checkoutRoot, checkout) || controller.configRelative != "ci" {
+		t.Fatalf("resolved config location = %q, %q", controller.checkoutRoot, controller.configRelative)
+	}
+}
+
+func TestSubmitRejectsMissingRecordedConfigDirectory(t *testing.T) {
+	checkout := t.TempDir()
+	git(t, checkout, "init", "-q")
+	if err := os.WriteFile(filepath.Join(checkout, "tracked"), []byte("tracked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "add", "tracked")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	configDirectory := filepath.Join(checkout, "ci")
+	if err := os.MkdirAll(configDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(configDirectory, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err == nil || !strings.Contains(err.Error(), "config directory") {
+		t.Fatalf("missing recorded config directory error = %v", err)
+	}
+}
+
 func TestServicePlist(t *testing.T) {
 	if runtime.GOOS != "darwin" {
 		t.Skip("launchd applies on macOS")
@@ -529,6 +3652,116 @@ func TestServicePlist(t *testing.T) {
 		if !strings.Contains(plist, value) {
 			t.Fatalf("plist missing %q", value)
 		}
+	}
+}
+
+func TestServicePathUsesPrepareExecutable(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"prepare":["sh","-c","true"],"tasks":{"unit":{"run":["true"]}}}`)
+	config, err := LoadConfig(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := servicePath(config, filepath.Dir(configPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(path, filepath.Dir(sh)) {
+		t.Fatalf("service PATH %q misses prepare command directory", path)
+	}
+}
+
+func TestServicePathAllowsTaskExecutableCreatedByPrepare(t *testing.T) {
+	checkout := t.TempDir()
+	git(t, checkout, "init", "-q")
+	if err := os.WriteFile(filepath.Join(checkout, "tracked"), []byte("tracked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "add", "tracked")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	_, err := servicePath(Config{Prepare: []string{"true"}, Tasks: map[string]Task{"unit": {Run: []string{"./node_modules/.bin/unit"}}}}, checkout)
+	if err != nil {
+		t.Fatalf("service path error = %v", err)
+	}
+}
+
+func TestServicePathDoesNotExportCheckoutForRelativeCommands(t *testing.T) {
+	checkout := t.TempDir()
+	runner := filepath.Join(checkout, "runner")
+	if err := os.WriteFile(runner, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path, err := servicePath(Config{Tasks: map[string]Task{"unit": {Run: []string{"./runner"}}}}, checkout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, directory := range filepath.SplitList(path) {
+		if samePath(directory, checkout) {
+			t.Fatalf("service PATH exports checkout: %q", path)
+		}
+	}
+}
+
+func TestServicePathUsesGitRootForNestedConfig(t *testing.T) {
+	repo := t.TempDir()
+	configDir := filepath.Join(repo, "config")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	git(t, repo, "init", "-q")
+	runner := filepath.Join(configDir, "runner")
+	if err := os.WriteFile(runner, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path, err := servicePath(Config{Tasks: map[string]Task{"unit": {Run: []string{"./runner"}}}}, configDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, directory := range filepath.SplitList(path) {
+		if pathWithin(repo, directory) {
+			t.Fatalf("service PATH exports nested Git checkout: %q", path)
+		}
+	}
+}
+
+func TestServicePathAllowsBareTaskExecutableCreatedByPrepare(t *testing.T) {
+	checkout := t.TempDir()
+	git(t, checkout, "init", "-q")
+	if err := os.WriteFile(filepath.Join(checkout, "tracked"), []byte("tracked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "add", "tracked")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	_, err := servicePath(Config{Prepare: []string{"true"}, Tasks: map[string]Task{"unit": {Run: []string{"unit"}, Env: map[string]string{"PATH": "."}}}}, checkout)
+	if err != nil {
+		t.Fatalf("service path error = %v", err)
+	}
+}
+
+func TestServicePathRejectsMissingTaskExecutableForUnverifiedCheckout(t *testing.T) {
+	checkout := t.TempDir()
+	_, err := servicePath(Config{Prepare: []string{"true"}, Tasks: map[string]Task{"unit": {Run: []string{"./missing"}}}}, checkout)
+	if err == nil || !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("service path error = %v", err)
+	}
+}
+
+func TestServicePathRejectsMissingTaskExecutableWithoutPrepare(t *testing.T) {
+	checkout := t.TempDir()
+	_, err := servicePath(Config{Tasks: map[string]Task{"unit": {Run: []string{"./missing"}}}}, checkout)
+	if err == nil || !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("service path error = %v", err)
+	}
+}
+
+func TestServicePathReportsMissingPrepareCommand(t *testing.T) {
+	checkout := t.TempDir()
+	_, err := servicePath(Config{Prepare: []string{"./missing"}, Tasks: map[string]Task{"unit": {Run: []string{"true"}}}}, checkout)
+	if err == nil || !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("service path error = %v", err)
 	}
 }
 
@@ -555,11 +3788,393 @@ func TestServiceRefusesActiveJobs(t *testing.T) {
 	}
 }
 
+func TestDefaultSocketPathCanonicalizesConfigSymlink(t *testing.T) {
+	realConfig := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+	linkedConfig := filepath.Join(t.TempDir(), "linked.json")
+	if err := os.Symlink(realConfig, linkedConfig); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := DefaultSocketPath(linkedConfig, ""), DefaultSocketPath(realConfig, ""); got != want {
+		t.Fatalf("symlink socket = %q, want %q", got, want)
+	}
+}
+
+func TestCancelUnknownJobReturnsFalse(t *testing.T) {
+	controller, err := Open(writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`), filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	cancelled, err := controller.Cancel(999)
+	if err != nil || cancelled {
+		t.Fatalf("cancel unknown job = %v, %v", cancelled, err)
+	}
+}
+
+func TestExecuteStopsBackgroundDescendants(t *testing.T) {
+	pidPath := filepath.Join(t.TempDir(), "child.pid")
+	code := (&Controller{}).executeCommandWithEnv(context.Background(), []string{"sh", "-c", "sleep 30 & echo $! > " + pidPath}, 0, io.Discard, t.TempDir(), nil)
+	if code != 0 {
+		t.Fatalf("background command exit = %d", code)
+	}
+	data, err := os.ReadFile(pidPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGKILL) })
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("background descendant survived command completion")
+}
+
+func TestRecoverInterruptedStopsRecordedProcessGroup(t *testing.T) {
+	stateDir := t.TempDir()
+	jobRoot := filepath.Join(stateDir, "worktrees", "job-7")
+	if err := os.MkdirAll(jobRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("sleep", "30")
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(jobRoot, "bitci-process-group"), []byte(strconv.Itoa(command.Process.Pid)), 0o600); err != nil {
+		_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
+		_ = command.Wait()
+		t.Fatal(err)
+	}
+	controller := &Controller{stateDir: stateDir}
+	if err := controller.terminateJobProcessGroup(7); err != nil {
+		t.Fatal(err)
+	}
+	if err := command.Wait(); err == nil {
+		t.Fatal("process group command survived recovery")
+	}
+}
+
+func TestServeWaitsForRunningJobCleanup(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	config := fmt.Sprintf(`{"version":1,"tasks":{"unit":{"run":[%q,"-test.run=TestHelperProcess","--"],"env":{"GO_WANT_HELPER_PROCESS":"1","GO_WANT_BLOCK":"1"}}}}`, os.Args[0])
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	jobs, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	socketPath := fmt.Sprintf("/tmp/bitci-serve-%d.sock", time.Now().UnixNano())
+	t.Cleanup(func() { _ = os.Remove(socketPath) })
+	go func() {
+		done <- controller.Serve(ctx, 1, time.Millisecond, socketPath)
+	}()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case err := <-done:
+			t.Fatalf("controller stopped before job ran: %v", err)
+		default:
+		}
+		var state string
+		if err := controller.db.QueryRow("SELECT state FROM jobs WHERE id = ?", jobs[0].ID).Scan(&state); err != nil {
+			t.Fatal(err)
+		}
+		if state == "running" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("controller did not wait for worker shutdown")
+	}
+	stored, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored[0].State != "failed" {
+		t.Fatalf("job state after serve shutdown = %q", stored[0].State)
+	}
+	if _, err := os.Lstat(filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", jobs[0].ID))); !os.IsNotExist(err) {
+		lines, _ := controller.TailLog(jobs[0].ID, 80)
+		t.Fatalf("job worktree remains after serve shutdown: %v\n%s", err, strings.Join(lines, "\n"))
+	}
+}
+
+func TestRecordedSHAScriptCannotMutateSourceRefs(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["./mutate"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, "mutate"), []byte("#!/bin/sh\ntest -f .git/objects/info/alternates\ngit update-ref refs/heads/main HEAD~1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "branch", "-M", "main")
+	git(t, checkout, "add", ".")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	if err := os.WriteFile(filepath.Join(checkout, "marker"), []byte("second"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "add", "marker")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "second")
+	wantMain := git(t, checkout, "rev-parse", "refs/heads/main")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "passed" {
+		t.Fatalf("isolated Git script job = %#v", jobs[0])
+	}
+	if got := git(t, checkout, "rev-parse", "refs/heads/main"); got != wantMain {
+		t.Fatalf("source main ref = %q, want %q", got, wantMain)
+	}
+}
+
+func TestCleanupDoesNotRemoveAnotherStateBatchRef(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	first, err := Open(configPath, filepath.Join(t.TempDir(), "state-one"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := Open(configPath, filepath.Join(t.TempDir(), "state-two"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	jobs, err := second.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.cleanupOrphanBatchRefs(); err != nil {
+		t.Fatal(err)
+	}
+	if got := git(t, checkout, "rev-parse", "--verify", "refs/bitci/jobs/"+jobs[0].Batch+"^{commit}"); got != jobs[0].Ref {
+		t.Fatalf("foreign state removed batch ref: %q", got)
+	}
+}
+
+func TestVerifyJobGitMetadataRejectsSymlink(t *testing.T) {
+	gitDirectory := filepath.Join(t.TempDir(), ".git")
+	if err := os.MkdirAll(gitDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), filepath.Join(gitDirectory, "objects")); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyJobGitMetadata(gitDirectory); err == nil {
+		t.Fatal("accepted symlinked Git metadata")
+	}
+}
+
+func TestStageLockSerializesControllers(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	first, err := Open(configPath, filepath.Join(t.TempDir(), "state-one"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := Open(configPath, filepath.Join(t.TempDir(), "state-two"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	release, err := first.acquireStageLock(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := second.acquireStageLock(ctx); err == nil {
+		t.Fatal("second controller acquired staging lock")
+	}
+}
+
+func TestStageLockRejectsCanceledContextBeforeAcquire(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := controller.acquireStageLock(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("acquireStageLock error = %v, want context canceled", err)
+	}
+}
+
+func TestRecordedSHADetectsDirectTrackedFileChange(t *testing.T) {
+	controller, _ := recordedChangeController(t, []string{"cp", "replacement", "marker"}, nil)
+	defer controller.Close()
+	assertSingleJobFailed(t, controller)
+}
+
+func TestRecordedSHADetectsChangedIndexFlags(t *testing.T) {
+	script := "#!/bin/sh\ngit update-index --assume-unchanged marker\nprintf changed > marker\n"
+	controller, _ := recordedChangeController(t, []string{"./mutate"}, map[string]fileFixture{"mutate": {content: script, mode: 0o700}})
+	defer controller.Close()
+	assertSingleJobFailed(t, controller)
+}
+
+func TestRecordedSHACleansCheckoutWithChangedHEAD(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(filepath.Join(checkout, "marker"), []byte("initial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "marker")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["./move-head"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, "move-head"), []byte("#!/bin/sh\ngit checkout --quiet --detach HEAD~1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "add", ".")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "task")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	jobs, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	stored, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored[0].State != "failed" {
+		t.Fatalf("changed HEAD job = %#v", stored[0])
+	}
+	if _, err := os.Lstat(filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", jobs[0].ID))); !os.IsNotExist(err) {
+		t.Fatalf("changed HEAD worktree remains: %v", err)
+	}
+}
+
+func TestRecoveryPreservesUnverifiedWorktreeCollision(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	jobs, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, claimed, err := controller.claim(1); err != nil || !claimed {
+		t.Fatalf("claim = %v, %v", claimed, err)
+	}
+	path := filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", jobs[0].ID))
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "unrelated"), []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.db.Exec("UPDATE jobs SET cleanup_pending = 1 WHERE id = ?", jobs[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.RecoverInterrupted(); err == nil || !strings.Contains(err.Error(), "unverified") {
+		t.Fatalf("recovery collision error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(path, "unrelated")); err != nil {
+		t.Fatalf("unverified collision was removed: %v", err)
+	}
+}
+
 func TestHelperProcess(t *testing.T) {
 	if os.Getenv("GO_WANT_HELPER_PROCESS") != "1" {
 		return
 	}
+	if os.Getenv("GO_WANT_BLOCK") == "1" {
+		for {
+			time.Sleep(time.Second)
+		}
+	}
+	if os.Getenv("GO_WANT_PWD_CHECK") == "1" {
+		directory, err := os.Getwd()
+		if err != nil || os.Getenv("PWD") != directory || os.Getenv("OLDPWD") != directory {
+			os.Exit(2)
+		}
+		os.Exit(0)
+	}
 	if releasePath := os.Getenv("GO_WANT_LIVE_LOG_RELEASE"); releasePath != "" {
+		if os.Getenv("GO_WANT_LIVE_LOG_PARTIAL") == "1" {
+			fmt.Fprint(os.Stdout, "BitCI live log partial")
+			for {
+				if _, err := os.Stat(releasePath); err == nil {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			fmt.Fprintln(os.Stdout, " line")
+			os.Exit(0)
+		}
 		fmt.Fprintln(os.Stdout, "BitCI live log ready")
 		for {
 			if _, err := os.Stat(releasePath); err == nil {
@@ -599,4 +4214,124 @@ func git(t *testing.T, directory string, args ...string) string {
 		t.Fatalf("git %v: %v: %s", args, err, output)
 	}
 	return strings.TrimSpace(string(output))
+}
+
+type fileFixture struct {
+	content string
+	mode    os.FileMode
+}
+
+func recordedChangeController(t *testing.T, run []string, files map[string]fileFixture) (*Controller, string) {
+	t.Helper()
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	config, err := json.Marshal(Config{Version: 1, Tasks: map[string]Task{"unit": {Run: run}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, config, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, "marker"), []byte("initial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, "replacement"), []byte("changed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, file := range files {
+		if err := os.WriteFile(filepath.Join(checkout, name), []byte(file.content), file.mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", ".")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		controller.Close()
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		controller.Close()
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	return controller, checkout
+}
+
+func assertSingleJobFailed(t *testing.T, controller *Controller) {
+	t.Helper()
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("job count = %d, want 1", len(jobs))
+	}
+	if jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 126 {
+		lines, _ := controller.TailLog(jobs[0].ID, 80)
+		t.Fatalf("recorded change job = %#v\n%s", jobs, strings.Join(lines, "\n"))
+	}
+}
+
+func recordedSHAConcurrentController(t *testing.T, sameResource bool) (*Controller, string) {
+	t.Helper()
+	checkout := t.TempDir()
+	events := t.TempDir()
+	t.Cleanup(func() { _ = os.WriteFile(filepath.Join(events, "release"), nil, 0o600) })
+	resources, taskResource := "", ""
+	if sameResource {
+		resources = `,"resources":{"browser":1}`
+		taskResource = `,"resources":["browser"]`
+	}
+	config := fmt.Sprintf(`{"version":1%s,"tasks":{"first":{"run":["sh","runner","first",%q]%s},"second":{"run":["sh","runner","second",%q]%s}}}`,
+		resources, events, taskResource, events, taskResource)
+	if err := os.WriteFile(filepath.Join(checkout, "bitci.json"), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := "#!/bin/sh\nset -eu\nname=$1\nevents=$2\n: > \"$events/$name.started\"\nwhile [ ! -f \"$events/release\" ]; do sleep 0.01; done\n"
+	if err := os.WriteFile(filepath.Join(checkout, "runner"), []byte(runner), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json", "runner")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(filepath.Join(checkout, "bitci.json"), filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return controller, events
+}
+
+func awaitFile(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		} else if !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", path)
+}
+
+func assertJobsPassed(t *testing.T, controller *Controller) {
+	t.Helper()
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 2 {
+		t.Fatalf("job count = %d, want 2", len(jobs))
+	}
+	for _, job := range jobs {
+		if job.State != "passed" {
+			lines, _ := controller.TailLog(job.ID, 80)
+			t.Fatalf("job = %#v\n%s", job, strings.Join(lines, "\n"))
+		}
+	}
 }

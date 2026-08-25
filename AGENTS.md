@@ -29,6 +29,10 @@ Agents never use the UI; it is for humans. Plan before submit. Inspect capped
 logs before retrying. Do not install or stop the managed service without the
 user's request.
 
+When Copilot reviews a pull request, inspect every finding. Fix valid findings,
+reply with the result, and resolve the thread after the fix lands. Do not resolve
+unfixed findings. Copilot comments do not satisfy required approval rules.
+
 ## Product boundary
 
 BitCI owns local task queueing, resource leases, logs, and safe reporting.

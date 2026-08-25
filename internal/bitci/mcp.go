@@ -12,11 +12,12 @@ type MCPOptions struct {
 }
 
 type MCPJob struct {
-	ID       int64  `json:"id"`
-	Task     string `json:"task"`
-	Ref      string `json:"ref"`
-	State    string `json:"state"`
-	ExitCode *int   `json:"exit_code,omitempty"`
+	ID        int64  `json:"id"`
+	Task      string `json:"task"`
+	Ref       string `json:"ref"`
+	TestedSHA string `json:"tested_sha,omitempty"`
+	State     string `json:"state"`
+	ExitCode  *int   `json:"exit_code,omitempty"`
 }
 
 type MCPStatus struct {
@@ -39,6 +40,18 @@ type MCPLogInput struct {
 
 type MCPLogOutput struct {
 	Lines []string `json:"lines"`
+}
+
+type MCPLogCursorInput struct {
+	ID     int64 `json:"id" jsonschema:"BitCI job ID"`
+	Cursor int64 `json:"cursor,omitempty" jsonschema:"byte cursor from the prior read_logs result"`
+	Limit  int   `json:"limit,omitempty" jsonschema:"maximum lines, capped at 80"`
+}
+
+type MCPLogCursorOutput struct {
+	Lines  []string `json:"lines"`
+	Cursor int64    `json:"cursor"`
+	State  string   `json:"state"`
 }
 
 type MCPSubmitInput struct {
@@ -65,7 +78,7 @@ func RunMCP(ctx context.Context, options MCPOptions) error {
 		}
 		result := MCPStatus{Jobs: make([]MCPJob, 0, len(jobs))}
 		for _, job := range jobs {
-			result.Jobs = append(result.Jobs, MCPJob{ID: job.ID, Task: job.Task, Ref: job.Ref, State: job.State, ExitCode: job.ExitCode})
+			result.Jobs = append(result.Jobs, MCPJob{ID: job.ID, Task: job.Task, Ref: job.Ref, TestedSHA: job.TestedSHA, State: job.State, ExitCode: job.ExitCode})
 		}
 		return nil, result, nil
 	})
@@ -89,6 +102,13 @@ func RunMCP(ctx context.Context, options MCPOptions) error {
 			return nil, MCPLogOutput{}, err
 		}
 		return nil, MCPLogOutput{Lines: lines}, nil
+	})
+	mcp.AddTool(server, &mcp.Tool{Name: "read_logs", Description: "Read new capped log lines from a byte cursor for one BitCI job."}, func(_ context.Context, _ *mcp.CallToolRequest, input MCPLogCursorInput) (*mcp.CallToolResult, MCPLogCursorOutput, error) {
+		var output MCPLogCursorOutput
+		if err := call("read_logs", LogCursorParams{ID: input.ID, Cursor: input.Cursor, Limit: input.Limit}, &output); err != nil {
+			return nil, MCPLogCursorOutput{}, err
+		}
+		return nil, output, nil
 	})
 	mcp.AddTool(server, &mcp.Tool{Name: "doctor", Description: "Check the BitCI disk guard."}, func(_ context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, map[string]string, error) {
 		var result map[string]string
