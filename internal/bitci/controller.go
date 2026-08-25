@@ -652,8 +652,7 @@ func (controller *Controller) jobCheckout(ctx context.Context, job Job) (string,
 }
 
 func copyRecordedObjects(ctx context.Context, checkoutRoot, ref, stateDir, objectFormat string) (string, error) {
-	cacheDigest := sha256.Sum256([]byte(resolvedPathForComparison(checkoutRoot) + "\x00" + strings.ToLower(strings.TrimSpace(objectFormat))))
-	cacheRoot := filepath.Join(stateDir, "object-cache", hex.EncodeToString(cacheDigest[:8]))
+	cacheRoot := objectCacheRoot(stateDir, checkoutRoot, ref, objectFormat)
 	if _, err := os.Stat(cacheRoot); os.IsNotExist(err) {
 		if err := os.MkdirAll(filepath.Dir(cacheRoot), 0o700); err != nil {
 			return "", fmt.Errorf("create recorded checkout object cache: %w", err)
@@ -700,6 +699,59 @@ func copyRecordedObjects(ctx context.Context, checkoutRoot, ref, stateDir, objec
 		return "", fmt.Errorf("import recorded checkout objects: %s: %w", strings.TrimSpace(indexError.String()), indexErr)
 	}
 	return filepath.Join(cacheRoot, "objects"), nil
+}
+
+func objectCacheRoot(stateDir, checkoutRoot, ref, objectFormat string) string {
+	cacheDigest := sha256.Sum256([]byte(resolvedPathForComparison(checkoutRoot) + "\x00" + strings.ToLower(strings.TrimSpace(objectFormat)) + "\x00" + strings.ToLower(ref)))
+	return filepath.Join(stateDir, "object-cache", hex.EncodeToString(cacheDigest[:8]))
+}
+
+func (controller *Controller) pruneObjectCaches() error {
+	root := filepath.Join(controller.stateDir, "object-cache")
+	entries, err := os.ReadDir(root)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	rows, err := controller.db.Query("SELECT DISTINCT checkout_root, ref FROM jobs WHERE state IN ('queued', 'running') OR cleanup_pending = 1")
+	if err != nil {
+		return err
+	}
+	keep := map[string]bool{}
+	for rows.Next() {
+		var checkoutRoot, ref string
+		if err := rows.Scan(&checkoutRoot, &ref); err != nil {
+			rows.Close()
+			return err
+		}
+		if checkoutRoot == "" || !isCheckoutSHA(ref) {
+			continue
+		}
+		objectFormat, err := gitAt(context.Background(), checkoutRoot, "rev-parse", "--show-object-format")
+		if err != nil {
+			rows.Close()
+			return nil
+		}
+		keep[filepath.Base(objectCacheRoot(controller.stateDir, checkoutRoot, ref, objectFormat))] = true
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || keep[entry.Name()] {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(root, entry.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func jobCheckoutOwner(job Job) []byte {
@@ -1015,6 +1067,9 @@ func (controller *Controller) RecoverInterrupted() error {
 	if err := controller.releaseFinishedBatchRefs(); err != nil {
 		failures = append(failures, err)
 	}
+	if err := controller.pruneObjectCaches(); err != nil {
+		failures = append(failures, err)
+	}
 	return errors.Join(failures...)
 }
 
@@ -1023,6 +1078,11 @@ func batchRef(batch string) string {
 }
 
 func (controller *Controller) cleanupOrphanBatchRefs() error {
+	releaseStage, err := controller.acquireStageLock(context.Background())
+	if err != nil {
+		return err
+	}
+	defer releaseStage()
 	rows, err := controller.db.Query("SELECT batch, checkout_root, ref FROM batch_refs")
 	if err != nil {
 		return err
@@ -1186,6 +1246,13 @@ func (controller *Controller) claim(maxWorkers int) (Job, bool, error) {
 		return Job{}, false, err
 	}
 	defer transaction.Rollback()
+	var pinned *Job
+	committed := false
+	defer func() {
+		if pinned != nil && !committed {
+			_ = controller.removeBatchRefIfOwned(*pinned)
+		}
+	}()
 	var active int
 	if err := transaction.QueryRow("SELECT COUNT(*) FROM jobs WHERE state = 'running'").Scan(&active); err != nil {
 		return Job{}, false, err
@@ -1239,6 +1306,8 @@ func (controller *Controller) claim(maxWorkers int) (Job, bool, error) {
 			if err := controller.pinClaimedJob(transaction, &job); err != nil {
 				return Job{}, false, err
 			}
+			pinnedJob := job
+			pinned = &pinnedJob
 		}
 		if _, err := transaction.Exec("UPDATE jobs SET state = 'running', started_at = ? WHERE id = ?", timestamp(), job.ID); err != nil {
 			return Job{}, false, err
@@ -1249,7 +1318,11 @@ func (controller *Controller) claim(maxWorkers int) (Job, bool, error) {
 			}
 		}
 		job.State = "running"
-		return job, true, transaction.Commit()
+		if err := transaction.Commit(); err != nil {
+			return Job{}, false, err
+		}
+		committed = true
+		return job, true, nil
 	}
 	if err := rows.Err(); err != nil {
 		return Job{}, false, err
@@ -1282,6 +1355,15 @@ func (controller *Controller) pinClaimedJob(transaction *sql.Tx, job *Job) error
 		return fmt.Errorf("pin recorded checkout SHA: %w", err)
 	}
 	return nil
+}
+
+func (controller *Controller) removeBatchRefIfOwned(job Job) error {
+	actual, err := gitAt(context.Background(), job.checkoutRoot, "rev-parse", "--verify", batchRef(job.Batch)+"^{commit}")
+	if err != nil || !strings.EqualFold(strings.TrimSpace(actual), job.Ref) {
+		return nil
+	}
+	_, err = gitAt(context.Background(), job.checkoutRoot, "update-ref", "-d", batchRef(job.Batch))
+	return err
 }
 
 func (controller *Controller) ready(transaction *sql.Tx, job Job, task Task) (bool, bool, error) {
@@ -1933,7 +2015,8 @@ func (controller *Controller) finish(job Job, code int, cleanupPending bool) err
 	pruneErr := controller.pruneLogs()
 	_, leaseErr := controller.db.Exec("DELETE FROM leases WHERE job_id = ?", job.ID)
 	refErr := controller.releaseBatchRef(job.Batch, job.checkoutRoot)
-	return errors.Join(pruneErr, leaseErr, refErr)
+	cacheErr := controller.pruneObjectCaches()
+	return errors.Join(pruneErr, leaseErr, refErr, cacheErr)
 }
 
 func (controller *Controller) Jobs() ([]Job, error) {

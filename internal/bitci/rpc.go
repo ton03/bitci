@@ -104,7 +104,13 @@ func (controller *Controller) ServeRPC(ctx context.Context, listener net.Listene
 	closerDone := make(chan struct{})
 	defer func() {
 		close(stopCloser)
+		connectionsMu.Lock()
+		for connection := range connections {
+			_ = connection.Close()
+		}
+		connectionsMu.Unlock()
 		<-closerDone
+		handlers.Wait()
 	}()
 	go func() {
 		defer close(closerDone)
@@ -119,7 +125,6 @@ func (controller *Controller) ServeRPC(ctx context.Context, listener net.Listene
 		case <-stopCloser:
 		}
 	}()
-	defer handlers.Wait()
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
