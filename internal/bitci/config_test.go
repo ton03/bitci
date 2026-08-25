@@ -276,6 +276,9 @@ func TestFinishReleasesLeaseWhenLogPruningFails(t *testing.T) {
 
 func TestStackExamplesValidate(t *testing.T) {
 	root := filepath.Clean(filepath.Join("..", ".."))
+	if _, err := LoadConfig(filepath.Join(root, "bitci.json")); err != nil {
+		t.Fatalf("dogfood pipeline: %v", err)
+	}
 	expected := map[string]map[string]string{
 		"go-backend":   {"test": "go", "vet": "go"},
 		"node-backend": {"test": "npm", "typecheck": "npm"},
