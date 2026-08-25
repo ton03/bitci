@@ -12,12 +12,19 @@ type MCPOptions struct {
 }
 
 type MCPJob struct {
-	ID        int64  `json:"id"`
-	Task      string `json:"task"`
-	Ref       string `json:"ref"`
-	TestedSHA string `json:"tested_sha,omitempty"`
-	State     string `json:"state"`
-	ExitCode  *int   `json:"exit_code,omitempty"`
+	ID               int64  `json:"id"`
+	Task             string `json:"task"`
+	Ref              string `json:"ref"`
+	TestedSHA        string `json:"tested_sha,omitempty"`
+	State            string `json:"state"`
+	ExitCode         *int   `json:"exit_code,omitempty"`
+	Attempt          int    `json:"attempt"`
+	RetryOf          *int64 `json:"retry_of,omitempty"`
+	RetryRoot        int64  `json:"retry_root"`
+	PriorExitCode    *int   `json:"prior_exit_code,omitempty"`
+	QueueWaitSeconds int    `json:"queue_wait_seconds"`
+	DurationSeconds  int    `json:"duration_seconds"`
+	TerminalResult   string `json:"terminal_result,omitempty"`
 }
 
 type MCPStatus struct {
@@ -78,7 +85,7 @@ func RunMCP(ctx context.Context, options MCPOptions) error {
 		}
 		result := MCPStatus{Jobs: make([]MCPJob, 0, len(jobs))}
 		for _, job := range jobs {
-			result.Jobs = append(result.Jobs, MCPJob{ID: job.ID, Task: job.Task, Ref: job.Ref, TestedSHA: job.TestedSHA, State: job.State, ExitCode: job.ExitCode})
+			result.Jobs = append(result.Jobs, MCPJob{ID: job.ID, Task: job.Task, Ref: job.Ref, TestedSHA: job.TestedSHA, State: job.State, ExitCode: job.ExitCode, Attempt: job.Attempt, RetryOf: job.RetryOf, RetryRoot: job.RetryRoot, PriorExitCode: job.PriorExitCode, QueueWaitSeconds: job.QueueWaitSeconds, DurationSeconds: job.DurationSeconds, TerminalResult: job.TerminalResult})
 		}
 		return nil, result, nil
 	})

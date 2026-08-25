@@ -1429,15 +1429,15 @@ func TestRetryPreservesRecordedSHAAndConfiguration(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer controller.Close()
+	if cancelled, err := controller.Cancel(original[0].ID); err != nil || !cancelled {
+		t.Fatalf("cancel original = %v, %v", cancelled, err)
+	}
 	retried, err := controller.Retry(original[0].ID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if retried[0].Ref != original[0].Ref || retried[0].checkoutRoot != original[0].checkoutRoot || retried[0].configRelative != original[0].configRelative {
 		t.Fatalf("retry changed recorded checkout: %#v", retried[0])
-	}
-	if cancelled, err := controller.Cancel(original[0].ID); err != nil || !cancelled {
-		t.Fatalf("cancel original = %v, %v", cancelled, err)
 	}
 	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
 		t.Fatalf("run retry = %v, %v", ran, err)
@@ -1468,6 +1468,9 @@ func TestRetryPinsLegacyRecordedSHA(t *testing.T) {
 	original, err := controller.Submit([]string{"unit"}, "")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if cancelled, err := controller.Cancel(original[0].ID); err != nil || !cancelled {
+		t.Fatalf("cancel original = %v, %v", cancelled, err)
 	}
 	if _, err := controller.db.Exec("UPDATE jobs SET checkout_root = '', config_relative = '' WHERE id = ?", original[0].ID); err != nil {
 		t.Fatal(err)

@@ -45,23 +45,31 @@ type Controller struct {
 	stageGate      chan struct{}
 	recoveryMu     sync.Mutex
 	recovered      bool
+	retryMu        sync.Mutex
 }
 
 type Job struct {
-	ID             int64  `json:"id"`
-	Batch          string `json:"batch"`
-	Task           string `json:"task"`
-	Ref            string `json:"ref"`
-	TestedSHA      string `json:"tested_sha,omitempty"`
-	State          string `json:"state"`
-	CreatedAt      string `json:"created_at"`
-	StartedAt      string `json:"started_at,omitempty"`
-	FinishedAt     string `json:"finished_at,omitempty"`
-	ExitCode       *int   `json:"exit_code,omitempty"`
-	LogPath        string `json:"log_path,omitempty"`
-	configJSON     string
-	checkoutRoot   string
-	configRelative string
+	ID               int64  `json:"id"`
+	Batch            string `json:"batch"`
+	Task             string `json:"task"`
+	Ref              string `json:"ref"`
+	TestedSHA        string `json:"tested_sha,omitempty"`
+	State            string `json:"state"`
+	CreatedAt        string `json:"created_at"`
+	StartedAt        string `json:"started_at,omitempty"`
+	FinishedAt       string `json:"finished_at,omitempty"`
+	ExitCode         *int   `json:"exit_code,omitempty"`
+	LogPath          string `json:"log_path,omitempty"`
+	Attempt          int    `json:"attempt"`
+	RetryOf          *int64 `json:"retry_of,omitempty"`
+	RetryRoot        int64  `json:"retry_root"`
+	PriorExitCode    *int   `json:"prior_exit_code,omitempty"`
+	QueueWaitSeconds int    `json:"queue_wait_seconds"`
+	DurationSeconds  int    `json:"duration_seconds"`
+	TerminalResult   string `json:"terminal_result,omitempty"`
+	configJSON       string
+	checkoutRoot     string
+	configRelative   string
 }
 
 func Open(configPath, stateDir string) (*Controller, error) {
@@ -232,7 +240,14 @@ func (controller *Controller) migrate() error {
 			config_json TEXT,
 			checkout_root TEXT,
 			config_relative TEXT,
-			cleanup_pending INTEGER NOT NULL DEFAULT 0
+			cleanup_pending INTEGER NOT NULL DEFAULT 0,
+			attempt INTEGER NOT NULL DEFAULT 1,
+			retry_of INTEGER,
+			retry_root INTEGER,
+			prior_exit_code INTEGER,
+			queue_wait_seconds INTEGER NOT NULL DEFAULT 0,
+			duration_seconds INTEGER NOT NULL DEFAULT 0,
+			terminal_result TEXT
 		);
 		CREATE INDEX IF NOT EXISTS jobs_queue ON jobs(state, id);
 		CREATE TABLE IF NOT EXISTS leases (
@@ -261,8 +276,19 @@ func (controller *Controller) migrate() error {
 	if err := controller.addJobColumn("config_relative", "TEXT"); err != nil {
 		return err
 	}
-	if err := controller.addJobColumn("cleanup_pending", "INTEGER NOT NULL DEFAULT 0"); err != nil {
-		return err
+	for _, column := range []struct{ name, definition string }{
+		{"cleanup_pending", "INTEGER NOT NULL DEFAULT 0"},
+		{"attempt", "INTEGER NOT NULL DEFAULT 1"},
+		{"retry_of", "INTEGER"},
+		{"retry_root", "INTEGER"},
+		{"prior_exit_code", "INTEGER"},
+		{"queue_wait_seconds", "INTEGER NOT NULL DEFAULT 0"},
+		{"duration_seconds", "INTEGER NOT NULL DEFAULT 0"},
+		{"terminal_result", "TEXT"},
+	} {
+		if err := controller.addJobColumn(column.name, column.definition); err != nil {
+			return err
+		}
 	}
 	if err := controller.addBatchRefColumn("ref", "TEXT NOT NULL DEFAULT ''"); err != nil {
 		return err
@@ -340,7 +366,7 @@ func (controller *Controller) SubmitContext(ctx context.Context, taskNames []str
 	} else if isCheckoutSHA(ref) {
 		return nil, fmt.Errorf("cannot submit requested checkout SHA: %w", err)
 	}
-	return controller.submit(ctx, controller.configSnapshot(), taskNames, ref, checkoutRoot, configRelative)
+	return controller.submit(ctx, controller.configSnapshot(), taskNames, ref, checkoutRoot, configRelative, nil)
 }
 
 func recordedDirectoryExists(checkoutRoot, ref, relative string) error {
@@ -354,7 +380,14 @@ func recordedDirectoryExists(checkoutRoot, ref, relative string) error {
 	return nil
 }
 
-func (controller *Controller) submit(ctx context.Context, config Config, taskNames []string, ref, checkoutRoot, configRelative string) ([]Job, error) {
+type retryInfo struct {
+	Attempt       int
+	RetryOf       int64
+	RetryRoot     int64
+	PriorExitCode *int
+}
+
+func (controller *Controller) submit(ctx context.Context, config Config, taskNames []string, ref, checkoutRoot, configRelative string, retries map[string]retryInfo) ([]Job, error) {
 	releaseStage, err := controller.acquireStageLock(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("lock checkout for submit: %w", err)
@@ -394,10 +427,14 @@ func (controller *Controller) submit(ctx context.Context, config Config, taskNam
 		return nil, err
 	}
 	for _, taskName := range ordered {
+		retry := retries[taskName]
+		if retry.Attempt == 0 {
+			retry.Attempt = 1
+		}
 		createdAt := timestamp()
 		result, err := transaction.Exec(
-			"INSERT INTO jobs(batch, task, ref, config_json, checkout_root, config_relative, state, created_at) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)",
-			batch, taskName, ref, configJSON, checkoutRoot, configRelative, createdAt,
+			"INSERT INTO jobs(batch, task, ref, config_json, checkout_root, config_relative, attempt, retry_of, retry_root, prior_exit_code, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, NULLIF(?, 0), NULLIF(?, 0), ?, 'queued', ?)",
+			batch, taskName, ref, configJSON, checkoutRoot, configRelative, retry.Attempt, retry.RetryOf, retry.RetryRoot, retry.PriorExitCode, createdAt,
 		)
 		if err != nil {
 			return nil, err
@@ -406,7 +443,17 @@ func (controller *Controller) submit(ctx context.Context, config Config, taskNam
 		if err != nil {
 			return nil, err
 		}
-		jobs = append(jobs, Job{ID: id, Batch: batch, Task: taskName, Ref: ref, State: "queued", CreatedAt: createdAt, checkoutRoot: checkoutRoot, configRelative: configRelative})
+		if retry.RetryRoot == 0 {
+			if _, err := transaction.Exec("UPDATE jobs SET retry_root = ? WHERE id = ?", id, id); err != nil {
+				return nil, err
+			}
+			retry.RetryRoot = id
+		}
+		job := Job{ID: id, Batch: batch, Task: taskName, Ref: ref, State: "queued", CreatedAt: createdAt, Attempt: retry.Attempt, RetryRoot: retry.RetryRoot, PriorExitCode: retry.PriorExitCode, checkoutRoot: checkoutRoot, configRelative: configRelative}
+		if retry.RetryOf != 0 {
+			job.RetryOf = &retry.RetryOf
+		}
+		jobs = append(jobs, job)
 	}
 	refCreated := false
 	if recordedRef {
@@ -1129,13 +1176,13 @@ func (controller *Controller) RecoverInterrupted() error {
 		return err
 	}
 	now := timestamp()
-	if _, err := transaction.Exec("UPDATE jobs SET state = 'cancelled', finished_at = ? WHERE state = 'queued' AND batch IN (SELECT DISTINCT batch FROM jobs WHERE state = 'running')", now); err != nil {
+	if _, err := transaction.Exec("UPDATE jobs SET state = 'cancelled', finished_at = ?, queue_wait_seconds = MAX(0, CAST(strftime('%s', ?) - strftime('%s', created_at) AS INTEGER)), duration_seconds = 0, terminal_result = 'cancelled' WHERE state = 'queued' AND batch IN (SELECT DISTINCT batch FROM jobs WHERE state = 'running')", now, now); err != nil {
 		return err
 	}
 	if _, err := transaction.Exec("DELETE FROM leases WHERE job_id IN (SELECT id FROM jobs WHERE state = 'running')"); err != nil {
 		return err
 	}
-	if _, err := transaction.Exec("UPDATE jobs SET state = 'failed', finished_at = ?, exit_code = 125 WHERE state = 'running'", now); err != nil {
+	if _, err := transaction.Exec("UPDATE jobs SET state = 'failed', finished_at = ?, exit_code = 125, duration_seconds = CASE WHEN started_at IS NULL THEN 0 ELSE MAX(0, CAST(strftime('%s', ?) - strftime('%s', started_at) AS INTEGER)) END, terminal_result = 'failed' WHERE state = 'running'", now, now); err != nil {
 		return err
 	}
 	for _, job := range interrupted {
@@ -1411,7 +1458,7 @@ func (controller *Controller) claimContext(ctx context.Context, maxWorkers int) 
 		}
 		config, task, err := controller.jobConfig(job)
 		if err != nil {
-			if _, updateErr := transaction.Exec("UPDATE jobs SET state = 'failed', finished_at = ?, exit_code = 127 WHERE id = ?", timestamp(), job.ID); updateErr != nil {
+			if _, updateErr := transaction.Exec("UPDATE jobs SET state = 'failed', finished_at = ?, exit_code = 127, terminal_result = 'failed' WHERE id = ?", timestamp(), job.ID); updateErr != nil {
 				return Job{}, false, updateErr
 			}
 			changed = true
@@ -1425,7 +1472,7 @@ func (controller *Controller) claimContext(ctx context.Context, maxWorkers int) 
 			return Job{}, false, err
 		}
 		if blocked {
-			if _, err := transaction.Exec("UPDATE jobs SET state = 'cancelled', finished_at = ? WHERE id = ?", timestamp(), job.ID); err != nil {
+			if _, err := transaction.Exec("UPDATE jobs SET state = 'cancelled', finished_at = ?, terminal_result = 'cancelled' WHERE id = ?", timestamp(), job.ID); err != nil {
 				return Job{}, false, err
 			}
 			changed = true
@@ -1449,7 +1496,8 @@ func (controller *Controller) claimContext(ctx context.Context, maxWorkers int) 
 			pinned = &pinnedJob
 			pinnedCreated = created
 		}
-		if _, err := transaction.Exec("UPDATE jobs SET state = 'running', started_at = ? WHERE id = ?", timestamp(), job.ID); err != nil {
+		now := timestamp()
+		if _, err := transaction.Exec("UPDATE jobs SET state = 'running', started_at = ?, queue_wait_seconds = MAX(0, CAST(strftime('%s', ?) - strftime('%s', created_at) AS INTEGER)) WHERE id = ?", now, now, job.ID); err != nil {
 			return Job{}, false, err
 		}
 		for _, resource := range task.Resources {
@@ -2276,9 +2324,10 @@ func (controller *Controller) finish(job Job, code int, cleanupPending bool) err
 	if code != 0 {
 		state = "failed"
 	}
+	now := timestamp()
 	_, err := controller.db.Exec(
-		"UPDATE jobs SET state = ?, finished_at = ?, exit_code = ?, log_path = ?, cleanup_pending = ? WHERE id = ?",
-		state, timestamp(), code, job.LogPath, cleanupPending, job.ID,
+		"UPDATE jobs SET state = ?, finished_at = ?, exit_code = ?, log_path = ?, cleanup_pending = ?, duration_seconds = CASE WHEN started_at IS NULL THEN 0 ELSE MAX(0, CAST(strftime('%s', ?) - strftime('%s', started_at) AS INTEGER)) END, terminal_result = ? WHERE id = ?",
+		state, now, code, job.LogPath, cleanupPending, now, state, job.ID,
 	)
 	if err != nil {
 		return err
@@ -2291,7 +2340,7 @@ func (controller *Controller) finish(job Job, code int, cleanupPending bool) err
 }
 
 func (controller *Controller) Jobs() ([]Job, error) {
-	rows, err := controller.db.Query("SELECT id, batch, task, ref, COALESCE(tested_sha, ''), state, created_at, COALESCE(started_at, ''), COALESCE(finished_at, ''), exit_code, COALESCE(log_path, ''), COALESCE(config_json, '') FROM jobs ORDER BY id")
+	rows, err := controller.db.Query("SELECT id, batch, task, ref, COALESCE(tested_sha, ''), state, created_at, COALESCE(started_at, ''), COALESCE(finished_at, ''), exit_code, COALESCE(log_path, ''), COALESCE(config_json, ''), COALESCE(attempt, 1), retry_of, COALESCE(retry_root, id), prior_exit_code, COALESCE(queue_wait_seconds, 0), COALESCE(duration_seconds, 0), COALESCE(terminal_result, '') FROM jobs ORDER BY id")
 	if err != nil {
 		return nil, err
 	}
@@ -2299,7 +2348,7 @@ func (controller *Controller) Jobs() ([]Job, error) {
 	var jobs []Job
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Batch, &job.Task, &job.Ref, &job.TestedSHA, &job.State, &job.CreatedAt, &job.StartedAt, &job.FinishedAt, &job.ExitCode, &job.LogPath, &job.configJSON); err != nil {
+		if err := rows.Scan(&job.ID, &job.Batch, &job.Task, &job.Ref, &job.TestedSHA, &job.State, &job.CreatedAt, &job.StartedAt, &job.FinishedAt, &job.ExitCode, &job.LogPath, &job.configJSON, &job.Attempt, &job.RetryOf, &job.RetryRoot, &job.PriorExitCode, &job.QueueWaitSeconds, &job.DurationSeconds, &job.TerminalResult); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, job)
@@ -2319,9 +2368,10 @@ func (controller *Controller) CancelContext(ctx context.Context, id int64) (bool
 		}
 		return false, err
 	}
+	now := timestamp()
 	result, err := controller.db.Exec(
-		"UPDATE jobs SET state = 'cancelled', finished_at = ? WHERE id = ? AND state = 'queued'",
-		timestamp(), id,
+		"UPDATE jobs SET state = 'cancelled', finished_at = ?, queue_wait_seconds = MAX(0, CAST(strftime('%s', ?) - strftime('%s', created_at) AS INTEGER)), duration_seconds = 0, terminal_result = 'cancelled' WHERE id = ? AND state = 'queued'",
+		now, now, id,
 	)
 	if err != nil {
 		return false, err
@@ -2338,9 +2388,14 @@ func (controller *Controller) Retry(id int64) ([]Job, error) {
 }
 
 func (controller *Controller) RetryContext(ctx context.Context, id int64) ([]Job, error) {
-	var task, ref, configJSON, checkoutRoot, configRelative string
-	if err := controller.db.QueryRow("SELECT task, ref, COALESCE(config_json, ''), COALESCE(checkout_root, ''), COALESCE(config_relative, '') FROM jobs WHERE id = ?", id).Scan(&task, &ref, &configJSON, &checkoutRoot, &configRelative); err != nil {
+	controller.retryMu.Lock()
+	defer controller.retryMu.Unlock()
+	var batch, task, ref, configJSON, checkoutRoot, configRelative, state string
+	if err := controller.db.QueryRow("SELECT batch, task, ref, COALESCE(config_json, ''), COALESCE(checkout_root, ''), COALESCE(config_relative, ''), state FROM jobs WHERE id = ?", id).Scan(&batch, &task, &ref, &configJSON, &checkoutRoot, &configRelative, &state); err != nil {
 		return nil, err
+	}
+	if state == "queued" || state == "running" {
+		return nil, fmt.Errorf("job %d is not finished", id)
 	}
 	config := controller.configSnapshot()
 	if configJSON != "" {
@@ -2362,7 +2417,57 @@ func (controller *Controller) RetryContext(ctx context.Context, id int64) ([]Job
 			return nil, fmt.Errorf("validate retried checkout configuration: %w", err)
 		}
 	}
-	return controller.submit(ctx, config, []string{task}, ref, checkoutRoot, configRelative)
+	ordered, err := config.Ordered([]string{task})
+	if err != nil {
+		return nil, err
+	}
+	type history struct {
+		id       int64
+		attempt  int
+		root     int64
+		exitCode *int
+	}
+	historyByTask := map[string]history{}
+	rows, err := controller.db.Query("SELECT id, task, COALESCE(attempt, 1), COALESCE(retry_root, id), exit_code FROM jobs WHERE batch = ?", batch)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var item history
+		var name string
+		if err := rows.Scan(&item.id, &name, &item.attempt, &item.root, &item.exitCode); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		historyByTask[name] = item
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	retries := make(map[string]retryInfo, len(ordered))
+	for _, name := range ordered {
+		item, ok := historyByTask[name]
+		if !ok {
+			return nil, fmt.Errorf("retry history lacks task %q", name)
+		}
+		var latest history
+		var latestState string
+		if err := controller.db.QueryRow("SELECT id, COALESCE(attempt, 1), exit_code, state FROM jobs WHERE COALESCE(retry_root, id) = ? ORDER BY COALESCE(attempt, 1) DESC, id DESC LIMIT 1", item.root).Scan(&latest.id, &latest.attempt, &latest.exitCode, &latestState); err != nil {
+			return nil, err
+		}
+		if latestState == "queued" || latestState == "running" {
+			return nil, fmt.Errorf("task %q already has a pending retry", name)
+		}
+		if config.Tasks[name].MaxRetries > 0 && latest.attempt > config.Tasks[name].MaxRetries {
+			return nil, fmt.Errorf("task %q reached max_retries %d", name, config.Tasks[name].MaxRetries)
+		}
+		retries[name] = retryInfo{Attempt: latest.attempt + 1, RetryOf: latest.id, RetryRoot: item.root, PriorExitCode: latest.exitCode}
+	}
+	return controller.submit(ctx, config, []string{task}, ref, checkoutRoot, configRelative, retries)
 }
 
 func (controller *Controller) TailLog(id int64, limit int) ([]string, error) {

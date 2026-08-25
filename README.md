@@ -32,7 +32,7 @@ Add `bitci.json` at the repository root:
   "version": 1,
   "resources": { "browser": 1 },
   "tasks": {
-    "unit": { "run": ["go", "test", "./..."], "paths": ["**"] },
+    "unit": { "run": ["go", "test", "./..."], "paths": ["**"], "max_retries": 1 },
     "browser": {
       "run": ["npm", "run", "test:browser"],
       "needs": ["unit"],
@@ -96,6 +96,10 @@ human CLI --> local queue and logs
   Each result records `tested_sha`.
 - BitCI keeps each recorded SHA reachable with a private Git ref until its batch finishes.
 - `status`, `logs`, `cancel`, and `retry` inspect or control the queue.
+
+`max_retries` caps manual reruns for that task. BitCI never retries jobs
+automatically. Status records each attempt, prior exit code, queue wait,
+duration, and terminal result.
 
 `cancel` affects queued work only. Retry only after reading logs. Never print
 secrets from tasks.
