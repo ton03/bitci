@@ -45,8 +45,8 @@ type Controller struct {
 	stageGate      chan struct{}
 	recoveryMu     sync.Mutex
 	recovered      bool
-	finishingMu    sync.Mutex
-	finishingJobs  map[int64]struct{}
+	activeMu       sync.Mutex
+	activeJobs     map[int64]struct{}
 	retryMu        sync.Mutex
 }
 
@@ -548,6 +548,8 @@ func (controller *Controller) runOnce(ctx context.Context, maxWorkers int) (bool
 	if err != nil || !claimed {
 		return false, err
 	}
+	endActive := controller.markActive(job.ID)
+	defer endActive()
 	config, task, err := controller.jobConfig(job)
 	if err != nil {
 		return true, controller.finish(job, 127, false)
@@ -581,6 +583,10 @@ func (controller *Controller) runOnce(ctx context.Context, maxWorkers int) (bool
 		}
 		worktreeRoot = filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", job.ID))
 		expectedOwner = jobCheckoutOwner(job)
+		if _, err := fmt.Fprintf(logFile, "BitCI worktree=%s\n", worktreeRoot); err != nil {
+			logFile.Close()
+			return true, controller.finish(job, 127, true)
+		}
 		if owner, readErr := os.ReadFile(jobCheckoutOwnerPath(worktreeRoot)); readErr != nil || !bytes.Equal(owner, expectedOwner) {
 			fmt.Fprintln(logFile, "BitCI could not record job worktree identity")
 			cleanupPending := cleanup() != nil
@@ -993,8 +999,11 @@ func (controller *Controller) verifyJobWorktree(worktreeRoot, ref string, expect
 		}
 	}
 	status, err := gitAt(context.Background(), worktreeRoot, "status", "--porcelain", "--untracked-files=no")
-	if err != nil || status != "" {
-		return fmt.Errorf("worktree tracked files changed")
+	if err != nil {
+		return fmt.Errorf("read worktree status: %w", err)
+	}
+	if status != "" {
+		return fmt.Errorf("worktree tracked files changed: %s", strings.TrimSpace(status))
 	}
 	sha, err := checkoutSHA(worktreeRoot)
 	if err != nil || !strings.EqualFold(sha, ref) {
@@ -1165,7 +1174,7 @@ func (controller *Controller) RecoverOrphaned() (int, error) {
 		if err := rows.Scan(&job.ID, &job.Batch, &job.Ref, &job.checkoutRoot, &job.WorkerPID, &job.startedAt); err != nil {
 			return 0, err
 		}
-		if controller.isFinishing(job.ID) {
+		if controller.isActive(job.ID) {
 			continue
 		}
 		if !orphanGraceExpired(job.startedAt) {
@@ -1224,24 +1233,24 @@ func orphanGraceExpired(startedAt string) bool {
 	return err != nil || time.Since(parsed) >= orphanRecoveryGrace
 }
 
-func (controller *Controller) markFinishing(id int64) func() {
-	controller.finishingMu.Lock()
-	if controller.finishingJobs == nil {
-		controller.finishingJobs = make(map[int64]struct{})
+func (controller *Controller) markActive(id int64) func() {
+	controller.activeMu.Lock()
+	if controller.activeJobs == nil {
+		controller.activeJobs = make(map[int64]struct{})
 	}
-	controller.finishingJobs[id] = struct{}{}
-	controller.finishingMu.Unlock()
+	controller.activeJobs[id] = struct{}{}
+	controller.activeMu.Unlock()
 	return func() {
-		controller.finishingMu.Lock()
-		delete(controller.finishingJobs, id)
-		controller.finishingMu.Unlock()
+		controller.activeMu.Lock()
+		delete(controller.activeJobs, id)
+		controller.activeMu.Unlock()
 	}
 }
 
-func (controller *Controller) isFinishing(id int64) bool {
-	controller.finishingMu.Lock()
-	_, ok := controller.finishingJobs[id]
-	controller.finishingMu.Unlock()
+func (controller *Controller) isActive(id int64) bool {
+	controller.activeMu.Lock()
+	_, ok := controller.activeJobs[id]
+	controller.activeMu.Unlock()
 	return ok
 }
 
@@ -2540,8 +2549,6 @@ func (controller *Controller) executeCommandWithEnvForJob(parent context.Context
 		}
 	}
 	err := command.Wait()
-	endFinishing := controller.markFinishing(int64(jobID))
-	defer endFinishing()
 	groupErr := syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
 	if persistProcess && (groupErr == nil || errors.Is(groupErr, syscall.ESRCH)) {
 		_ = os.Remove(processPath)
@@ -2549,23 +2556,33 @@ func (controller *Controller) executeCommandWithEnvForJob(parent context.Context
 	if groupErr != nil && !errors.Is(groupErr, syscall.ESRCH) {
 		fmt.Fprintf(output, "BitCI could not stop task descendants: %v\n", groupErr)
 		if err == nil {
+			writeTaskExitCode(output, 127)
 			return 127
 		}
 	}
 	if jobID > 0 {
 		if _, clearErr := controller.db.Exec("UPDATE jobs SET worker_pid = NULL WHERE id = ? AND worker_pid = ?", jobID, command.Process.Pid); clearErr != nil && err == nil {
 			fmt.Fprintf(output, "BitCI could not clear task process group: %v\n", clearErr)
+			writeTaskExitCode(output, 127)
 			return 127
 		}
 	}
 	if err == nil {
+		writeTaskExitCode(output, 0)
 		return 0
 	}
 	if exitError, ok := err.(*exec.ExitError); ok {
-		return exitError.ExitCode()
+		code := exitError.ExitCode()
+		writeTaskExitCode(output, code)
+		return code
 	}
 	fmt.Fprintf(output, "BitCI could not start task: %v\n", err)
+	writeTaskExitCode(output, 127)
 	return 127
+}
+
+func writeTaskExitCode(output io.Writer, code int) {
+	fmt.Fprintf(output, "\nBitCI task_exit_code=%d\n", code)
 }
 
 func (controller *Controller) processGroupPath(directory string) (string, bool) {
@@ -2696,11 +2713,25 @@ func (controller *Controller) finish(job Job, code int, cleanupPending bool) err
 		}
 		return fmt.Errorf("job %d is no longer finishable", job.ID)
 	}
+	terminalLogErr := appendTerminalLog(job.LogPath, state, code)
 	pruneErr := controller.pruneLogs()
 	_, leaseErr := controller.db.Exec("DELETE FROM leases WHERE job_id = ?", job.ID)
 	refErr := controller.releaseBatchRef(job.Batch, job.checkoutRoot)
 	cacheErr := controller.pruneObjectCaches()
-	return errors.Join(pruneErr, leaseErr, refErr, cacheErr)
+	return errors.Join(terminalLogErr, pruneErr, leaseErr, refErr, cacheErr)
+}
+
+func appendTerminalLog(path, state string, code int) error {
+	if path == "" {
+		return nil
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return err
+	}
+	_, writeErr := fmt.Fprintf(file, "BitCI terminal_state=%s exit_code=%d\n", state, code)
+	closeErr := file.Close()
+	return errors.Join(writeErr, closeErr)
 }
 
 func (controller *Controller) Jobs() ([]Job, error) {

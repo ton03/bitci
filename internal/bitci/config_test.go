@@ -24,6 +24,17 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+func withoutBitCITerminalLines(lines []string) []string {
+	filtered := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if line == "" || strings.HasPrefix(line, "BitCI task_exit_code=") || strings.HasPrefix(line, "BitCI terminal_state=") {
+			continue
+		}
+		filtered = append(filtered, line)
+	}
+	return filtered
+}
+
 func TestConfigContract(t *testing.T) {
 	configPath := writeConfig(t, `{
 		"version": 1,
@@ -82,6 +93,7 @@ func TestLogsRedactConfiguredValues(t *testing.T) {
 		t.Fatalf("run once = %v, %v", ran, err)
 	}
 	lines, err := controller.TailLog(jobs[0].ID, 80)
+	lines = withoutBitCITerminalLines(lines)
 	if err != nil || strings.Join(lines, "") != "[REDACTED]" {
 		t.Fatalf("redacted logs = %q, %v", lines, err)
 	}
@@ -102,6 +114,7 @@ func TestLogsRedactLongestConfiguredValueFirst(t *testing.T) {
 		t.Fatalf("run once = %v, %v", ran, err)
 	}
 	lines, err := controller.TailLog(jobs[0].ID, 80)
+	lines = withoutBitCITerminalLines(lines)
 	if err != nil || strings.Join(lines, "") != "[REDACTED]" {
 		t.Fatalf("redacted logs = %q, %v", lines, err)
 	}
@@ -133,6 +146,7 @@ func TestLogReadsUsePersistedRedaction(t *testing.T) {
 	}
 	defer controller.Close()
 	lines, err := controller.TailLog(jobs[0].ID, 80)
+	lines = withoutBitCITerminalLines(lines)
 	if err != nil || strings.Join(lines, "") != "[REDACTED] marker" {
 		t.Fatalf("tail with persisted redaction = %q, %v", lines, err)
 	}
@@ -145,6 +159,7 @@ func TestLogReadsUsePersistedRedaction(t *testing.T) {
 		t.Fatalf("secret search with persisted redaction = %q, %v", lines, err)
 	}
 	output, err := controller.ReadLog(jobs[0].ID, 0, 80)
+	output.Lines = withoutBitCITerminalLines(output.Lines)
 	if err != nil || strings.Join(output.Lines, "") != "[REDACTED] marker" {
 		t.Fatalf("cursor read with persisted redaction = %#v, %v", output, err)
 	}
@@ -776,6 +791,11 @@ func TestServeRunsThreeRecordedSHAJobsConcurrently(t *testing.T) {
 			t.Fatalf("finished job = %#v", job)
 		}
 		path := filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", job.ID))
+		lines, err := controller.TailLog(job.ID, 40)
+		logText := strings.Join(lines, "\n")
+		if err != nil || !strings.Contains(logText, "BitCI worktree="+path) || !strings.Contains(logText, "BitCI task_exit_code=0") || !strings.Contains(logText, "BitCI terminal_state=passed exit_code=0") {
+			t.Fatalf("finished job log = %q, %v", logText, err)
+		}
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("finished job worktree %s = %v", path, err)
 		}
@@ -989,7 +1009,7 @@ func TestRecoverOrphanedWithoutTaskProcess(t *testing.T) {
 	}
 }
 
-func TestRecoverOrphanedSkipsFinishingJob(t *testing.T) {
+func TestRecoverOrphanedSkipsActiveJob(t *testing.T) {
 	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
 	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
 	if err != nil {
@@ -1007,8 +1027,8 @@ func TestRecoverOrphanedSkipsFinishingJob(t *testing.T) {
 	if _, err := controller.db.Exec("UPDATE jobs SET started_at = ?, worker_pid = ? WHERE id = ?", old, 999999999, jobs[0].ID); err != nil {
 		t.Fatal(err)
 	}
-	endFinishing := controller.markFinishing(jobs[0].ID)
-	defer endFinishing()
+	endActive := controller.markActive(jobs[0].ID)
+	defer endActive()
 	if recovered, err := controller.RecoverOrphaned(); err != nil || recovered != 0 {
 		t.Fatalf("recover finishing job = %d, %v", recovered, err)
 	}
@@ -1624,10 +1644,11 @@ func TestRunControlAndLogs(t *testing.T) {
 	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
 		t.Fatalf("run once = %v, %v", ran, err)
 	}
-	lines, err := controller.TailLog(retried[0].ID, 2)
+	lines, err := controller.TailLog(retried[0].ID, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
+	lines = withoutBitCITerminalLines(lines)
 	if got, want := strings.Join(lines, ","), "error second,third"; got != want {
 		t.Fatalf("tail = %q, want %q", got, want)
 	}
@@ -1652,6 +1673,7 @@ func TestRunControlAndLogs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	second.Lines = withoutBitCITerminalLines(second.Lines)
 	if got, want := strings.Join(second.Lines, ","), "third"; got != want {
 		t.Fatalf("second log read = %q, want %q", got, want)
 	}
@@ -2171,6 +2193,7 @@ func TestLiveLogCursorWaitsForCompleteLine(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	complete.Lines = withoutBitCITerminalLines(complete.Lines)
 	if got, want := strings.Join(complete.Lines, ","), "BitCI live log partial line"; got != want {
 		t.Fatalf("complete live log = %q, want %q", got, want)
 	}
@@ -2940,6 +2963,84 @@ func TestRecordedSHAVerifiesGitFileContents(t *testing.T) {
 	}
 	if jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 126 {
 		t.Fatalf("Git file mutation job = %#v", jobs[0])
+	}
+}
+
+func TestRecordedSHAMutationReportsAndCleans(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["cp","replacement","bitci.json"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, "replacement"), []byte("mutated\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json", "replacement")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 126 {
+		t.Fatalf("mutation job = %#v", jobs[0])
+	}
+	lines, err := controller.TailLog(jobs[0].ID, 40)
+	logText := strings.Join(lines, "\n")
+	if err != nil || !strings.Contains(logText, "worktree tracked files changed: M bitci.json") || !strings.Contains(logText, "BitCI terminal_state=failed exit_code=126") {
+		t.Fatalf("mutation log = %q, %v", logText, err)
+	}
+	path := filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", jobs[0].ID))
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("mutated worktree remains: %v", err)
+	}
+}
+
+func TestRecordedSHAExit125CapturesTaskStderr(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["./docker-fail"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, "docker-fail"), []byte("#!/bin/sh\nprintf 'docker: daemon unavailable\\n' >&2\nexit 125\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json", "docker-fail")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run once = %v, %v", ran, err)
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].State != "failed" || jobs[0].ExitCode == nil || *jobs[0].ExitCode != 125 {
+		t.Fatalf("exit 125 job = %#v", jobs[0])
+	}
+	lines, err := controller.TailLog(jobs[0].ID, 40)
+	logText := strings.Join(lines, "\n")
+	if err != nil || !strings.Contains(logText, "docker: daemon unavailable") || !strings.Contains(logText, "BitCI task_exit_code=125") || !strings.Contains(logText, "BitCI terminal_state=failed exit_code=125") {
+		t.Fatalf("exit 125 log = %q, %v", logText, err)
 	}
 }
 
