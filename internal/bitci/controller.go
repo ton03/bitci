@@ -52,6 +52,7 @@ type Job struct {
 	ID               int64  `json:"id"`
 	Batch            string `json:"batch"`
 	Task             string `json:"task"`
+	SubmittedRef     string `json:"submitted_ref,omitempty"`
 	Ref              string `json:"ref"`
 	TestedSHA        string `json:"tested_sha,omitempty"`
 	State            string `json:"state"`
@@ -232,6 +233,7 @@ func (controller *Controller) migrate() error {
 			batch TEXT NOT NULL,
 			task TEXT NOT NULL,
 			ref TEXT NOT NULL,
+			submitted_ref TEXT,
 			state TEXT NOT NULL,
 			created_at TEXT NOT NULL,
 			started_at TEXT,
@@ -263,11 +265,20 @@ func (controller *Controller) migrate() error {
 			checkout_root TEXT NOT NULL,
 			ref TEXT NOT NULL
 		);
+		CREATE TABLE IF NOT EXISTS staged_checkouts (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			pull_request INTEGER NOT NULL,
+			sha TEXT NOT NULL,
+			staged_at TEXT NOT NULL
+		);
 	`)
 	if err != nil {
 		return err
 	}
 	if err := controller.addJobColumn("tested_sha", "TEXT"); err != nil {
+		return err
+	}
+	if err := controller.addJobColumn("submitted_ref", "TEXT"); err != nil {
 		return err
 	}
 	if err := controller.addJobColumn("config_json", "TEXT"); err != nil {
@@ -350,27 +361,53 @@ func (controller *Controller) Submit(taskNames []string, ref string) ([]Job, err
 }
 
 func (controller *Controller) SubmitContext(ctx context.Context, taskNames []string, ref string) ([]Job, error) {
-	if isCheckoutSHA(ref) {
-		ref = strings.ToLower(ref)
-	}
+	requestedRef := strings.TrimSpace(ref)
 	checkoutRoot, configRelative := "", ""
+	submittedRef := requestedRef
 	if sha, err := controller.checkoutSHA(); err == nil {
-		if isCheckoutSHA(ref) && !strings.EqualFold(ref, sha) {
-			return nil, fmt.Errorf("requested checkout SHA does not match checkout HEAD")
+		if requestedRef != "" && !isCommitRef(requestedRef) {
+			return nil, fmt.Errorf("requested ref must be a commit SHA")
 		}
-		ref = sha
 		var locationErr error
 		checkoutRoot, configRelative, locationErr = controller.checkoutLocation()
 		if locationErr != nil {
 			return nil, locationErr
 		}
-		if err := recordedDirectoryExists(checkoutRoot, sha, configRelative); err != nil {
+		stagedSHA, err := controller.stagedCheckoutSHA()
+		if err != nil {
 			return nil, err
 		}
-	} else if isCheckoutSHA(ref) {
-		return nil, fmt.Errorf("cannot submit requested checkout SHA: %w", err)
+		if requestedRef == "" {
+			ref = sha
+			submittedRef = sha
+		} else {
+			ref, err = resolveCommitSHA(ctx, checkoutRoot, requestedRef)
+			if err != nil {
+				return nil, fmt.Errorf("requested checkout SHA is unavailable: %w", err)
+			}
+		}
+		if stagedSHA != "" && !strings.EqualFold(stagedSHA, ref) {
+			return nil, fmt.Errorf("staged checkout SHA %s does not match requested SHA %s", stagedSHA, ref)
+		}
+		if err := recordedDirectoryExists(checkoutRoot, ref, configRelative); err != nil {
+			return nil, err
+		}
+	} else if isCommitRef(requestedRef) {
+		return nil, fmt.Errorf("cannot submit requested checkout SHA: checkout is unavailable")
 	}
-	return controller.submit(ctx, controller.configSnapshot(), taskNames, ref, checkoutRoot, configRelative, nil)
+	return controller.submit(ctx, controller.configSnapshot(), taskNames, ref, submittedRef, checkoutRoot, configRelative, nil)
+}
+
+func resolveCommitSHA(ctx context.Context, checkoutRoot, ref string) (string, error) {
+	resolved, err := gitAt(ctx, checkoutRoot, "rev-parse", "--verify", ref+"^{commit}")
+	if err != nil {
+		return "", err
+	}
+	resolved = strings.TrimSpace(resolved)
+	if !isCheckoutSHA(resolved) {
+		return "", fmt.Errorf("Git returned an invalid commit SHA")
+	}
+	return strings.ToLower(resolved), nil
 }
 
 func recordedDirectoryExists(checkoutRoot, ref, relative string) error {
@@ -391,7 +428,7 @@ type retryInfo struct {
 	PriorExitCode *int
 }
 
-func (controller *Controller) submit(ctx context.Context, config Config, taskNames []string, ref, checkoutRoot, configRelative string, retries map[string]retryInfo) ([]Job, error) {
+func (controller *Controller) submit(ctx context.Context, config Config, taskNames []string, ref, submittedRef, checkoutRoot, configRelative string, retries map[string]retryInfo) ([]Job, error) {
 	releaseStage, err := controller.acquireStageLock(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("lock checkout for submit: %w", err)
@@ -437,8 +474,8 @@ func (controller *Controller) submit(ctx context.Context, config Config, taskNam
 		}
 		createdAt := timestamp()
 		result, err := transaction.Exec(
-			"INSERT INTO jobs(batch, task, ref, config_json, checkout_root, config_relative, attempt, retry_of, retry_root, prior_exit_code, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, NULLIF(?, 0), NULLIF(?, 0), ?, 'queued', ?)",
-			batch, taskName, ref, configJSON, checkoutRoot, configRelative, retry.Attempt, retry.RetryOf, retry.RetryRoot, retry.PriorExitCode, createdAt,
+			"INSERT INTO jobs(batch, task, ref, submitted_ref, config_json, checkout_root, config_relative, attempt, retry_of, retry_root, prior_exit_code, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, 0), NULLIF(?, 0), ?, 'queued', ?)",
+			batch, taskName, ref, submittedRef, configJSON, checkoutRoot, configRelative, retry.Attempt, retry.RetryOf, retry.RetryRoot, retry.PriorExitCode, createdAt,
 		)
 		if err != nil {
 			return nil, err
@@ -453,7 +490,7 @@ func (controller *Controller) submit(ctx context.Context, config Config, taskNam
 			}
 			retry.RetryRoot = id
 		}
-		job := Job{ID: id, Batch: batch, Task: taskName, Ref: ref, State: "queued", CreatedAt: createdAt, Attempt: retry.Attempt, RetryRoot: retry.RetryRoot, PriorExitCode: retry.PriorExitCode, checkoutRoot: checkoutRoot, configRelative: configRelative}
+		job := Job{ID: id, Batch: batch, Task: taskName, SubmittedRef: submittedRef, Ref: ref, State: "queued", CreatedAt: createdAt, Attempt: retry.Attempt, RetryRoot: retry.RetryRoot, PriorExitCode: retry.PriorExitCode, checkoutRoot: checkoutRoot, configRelative: configRelative}
 		if retry.RetryOf != 0 {
 			job.RetryOf = &retry.RetryOf
 		}
@@ -517,6 +554,12 @@ func (controller *Controller) runOnce(ctx context.Context, maxWorkers int) (bool
 	if err != nil {
 		return true, controller.finish(job, 127, false)
 	}
+	if isCheckoutSHA(job.Ref) {
+		if err := controller.writeJobLogHeader(logFile, job, task, maxWorkers); err != nil {
+			logFile.Close()
+			return true, controller.finish(job, 127, false)
+		}
+	}
 	workDir := filepath.Dir(controller.configPath)
 	worktreeRoot := ""
 	var expectedOwner []byte
@@ -541,6 +584,14 @@ func (controller *Controller) runOnce(ctx context.Context, maxWorkers int) (bool
 			cleanupPending := cleanup() != nil
 			logFile.Close()
 			return true, controller.finish(job, 126, cleanupPending)
+		}
+		if err := controller.db.QueryRow("SELECT COALESCE(tested_sha, '') FROM jobs WHERE id = ?", job.ID).Scan(&job.TestedSHA); err != nil {
+			logFile.Close()
+			return true, controller.finish(job, 127, false)
+		}
+		if _, err := fmt.Fprintf(logFile, "BitCI tested_sha=%s\n", job.TestedSHA); err != nil {
+			logFile.Close()
+			return true, controller.finish(job, 127, false)
 		}
 	}
 	code := 0
@@ -938,6 +989,18 @@ func isCheckoutSHA(value string) bool {
 	return true
 }
 
+func isCommitRef(value string) bool {
+	if len(value) < 7 || len(value) > 64 {
+		return false
+	}
+	for _, character := range value {
+		if !('0' <= character && character <= '9' || 'a' <= character && character <= 'f' || 'A' <= character && character <= 'F') {
+			return false
+		}
+	}
+	return true
+}
+
 func timestamp() string {
 	return time.Now().UTC().Format(time.RFC3339Nano)
 }
@@ -1061,7 +1124,7 @@ func recoveryInterval(interval time.Duration) time.Duration {
 // RecoverOrphaned fails running jobs whose recorded task process no longer exists.
 // It never kills a process and leaves live jobs untouched.
 func (controller *Controller) RecoverOrphaned() (int, error) {
-	rows, err := controller.db.Query("SELECT id, batch, ref, COALESCE(checkout_root, ''), worker_pid, COALESCE(started_at, '') FROM jobs WHERE state = 'running' AND worker_pid IS NOT NULL")
+	rows, err := controller.db.Query("SELECT id, batch, ref, COALESCE(checkout_root, ''), worker_pid, COALESCE(started_at, '') FROM jobs WHERE state = 'running'")
 	if err != nil {
 		return 0, err
 	}
@@ -1072,8 +1135,11 @@ func (controller *Controller) RecoverOrphaned() (int, error) {
 		if err := rows.Scan(&job.ID, &job.Batch, &job.Ref, &job.checkoutRoot, &job.WorkerPID, &job.startedAt); err != nil {
 			return 0, err
 		}
-		startedAt, parseErr := time.Parse(time.RFC3339, job.startedAt)
-		if parseErr == nil && time.Since(startedAt) < orphanRecoveryGrace {
+		if !orphanGraceExpired(job.startedAt) {
+			continue
+		}
+		if job.WorkerPID == nil {
+			orphaned = append(orphaned, job)
 			continue
 		}
 		alive, err := processAlive(*job.WorkerPID)
@@ -1096,14 +1162,18 @@ func (controller *Controller) RecoverOrphaned() (int, error) {
 // RecoverJob fails one running job only when its recorded task process is gone.
 func (controller *Controller) RecoverJob(id int64) (bool, error) {
 	var job Job
-	if err := controller.db.QueryRow("SELECT id, batch, ref, COALESCE(checkout_root, ''), worker_pid FROM jobs WHERE id = ? AND state = 'running'", id).Scan(&job.ID, &job.Batch, &job.Ref, &job.checkoutRoot, &job.WorkerPID); err != nil {
+	if err := controller.db.QueryRow("SELECT id, batch, ref, COALESCE(checkout_root, ''), worker_pid, COALESCE(started_at, '') FROM jobs WHERE id = ? AND state = 'running'", id).Scan(&job.ID, &job.Batch, &job.Ref, &job.checkoutRoot, &job.WorkerPID, &job.startedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, fmt.Errorf("job %d is not running", id)
 		}
 		return false, err
 	}
 	if job.WorkerPID == nil {
-		return false, fmt.Errorf("job %d has no recorded task process", id)
+		if !orphanGraceExpired(job.startedAt) {
+			return false, fmt.Errorf("job %d has no task process yet", id)
+		}
+		recovered, err := controller.recoverJobs([]Job{job}, false)
+		return recovered == 1, err
 	}
 	alive, err := processAlive(*job.WorkerPID)
 	if err != nil {
@@ -1114,6 +1184,11 @@ func (controller *Controller) RecoverJob(id int64) (bool, error) {
 	}
 	recovered, err := controller.recoverJobs([]Job{job}, false)
 	return recovered == 1, err
+}
+
+func orphanGraceExpired(startedAt string) bool {
+	parsed, err := time.Parse(time.RFC3339, startedAt)
+	return err != nil || time.Since(parsed) >= orphanRecoveryGrace
 }
 
 func (controller *Controller) recoverJobs(jobs []Job, skipChanged bool) (int, error) {
@@ -1128,7 +1203,13 @@ func (controller *Controller) recoverJobs(jobs []Job, skipChanged bool) (int, er
 	now := timestamp()
 	recovered := make([]Job, 0, len(jobs))
 	for _, job := range jobs {
-		result, err := transaction.Exec("UPDATE jobs SET state = 'failed', finished_at = ?, exit_code = 125, duration_seconds = COALESCE(CASE WHEN started_at IS NULL THEN 0 ELSE MAX(0, CAST(strftime('%s', ?) - strftime('%s', started_at) AS INTEGER)) END, 0), terminal_result = 'failed', worker_pid = NULL, cleanup_pending = ? WHERE id = ? AND state = 'running' AND worker_pid = ?", now, now, isCheckoutSHA(job.Ref), job.ID, *job.WorkerPID)
+		var result sql.Result
+		var err error
+		if job.WorkerPID == nil {
+			result, err = transaction.Exec("UPDATE jobs SET state = 'failed', finished_at = ?, exit_code = 125, duration_seconds = COALESCE(CASE WHEN started_at IS NULL THEN 0 ELSE MAX(0, CAST(strftime('%s', ?) - strftime('%s', started_at) AS INTEGER)) END, 0), terminal_result = 'failed', worker_pid = NULL, cleanup_pending = ? WHERE id = ? AND state = 'running' AND worker_pid IS NULL", now, now, isCheckoutSHA(job.Ref), job.ID)
+		} else {
+			result, err = transaction.Exec("UPDATE jobs SET state = 'failed', finished_at = ?, exit_code = 125, duration_seconds = COALESCE(CASE WHEN started_at IS NULL THEN 0 ELSE MAX(0, CAST(strftime('%s', ?) - strftime('%s', started_at) AS INTEGER)) END, 0), terminal_result = 'failed', worker_pid = NULL, cleanup_pending = ? WHERE id = ? AND state = 'running' AND worker_pid = ?", now, now, isCheckoutSHA(job.Ref), job.ID, *job.WorkerPID)
+		}
 		if err != nil {
 			return 0, err
 		}
@@ -1610,7 +1691,7 @@ func (controller *Controller) claimContext(ctx context.Context, maxWorkers int) 
 	if active >= maxWorkers {
 		return Job{}, false, nil
 	}
-	rows, err := transaction.Query("SELECT id, batch, task, ref, COALESCE(config_json, ''), COALESCE(checkout_root, ''), COALESCE(config_relative, ''), state FROM jobs WHERE state = 'queued' ORDER BY id")
+	rows, err := transaction.Query("SELECT id, batch, task, COALESCE(submitted_ref, ''), ref, COALESCE(config_json, ''), COALESCE(checkout_root, ''), COALESCE(config_relative, ''), state FROM jobs WHERE state = 'queued' ORDER BY id")
 	if err != nil {
 		return Job{}, false, err
 	}
@@ -1618,7 +1699,7 @@ func (controller *Controller) claimContext(ctx context.Context, maxWorkers int) 
 	changed := false
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Batch, &job.Task, &job.Ref, &job.configJSON, &job.checkoutRoot, &job.configRelative, &job.State); err != nil {
+		if err := rows.Scan(&job.ID, &job.Batch, &job.Task, &job.SubmittedRef, &job.Ref, &job.configJSON, &job.checkoutRoot, &job.configRelative, &job.State); err != nil {
 			return Job{}, false, err
 		}
 		config, task, err := controller.jobConfig(job)
@@ -2267,6 +2348,16 @@ func (controller *Controller) startLog(job *Job) (*os.File, error) {
 	return file, nil
 }
 
+func (controller *Controller) writeJobLogHeader(output io.Writer, job Job, task Task, maxWorkers int) error {
+	resources := strings.Join(task.Resources, ",")
+	diskFree := "unknown"
+	if free, err := controller.diskFree(); err == nil {
+		diskFree = strconv.FormatUint(free, 10)
+	}
+	_, err := fmt.Fprintf(output, "BitCI job id=%d task=%s submitted_ref=%s ref=%s timeout_seconds=%d max_workers=%d resources=%s disk_free_bytes=%s\n", job.ID, job.Task, job.SubmittedRef, job.Ref, task.Timeout, maxWorkers, resources, diskFree)
+	return err
+}
+
 func (controller *Controller) pruneLogs() error {
 	config := controller.configSnapshot()
 	if config.LogRetention == 0 {
@@ -2557,7 +2648,7 @@ func (controller *Controller) finish(job Job, code int, cleanupPending bool) err
 }
 
 func (controller *Controller) Jobs() ([]Job, error) {
-	rows, err := controller.db.Query("SELECT id, batch, task, ref, COALESCE(tested_sha, ''), state, created_at, COALESCE(started_at, ''), COALESCE(finished_at, ''), exit_code, COALESCE(log_path, ''), COALESCE(config_json, ''), COALESCE(attempt, 1), retry_of, COALESCE(retry_root, id), prior_exit_code, COALESCE(queue_wait_seconds, 0), COALESCE(duration_seconds, 0), COALESCE(terminal_result, ''), worker_pid FROM jobs ORDER BY id")
+	rows, err := controller.db.Query("SELECT id, batch, task, COALESCE(submitted_ref, ''), ref, COALESCE(tested_sha, ''), state, created_at, COALESCE(started_at, ''), COALESCE(finished_at, ''), exit_code, COALESCE(log_path, ''), COALESCE(config_json, ''), COALESCE(attempt, 1), retry_of, COALESCE(retry_root, id), prior_exit_code, COALESCE(queue_wait_seconds, 0), COALESCE(duration_seconds, 0), COALESCE(terminal_result, ''), worker_pid FROM jobs ORDER BY id")
 	if err != nil {
 		return nil, err
 	}
@@ -2565,7 +2656,7 @@ func (controller *Controller) Jobs() ([]Job, error) {
 	var jobs []Job
 	for rows.Next() {
 		var job Job
-		if err := rows.Scan(&job.ID, &job.Batch, &job.Task, &job.Ref, &job.TestedSHA, &job.State, &job.CreatedAt, &job.StartedAt, &job.FinishedAt, &job.ExitCode, &job.LogPath, &job.configJSON, &job.Attempt, &job.RetryOf, &job.RetryRoot, &job.PriorExitCode, &job.QueueWaitSeconds, &job.DurationSeconds, &job.TerminalResult, &job.WorkerPID); err != nil {
+		if err := rows.Scan(&job.ID, &job.Batch, &job.Task, &job.SubmittedRef, &job.Ref, &job.TestedSHA, &job.State, &job.CreatedAt, &job.StartedAt, &job.FinishedAt, &job.ExitCode, &job.LogPath, &job.configJSON, &job.Attempt, &job.RetryOf, &job.RetryRoot, &job.PriorExitCode, &job.QueueWaitSeconds, &job.DurationSeconds, &job.TerminalResult, &job.WorkerPID); err != nil {
 			return nil, err
 		}
 		jobs = append(jobs, job)
@@ -2607,9 +2698,12 @@ func (controller *Controller) Retry(id int64) ([]Job, error) {
 func (controller *Controller) RetryContext(ctx context.Context, id int64) ([]Job, error) {
 	controller.retryMu.Lock()
 	defer controller.retryMu.Unlock()
-	var batch, task, ref, configJSON, checkoutRoot, configRelative, state string
-	if err := controller.db.QueryRow("SELECT batch, task, ref, COALESCE(config_json, ''), COALESCE(checkout_root, ''), COALESCE(config_relative, ''), state FROM jobs WHERE id = ?", id).Scan(&batch, &task, &ref, &configJSON, &checkoutRoot, &configRelative, &state); err != nil {
+	var batch, task, ref, submittedRef, configJSON, checkoutRoot, configRelative, state string
+	if err := controller.db.QueryRow("SELECT batch, task, ref, COALESCE(submitted_ref, ''), COALESCE(config_json, ''), COALESCE(checkout_root, ''), COALESCE(config_relative, ''), state FROM jobs WHERE id = ?", id).Scan(&batch, &task, &ref, &submittedRef, &configJSON, &checkoutRoot, &configRelative, &state); err != nil {
 		return nil, err
+	}
+	if submittedRef == "" {
+		submittedRef = ref
 	}
 	if state == "queued" || state == "running" {
 		return nil, fmt.Errorf("job %d is not finished", id)
@@ -2684,7 +2778,7 @@ func (controller *Controller) RetryContext(ctx context.Context, id int64) ([]Job
 		}
 		retries[name] = retryInfo{Attempt: latest.attempt + 1, RetryOf: latest.id, RetryRoot: item.root, PriorExitCode: latest.exitCode}
 	}
-	return controller.submit(ctx, config, []string{task}, ref, checkoutRoot, configRelative, retries)
+	return controller.submit(ctx, config, []string{task}, ref, submittedRef, checkoutRoot, configRelative, retries)
 }
 
 func (controller *Controller) TailLog(id int64, limit int) ([]string, error) {

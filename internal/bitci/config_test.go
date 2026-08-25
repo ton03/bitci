@@ -675,6 +675,113 @@ func TestServeRunsRecordedSHAJobsConcurrently(t *testing.T) {
 	}
 }
 
+func TestServeRunsThreeRecordedSHAJobsConcurrently(t *testing.T) {
+	controller, events := recordedSHAConcurrentController(t, false)
+	defer controller.Close()
+
+	first, err := controller.Submit([]string{"first"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	refs := []string{first[0].Ref}
+	for index, name := range []string{"second", "third"} {
+		marker := fmt.Sprintf("%s-marker", name)
+		if err := os.WriteFile(filepath.Join(controller.checkoutRoot, marker), []byte(name+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		git(t, controller.checkoutRoot, "add", marker)
+		git(t, controller.checkoutRoot, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", name)
+		jobs, submitErr := controller.Submit([]string{name}, "")
+		if submitErr != nil {
+			t.Fatal(submitErr)
+		}
+		if len(jobs) != 1 {
+			t.Fatalf("%s jobs = %#v", name, jobs)
+		}
+		refs = append(refs, jobs[0].Ref)
+		if jobs[0].Ref == refs[index] {
+			t.Fatalf("%s reused SHA %s", name, jobs[0].Ref)
+		}
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	serveErr := make(chan error, 1)
+	socketPath := filepath.Join(os.TempDir(), fmt.Sprintf("bitci-three-%d.sock", time.Now().UnixNano()))
+	t.Cleanup(func() { _ = os.Remove(socketPath) })
+	go func() { serveErr <- controller.Serve(ctx, 3, 10*time.Millisecond, socketPath) }()
+	defer func() {
+		cancel()
+		select {
+		case err := <-serveErr:
+			if err != nil {
+				t.Errorf("serve = %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("serve did not stop")
+		}
+	}()
+
+	for _, name := range []string{"first", "second", "third"} {
+		awaitFile(t, filepath.Join(events, name+".started"))
+	}
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 3 {
+		t.Fatalf("job count = %d, want 3", len(jobs))
+	}
+	paths := make(map[string]bool)
+	for index, job := range jobs {
+		if job.State != "running" || job.Ref != refs[index] || job.TestedSHA != refs[index] || job.SubmittedRef != refs[index] || job.LogPath == "" {
+			t.Fatalf("three-job snapshot = %#v, refs = %#v", job, refs)
+		}
+		path := filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", job.ID))
+		if paths[path] {
+			t.Fatalf("jobs share worktree path %q", path)
+		}
+		paths[path] = true
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("job %d worktree = %v", job.ID, err)
+		}
+		lines, err := controller.TailLog(job.ID, 8)
+		logText := strings.Join(lines, "\n")
+		if err != nil || !strings.Contains(logText, "submitted_ref="+job.SubmittedRef) || !strings.Contains(logText, "tested_sha="+job.TestedSHA) {
+			t.Fatalf("job %d provenance log = %q, %v", job.ID, logText, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(events, "release"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		jobs, err = controller.Jobs()
+		if err != nil {
+			t.Fatal(err)
+		}
+		passed := len(jobs) == 3
+		for _, job := range jobs {
+			passed = passed && job.State == "passed"
+		}
+		if passed {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(jobs) != 3 {
+		t.Fatalf("finished jobs = %#v", jobs)
+	}
+	for _, job := range jobs {
+		if job.State != "passed" {
+			t.Fatalf("finished job = %#v", job)
+		}
+		path := filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", job.ID))
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("finished job worktree %s = %v", path, err)
+		}
+	}
+}
+
 func TestRecordedSHAJobsWithSameResourceSerialize(t *testing.T) {
 	controller, events := recordedSHAConcurrentController(t, true)
 	defer controller.Close()
@@ -838,6 +945,73 @@ func TestRecoverOrphanedReleasesLeaseAndCancelsBatch(t *testing.T) {
 	}
 	if _, claimed, err := controller.claim(1); err != nil || !claimed {
 		t.Fatalf("claim after orphan recovery = %v, %v", claimed, err)
+	}
+}
+
+func TestRecoverOrphanedWithoutTaskProcess(t *testing.T) {
+	configPath := writeConfig(t, `{
+		"version":1,
+		"resources":{"browser":1},
+		"tasks":{"unit":{"run":["true"],"resources":["browser"]}}
+	}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	jobs, err := controller.Submit([]string{"unit"}, "one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, claimed, err := controller.claim(1); err != nil || !claimed {
+		t.Fatalf("claim = %v, %v", claimed, err)
+	}
+	old := time.Now().Add(-orphanRecoveryGrace - time.Second).UTC().Format(time.RFC3339)
+	if _, err := controller.db.Exec("UPDATE jobs SET started_at = ?, worker_pid = NULL WHERE id = ?", old, jobs[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := controller.RecoverOrphaned()
+	if err != nil || recovered != 1 {
+		t.Fatalf("recover missing process = %d, %v", recovered, err)
+	}
+	finished, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finished[0].State != "failed" || finished[0].ExitCode == nil || *finished[0].ExitCode != 125 || finished[0].WorkerPID != nil {
+		t.Fatalf("recovered missing process job = %#v", finished[0])
+	}
+	if _, err := controller.Submit([]string{"unit"}, "two"); err != nil {
+		t.Fatal(err)
+	}
+	if _, claimed, err := controller.claim(1); err != nil || !claimed {
+		t.Fatalf("claim after missing process recovery = %v, %v", claimed, err)
+	}
+}
+
+func TestRecoverJobWaitsForMissingTaskProcessGrace(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	jobs, err := controller.Submit([]string{"unit"}, "one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, claimed, err := controller.claim(1); err != nil || !claimed {
+		t.Fatalf("claim = %v, %v", claimed, err)
+	}
+	if recovered, err := controller.RecoverJob(jobs[0].ID); err == nil || recovered || !strings.Contains(err.Error(), "no task process yet") {
+		t.Fatalf("early missing process recovery = %v, %v", recovered, err)
+	}
+	old := time.Now().Add(-orphanRecoveryGrace - time.Second).UTC().Format(time.RFC3339)
+	if _, err := controller.db.Exec("UPDATE jobs SET started_at = ?, worker_pid = NULL WHERE id = ?", old, jobs[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if recovered, err := controller.RecoverJob(jobs[0].ID); err != nil || !recovered {
+		t.Fatalf("late missing process recovery = %v, %v", recovered, err)
 	}
 }
 
@@ -1287,7 +1461,7 @@ func TestMCPStatusIncludesTestedSHA(t *testing.T) {
 	}
 	defer controller.Close()
 	sha := "0123456789012345678901234567890123456789"
-	if _, err := controller.db.Exec("INSERT INTO jobs(batch, task, ref, tested_sha, state, created_at) VALUES ('batch', 'unit', ?, ?, 'passed', '2026-01-01T00:00:00Z')", sha, sha); err != nil {
+	if _, err := controller.db.Exec("INSERT INTO jobs(batch, task, submitted_ref, ref, tested_sha, state, created_at) VALUES ('batch', 'unit', ?, ?, ?, 'passed', '2026-01-01T00:00:00Z')", "short-sha", sha, sha); err != nil {
 		t.Fatal(err)
 	}
 	socketPath := fmt.Sprintf("/tmp/bitci-%d.sock", time.Now().UnixNano())
@@ -1301,7 +1475,7 @@ func TestMCPStatusIncludesTestedSHA(t *testing.T) {
 	ownerDone := make(chan error, 1)
 	go func() { ownerDone <- controller.ServeRPC(ctx, listener) }()
 	status := mcpStatus(t, socketPath)
-	if len(status.Jobs) != 1 || status.Jobs[0].TestedSHA != sha {
+	if len(status.Jobs) != 1 || status.Jobs[0].SubmittedRef != "short-sha" || status.Jobs[0].TestedSHA != sha {
 		t.Fatalf("MCP status = %#v", status)
 	}
 	cancel()
@@ -1707,8 +1881,8 @@ func TestDashboardContract(t *testing.T) {
 	insert := func(state string, created, started, finished time.Time, sha, logPath string) int64 {
 		t.Helper()
 		result, err := controller.db.Exec(
-			"INSERT INTO jobs(batch, task, ref, tested_sha, state, created_at, started_at, finished_at, log_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-			"batch", "unit", sha, sha, state, created.Format(time.RFC3339), started.Format(time.RFC3339), finished.Format(time.RFC3339), logPath,
+			"INSERT INTO jobs(batch, task, submitted_ref, ref, tested_sha, state, created_at, started_at, finished_at, log_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			"batch", "unit", sha[:12], sha, sha, state, created.Format(time.RFC3339), started.Format(time.RFC3339), finished.Format(time.RFC3339), logPath,
 		)
 		if err != nil {
 			t.Fatal(err)
@@ -1735,7 +1909,7 @@ func TestDashboardContract(t *testing.T) {
 		t.Fatalf("dashboard status = %d", response.Code)
 	}
 	body := response.Body.String()
-	for _, value := range []string{"Recent jobs", "0123456789012345678901234567890123456789", "2m0s", "avg passed · 7d (1)", "1.0 MiB", "0/1"} {
+	for _, value := range []string{"Recent jobs", "012345678901", "0123456789012345678901234567890123456789", "2m0s", "avg passed · 7d (1)", "1.0 MiB", "0/1"} {
 		if !strings.Contains(body, value) {
 			t.Fatalf("dashboard missing %q: %s", value, body)
 		}
@@ -1991,7 +2165,7 @@ func TestJobRunsInRecordedCheckoutSHA(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer controller.Close()
-	jobs, err := controller.Submit([]string{"unit"}, "untrusted input")
+	jobs, err := controller.Submit([]string{"unit"}, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2105,7 +2279,7 @@ func TestRecordedDirectoryExistsRejectsBlob(t *testing.T) {
 	}
 }
 
-func TestSubmitRejectsRequestedSHAWithoutMatchingCheckout(t *testing.T) {
+func TestSubmitAcceptsRequestedSHAWithoutMatchingCheckout(t *testing.T) {
 	checkout := t.TempDir()
 	configPath := filepath.Join(checkout, "bitci.json")
 	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
@@ -2125,15 +2299,37 @@ func TestSubmitRejectsRequestedSHAWithoutMatchingCheckout(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer controller.Close()
-	if _, err := controller.Submit([]string{"unit"}, requested); err == nil || !strings.Contains(err.Error(), "does not match checkout HEAD") {
-		t.Fatalf("submit mismatched SHA error = %v", err)
-	}
-	jobs, err := controller.Jobs()
+	requestedShort := requested[:12]
+	jobs, err := controller.Submit([]string{"unit"}, requestedShort)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(jobs) != 0 {
-		t.Fatalf("mismatched SHA queued jobs = %#v", jobs)
+	if len(jobs) != 1 || jobs[0].Ref != requested || jobs[0].SubmittedRef != requestedShort {
+		t.Fatalf("submitted SHA metadata = %#v", jobs)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run requested SHA = %v, %v", ran, err)
+	}
+	finished, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finished[0].State != "passed" || finished[0].SubmittedRef != requestedShort || finished[0].TestedSHA != requested {
+		t.Fatalf("requested SHA result = %#v", finished[0])
+	}
+	lines, err := controller.TailLog(finished[0].ID, 8)
+	if err != nil || !strings.Contains(strings.Join(lines, "\n"), "submitted_ref="+requestedShort) {
+		t.Fatalf("requested SHA log = %q, %v", strings.Join(lines, "\n"), err)
+	}
+	jobs, err = controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("requested SHA jobs = %#v", jobs)
+	}
+	if _, err := controller.Submit([]string{"unit"}, "main"); err == nil || !strings.Contains(err.Error(), "requested ref must be a commit SHA") {
+		t.Fatalf("symbolic ref error = %v", err)
 	}
 }
 
@@ -3912,6 +4108,17 @@ func TestStagePRChecksTrustAndCleansNext(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(checkout, ".next")); !os.IsNotExist(err) {
 		t.Fatalf("stale .next remains: %v", err)
 	}
+	if staged, err := controller.stagedCheckoutSHA(); err != nil || staged != prSHA {
+		t.Fatalf("staged checkout record = %q, %v", staged, err)
+	}
+	jobs, err := controller.Submit([]string{"unit"}, "")
+	if err != nil || len(jobs) != 1 || jobs[0].Ref != prSHA || jobs[0].SubmittedRef != prSHA {
+		t.Fatalf("submit staged SHA = %#v, %v", jobs, err)
+	}
+	git(t, checkout, "checkout", "--detach", "-q", mainSHA)
+	if _, err := controller.Submit([]string{"unit"}, ""); err == nil || !strings.Contains(err.Error(), "staged checkout SHA") {
+		t.Fatalf("stale staged checkout accepted: %v", err)
+	}
 }
 
 func TestStagePRRejectsFork(t *testing.T) {
@@ -4661,8 +4868,8 @@ func recordedSHAConcurrentController(t *testing.T, sameResource bool) (*Controll
 		resources = `,"resources":{"browser":1}`
 		taskResource = `,"resources":["browser"]`
 	}
-	config := fmt.Sprintf(`{"version":1%s,"tasks":{"first":{"run":["sh","runner","first",%q]%s},"second":{"run":["sh","runner","second",%q]%s}}}`,
-		resources, events, taskResource, events, taskResource)
+	config := fmt.Sprintf(`{"version":1%s,"tasks":{"first":{"run":["sh","runner","first",%q]%s},"second":{"run":["sh","runner","second",%q]%s},"third":{"run":["sh","runner","third",%q]%s}}}`,
+		resources, events, taskResource, events, taskResource, events, taskResource)
 	if err := os.WriteFile(filepath.Join(checkout, "bitci.json"), []byte(config), 0o600); err != nil {
 		t.Fatal(err)
 	}

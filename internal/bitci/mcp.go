@@ -14,6 +14,7 @@ type MCPOptions struct {
 type MCPJob struct {
 	ID               int64  `json:"id"`
 	Task             string `json:"task"`
+	SubmittedRef     string `json:"submitted_ref,omitempty"`
 	Ref              string `json:"ref"`
 	TestedSHA        string `json:"tested_sha,omitempty"`
 	State            string `json:"state"`
@@ -64,7 +65,7 @@ type MCPLogCursorOutput struct {
 
 type MCPSubmitInput struct {
 	TaskIDs []string `json:"task_ids" jsonschema:"configured task IDs only"`
-	Ref     string   `json:"ref,omitempty" jsonschema:"source reference"`
+	Ref     string   `json:"ref,omitempty" jsonschema:"optional 7-64 character commit SHA"`
 }
 
 type MCPJobInput struct {
@@ -86,7 +87,7 @@ func RunMCP(ctx context.Context, options MCPOptions) error {
 		}
 		result := MCPStatus{Jobs: make([]MCPJob, 0, len(jobs))}
 		for _, job := range jobs {
-			result.Jobs = append(result.Jobs, MCPJob{ID: job.ID, Task: job.Task, Ref: job.Ref, TestedSHA: job.TestedSHA, State: job.State, ExitCode: job.ExitCode, Attempt: job.Attempt, RetryOf: job.RetryOf, RetryRoot: job.RetryRoot, PriorExitCode: job.PriorExitCode, QueueWaitSeconds: job.QueueWaitSeconds, DurationSeconds: job.DurationSeconds, TerminalResult: job.TerminalResult, WorkerPID: job.WorkerPID})
+			result.Jobs = append(result.Jobs, MCPJob{ID: job.ID, Task: job.Task, SubmittedRef: job.SubmittedRef, Ref: job.Ref, TestedSHA: job.TestedSHA, State: job.State, ExitCode: job.ExitCode, Attempt: job.Attempt, RetryOf: job.RetryOf, RetryRoot: job.RetryRoot, PriorExitCode: job.PriorExitCode, QueueWaitSeconds: job.QueueWaitSeconds, DurationSeconds: job.DurationSeconds, TerminalResult: job.TerminalResult, WorkerPID: job.WorkerPID})
 		}
 		return nil, result, nil
 	})
@@ -139,7 +140,7 @@ func addRunTools(server *mcp.Server, call func(string, any, any) error) {
 		}
 		result := MCPStatus{Jobs: make([]MCPJob, 0, len(jobs))}
 		for _, job := range jobs {
-			result.Jobs = append(result.Jobs, MCPJob{ID: job.ID, Task: job.Task, Ref: job.Ref, State: job.State})
+			result.Jobs = append(result.Jobs, MCPJob{ID: job.ID, Task: job.Task, SubmittedRef: job.SubmittedRef, Ref: job.Ref, State: job.State})
 		}
 		return nil, result, nil
 	})
@@ -157,7 +158,7 @@ func addRunTools(server *mcp.Server, call func(string, any, any) error) {
 		}
 		result := MCPStatus{Jobs: make([]MCPJob, 0, len(jobs))}
 		for _, job := range jobs {
-			result.Jobs = append(result.Jobs, MCPJob{ID: job.ID, Task: job.Task, Ref: job.Ref, State: job.State})
+			result.Jobs = append(result.Jobs, MCPJob{ID: job.ID, Task: job.Task, SubmittedRef: job.SubmittedRef, Ref: job.Ref, State: job.State})
 		}
 		return nil, result, nil
 	})

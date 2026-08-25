@@ -116,6 +116,9 @@ human CLI --> local queue and logs
 
 - `plan` selects task IDs from changed paths.
 - `submit` records those task IDs, their config, and the source SHA.
+- `submitted_ref` keeps the exact SHA text supplied by the caller. `ref` stores
+  its verified full commit SHA, and `tested_sha` records the SHA checked out
+  inside the job worktree.
 - `serve` claims FIFO jobs when worker, disk, and resource limits allow them.
 - SHA-backed jobs run in a detached checkout with independent Git metadata.
   The checkout reads source objects through Git alternates.
@@ -205,7 +208,8 @@ skill -> plan -> submit configured IDs -> status -> read_logs(cursor) -> retry o
 `read_logs` returns capped complete lines and a cursor. A finished job may return
 one final line without a newline. Oversized lines are skipped through bounded
 reads. Pass the cursor to the next call while a job runs. Use `tail_logs` for
-the final context.
+the final context. Recorded-SHA logs include submitted and tested SHA, worker
+cap, declared resources, timeout, and free disk at task start.
 
 CLI fallback: `bitci logs --cursor 0 <job-id>` returns the same lines, cursor,
 and state.
@@ -218,15 +222,17 @@ Use absolute paths outside the checkout:
 
 ```sh
 bitci submit --config /srv/project-ci/bitci.json --state-dir /var/lib/bitci/project unit
-bitci status --state-dir /var/lib/bitci/project
+bitci status --config /srv/project-ci/bitci.json --state-dir /var/lib/bitci/project
 ```
 
 `stage-pr` is for a dedicated CI checkout only. It requires
 `BITCI_GITHUB_TOKEN`, rejects fork heads and dirty checkouts, cleans ignored
-`.next` output, and verifies the fetched SHA before work starts.
+`.next` output, and verifies the fetched SHA before work starts. It records the
+trusted SHA and rejects submits after the staged checkout changes.
 
 ```sh
 bitci stage-pr --config /srv/project-ci/bitci.json --state-dir /var/lib/bitci/project 42
+bitci submit --config /srv/project-ci/bitci.json --state-dir /var/lib/bitci/project --ref <stage.SHA> unit
 ```
 
 ## Examples and releases

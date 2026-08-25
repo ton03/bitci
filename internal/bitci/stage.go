@@ -2,7 +2,9 @@ package bitci
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -33,7 +35,7 @@ type pullRequest struct {
 
 // StagePR checks a same-repository GitHub pull request and detaches the
 // dedicated checkout at its verified head SHA.
-func (controller *Controller) StagePR(ctx context.Context, number int, token string) (Stage, error) {
+func (controller *Controller) StagePR(ctx context.Context, number int, token string) (stage Stage, returnErr error) {
 	if number < 1 {
 		return Stage{}, fmt.Errorf("pull request number must be positive")
 	}
@@ -46,6 +48,27 @@ func (controller *Controller) StagePR(ctx context.Context, number int, token str
 	}
 	defer release()
 	if err := controller.noActiveJobs(); err != nil {
+		return Stage{}, err
+	}
+	originalSHA, err := controller.checkoutSHA()
+	if err != nil {
+		return Stage{}, fmt.Errorf("read current checkout SHA: %w", err)
+	}
+	originalConfig := controller.configSnapshot()
+	targetCheckedOut := false
+	staged := false
+	defer func() {
+		if !targetCheckedOut || staged {
+			return
+		}
+		if _, err := controller.git(ctx, "checkout", "--detach", originalSHA); err != nil {
+			returnErr = errors.Join(returnErr, fmt.Errorf("restore checkout after failed staging: %w", err))
+		}
+		controller.configMu.Lock()
+		controller.config = originalConfig
+		controller.configMu.Unlock()
+	}()
+	if err := controller.clearStagedCheckout(); err != nil {
 		return Stage{}, err
 	}
 	repository, err := controller.githubRepository()
@@ -79,6 +102,7 @@ func (controller *Controller) StagePR(ctx context.Context, number int, token str
 	if _, err := controller.git(ctx, "checkout", "--detach", pull.Head.SHA); err != nil {
 		return Stage{}, fmt.Errorf("checkout trusted pull request: %w", err)
 	}
+	targetCheckedOut = true
 	sha, err := controller.checkoutSHA()
 	if err != nil || sha != pull.Head.SHA {
 		return Stage{}, fmt.Errorf("checked out SHA does not match GitHub")
@@ -90,7 +114,43 @@ func (controller *Controller) StagePR(ctx context.Context, number int, token str
 	controller.configMu.Lock()
 	controller.config = stagedConfig
 	controller.configMu.Unlock()
+	if err := controller.recordStagedCheckout(number, sha); err != nil {
+		return Stage{}, err
+	}
+	staged = true
 	return Stage{PR: number, SHA: sha}, nil
+}
+
+func (controller *Controller) stagedCheckoutSHA() (string, error) {
+	var sha string
+	err := controller.db.QueryRow("SELECT sha FROM staged_checkouts WHERE id = 1").Scan(&sha)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read staged checkout: %w", err)
+	}
+	if !isCheckoutSHA(sha) {
+		return "", fmt.Errorf("staged checkout has invalid SHA")
+	}
+	return strings.ToLower(sha), nil
+}
+
+func (controller *Controller) clearStagedCheckout() error {
+	if _, err := controller.db.Exec("DELETE FROM staged_checkouts WHERE id = 1"); err != nil {
+		return fmt.Errorf("clear staged checkout: %w", err)
+	}
+	return nil
+}
+
+func (controller *Controller) recordStagedCheckout(number int, sha string) error {
+	if !isCheckoutSHA(sha) {
+		return fmt.Errorf("cannot record invalid staged checkout SHA")
+	}
+	if _, err := controller.db.Exec("INSERT INTO staged_checkouts(id, pull_request, sha, staged_at) VALUES (1, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET pull_request = excluded.pull_request, sha = excluded.sha, staged_at = excluded.staged_at", number, strings.ToLower(sha), timestamp()); err != nil {
+		return fmt.Errorf("record staged checkout: %w", err)
+	}
+	return nil
 }
 
 func (controller *Controller) protectStateFromTarget(ctx context.Context, sha string) error {
