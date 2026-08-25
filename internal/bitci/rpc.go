@@ -221,7 +221,7 @@ func (controller *Controller) handleRPC(ctx context.Context, request RPCRequest)
 		if err := json.Unmarshal(request.Params, &params); err != nil {
 			return RPCResponse{Error: err.Error()}
 		}
-		cancelled, err := controller.Cancel(params.ID)
+		cancelled, err := controller.CancelContext(ctx, params.ID)
 		return result(map[string]bool{"cancelled": cancelled}, err)
 	case "retry":
 		var params JobParams

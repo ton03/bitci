@@ -926,6 +926,9 @@ func (controller *Controller) lockOwner() (func(), error) {
 
 func (controller *Controller) acquireStageLock(ctx context.Context) (func(), error) {
 	controller.initStageGate()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	select {
 	case <-controller.stageGate:
 	case <-ctx.Done():
@@ -1166,7 +1169,11 @@ func (controller *Controller) cleanupOrphanBatchRefs() error {
 }
 
 func (controller *Controller) releaseBatchRef(batch, checkoutRoot string) error {
-	releaseStage, err := controller.acquireStageLock(context.Background())
+	return controller.releaseBatchRefContext(context.Background(), batch, checkoutRoot)
+}
+
+func (controller *Controller) releaseBatchRefContext(ctx context.Context, batch, checkoutRoot string) error {
+	releaseStage, err := controller.acquireStageLock(ctx)
 	if err != nil {
 		return err
 	}
@@ -1296,9 +1303,10 @@ func (controller *Controller) claimContext(ctx context.Context, maxWorkers int) 
 	}
 	defer transaction.Rollback()
 	var pinned *Job
+	pinnedCreated := false
 	committed := false
 	defer func() {
-		if pinned != nil && !committed {
+		if pinned != nil && pinnedCreated && !committed {
 			_ = controller.removeBatchRefIfOwned(*pinned)
 		}
 	}()
@@ -1352,11 +1360,13 @@ func (controller *Controller) claimContext(ctx context.Context, maxWorkers int) 
 			continue
 		}
 		if isCheckoutSHA(job.Ref) {
-			if err := controller.pinClaimedJob(transaction, &job); err != nil {
+			created, err := controller.pinClaimedJob(transaction, &job)
+			if err != nil {
 				return Job{}, false, err
 			}
 			pinnedJob := job
 			pinned = &pinnedJob
+			pinnedCreated = created
 		}
 		if _, err := transaction.Exec("UPDATE jobs SET state = 'running', started_at = ? WHERE id = ?", timestamp(), job.ID); err != nil {
 			return Job{}, false, err
@@ -1385,28 +1395,50 @@ func (controller *Controller) claimContext(ctx context.Context, maxWorkers int) 
 	return Job{}, false, nil
 }
 
-func (controller *Controller) pinClaimedJob(transaction *sql.Tx, job *Job) error {
+func (controller *Controller) pinClaimedJob(transaction *sql.Tx, job *Job) (bool, error) {
 	if job.checkoutRoot == "" {
 		root, relative, err := controller.checkoutLocation()
 		if err != nil {
-			return fmt.Errorf("find checkout for recorded SHA: %w", err)
+			return false, fmt.Errorf("find checkout for recorded SHA: %w", err)
 		}
 		job.checkoutRoot, job.configRelative = root, relative
 		if _, err := transaction.Exec("UPDATE jobs SET checkout_root = ?, config_relative = ? WHERE batch = ?", root, relative, job.Batch); err != nil {
-			return err
+			return false, err
 		}
 	}
 	job.Ref = strings.ToLower(job.Ref)
+	created := false
+	var existing string
+	if err := transaction.QueryRow("SELECT ref FROM batch_refs WHERE batch = ?", job.Batch).Scan(&existing); err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return false, err
+		}
+		created = true
+	} else if !strings.EqualFold(existing, job.Ref) {
+		return false, fmt.Errorf("batch %s has unexpected recorded ref", job.Batch)
+	}
+	actual, err := gitAt(context.Background(), job.checkoutRoot, "rev-parse", "--verify", batchRef(job.Batch)+"^{commit}")
+	if err == nil {
+		if !strings.EqualFold(strings.TrimSpace(actual), job.Ref) {
+			return false, fmt.Errorf("batch %s ref changed unexpectedly", job.Batch)
+		}
+	} else {
+		created = true
+	}
 	if _, err := transaction.Exec("INSERT OR REPLACE INTO batch_refs(batch, checkout_root, ref) VALUES (?, ?, ?)", job.Batch, job.checkoutRoot, job.Ref); err != nil {
-		return err
+		return false, err
 	}
 	if _, err := gitAt(context.Background(), job.checkoutRoot, "update-ref", batchRef(job.Batch), job.Ref); err != nil {
-		return fmt.Errorf("pin recorded checkout SHA: %w", err)
+		return false, fmt.Errorf("pin recorded checkout SHA: %w", err)
 	}
-	return nil
+	return created, nil
 }
 
 func (controller *Controller) removeBatchRefIfOwned(job Job) error {
+	var protected int
+	if err := controller.db.QueryRow("SELECT COUNT(*) FROM jobs WHERE batch = ? AND (state IN ('queued', 'running') OR cleanup_pending = 1)", job.Batch).Scan(&protected); err != nil || protected != 0 {
+		return err
+	}
 	actual, err := gitAt(context.Background(), job.checkoutRoot, "rev-parse", "--verify", batchRef(job.Batch)+"^{commit}")
 	if err != nil || !strings.EqualFold(strings.TrimSpace(actual), job.Ref) {
 		return nil
@@ -2096,6 +2128,10 @@ func (controller *Controller) Jobs() ([]Job, error) {
 }
 
 func (controller *Controller) Cancel(id int64) (bool, error) {
+	return controller.CancelContext(context.Background(), id)
+}
+
+func (controller *Controller) CancelContext(ctx context.Context, id int64) (bool, error) {
 	var batch, checkoutRoot string
 	if err := controller.db.QueryRow("SELECT batch, COALESCE(checkout_root, '') FROM jobs WHERE id = ?", id).Scan(&batch, &checkoutRoot); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -2114,7 +2150,7 @@ func (controller *Controller) Cancel(id int64) (bool, error) {
 	if err != nil || count != 1 {
 		return false, err
 	}
-	return true, controller.releaseBatchRef(batch, checkoutRoot)
+	return true, controller.releaseBatchRefContext(ctx, batch, checkoutRoot)
 }
 
 func (controller *Controller) Retry(id int64) ([]Job, error) {

@@ -3665,6 +3665,12 @@ func TestServicePathUsesPrepareExecutable(t *testing.T) {
 
 func TestServicePathAllowsTaskExecutableCreatedByPrepare(t *testing.T) {
 	checkout := t.TempDir()
+	git(t, checkout, "init", "-q")
+	if err := os.WriteFile(filepath.Join(checkout, "tracked"), []byte("tracked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "add", "tracked")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
 	_, err := servicePath(Config{Prepare: []string{"true"}, Tasks: map[string]Task{"unit": {Run: []string{"./node_modules/.bin/unit"}}}}, checkout)
 	if err != nil {
 		t.Fatalf("service path error = %v", err)
@@ -3712,8 +3718,22 @@ func TestServicePathUsesGitRootForNestedConfig(t *testing.T) {
 
 func TestServicePathAllowsBareTaskExecutableCreatedByPrepare(t *testing.T) {
 	checkout := t.TempDir()
+	git(t, checkout, "init", "-q")
+	if err := os.WriteFile(filepath.Join(checkout, "tracked"), []byte("tracked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "add", "tracked")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
 	_, err := servicePath(Config{Prepare: []string{"true"}, Tasks: map[string]Task{"unit": {Run: []string{"unit"}, Env: map[string]string{"PATH": "."}}}}, checkout)
 	if err != nil {
+		t.Fatalf("service path error = %v", err)
+	}
+}
+
+func TestServicePathRejectsMissingTaskExecutableForUnverifiedCheckout(t *testing.T) {
+	checkout := t.TempDir()
+	_, err := servicePath(Config{Prepare: []string{"true"}, Tasks: map[string]Task{"unit": {Run: []string{"./missing"}}}}, checkout)
+	if err == nil || !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("service path error = %v", err)
 	}
 }
@@ -3981,6 +4001,20 @@ func TestStageLockSerializesControllers(t *testing.T) {
 	defer cancel()
 	if _, err := second.acquireStageLock(ctx); err == nil {
 		t.Fatal("second controller acquired staging lock")
+	}
+}
+
+func TestStageLockRejectsCanceledContextBeforeAcquire(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := controller.acquireStageLock(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("acquireStageLock error = %v, want context canceled", err)
 	}
 }
 

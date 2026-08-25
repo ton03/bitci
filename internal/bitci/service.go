@@ -77,8 +77,12 @@ func servicePath(config Config, checkout string) (string, error) {
 		return path, nil
 	}
 	gitRoot := ""
+	verifiedCommit := false
 	if output, err := exec.Command("git", "-C", checkout, "rev-parse", "--show-toplevel").Output(); err == nil {
 		gitRoot = filepath.Clean(strings.TrimSpace(string(output)))
+		if _, err := exec.Command("git", "-C", gitRoot, "rev-parse", "--verify", "HEAD^{commit}").Output(); err == nil {
+			verifiedCommit = true
+		}
 	}
 	directories := make([]string, 0, len(config.Tasks)+6)
 	seen := map[string]bool{}
@@ -110,7 +114,7 @@ func servicePath(config Config, checkout string) (string, error) {
 			name          string
 			requireExists bool
 			environment   map[string]string
-		}{name: config.Tasks[name].Run[0], requireExists: len(config.Prepare) == 0, environment: config.Tasks[name].Env})
+		}{name: config.Tasks[name].Run[0], requireExists: len(config.Prepare) == 0 || !verifiedCommit, environment: config.Tasks[name].Env})
 	}
 	for _, configured := range commands {
 		command := configured.name
