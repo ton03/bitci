@@ -18,6 +18,11 @@ go install github.com/ton03/bitci/cmd/bitci@v0.0.1-alpha.1
 bitci version
 ```
 
+## Dogfood
+
+This repository uses [bitci.json](bitci.json) to run `test`, `build`, `race`,
+and `vet` tasks from the same local controller BitCI ships.
+
 ## Set up a project
 
 Add `bitci.json` at the repository root:
@@ -27,7 +32,7 @@ Add `bitci.json` at the repository root:
   "version": 1,
   "resources": { "browser": 1 },
   "tasks": {
-    "unit": { "run": ["go", "test", "./..."], "paths": ["**"] },
+    "unit": { "run": ["go", "test", "./..."], "paths": ["**"], "max_retries": 1 },
     "browser": {
       "run": ["npm", "run", "test:browser"],
       "needs": ["unit"],
@@ -43,10 +48,10 @@ Validate it:
 bitci validate
 ```
 
-For a quick local run, start the controller in one terminal:
+Start the local controller and dashboard:
 
 ```sh
-bitci serve --max-workers 2
+bitci serve --max-workers 2 --http 127.0.0.1:8787
 ```
 
 Then submit configured task IDs:
@@ -61,13 +66,18 @@ bitci logs --tail 80 1
 `serve` owns the queue. It starts only submitted tasks. Use the macOS service
 below when this project needs an always-on controller.
 
+Open `http://127.0.0.1:8787` for the local, read-only dashboard. It refreshes
+every three seconds and shows job state, tested SHA, timing, resource leases,
+disk space, capped logs, and the average duration of passing jobs in seven days.
+The dashboard only accepts the loopback address. It has no task controls.
+
 ## How it works
 
 ```text
 bitci.json --plan/submit--> SQLite queue --claim--> serve
                                                |       |
                                                |       +--> resource leases
-                                               |       +--> recorded-SHA worktree
+                                               |       +--> recorded-SHA checkout
                                                |       +--> configured argv
                                                |       +--> capped local log
                                                v
@@ -80,22 +90,37 @@ human CLI --> local queue and logs
 - `plan` selects task IDs from changed paths.
 - `submit` records those task IDs, their config, and the source SHA.
 - `serve` claims FIFO jobs when worker, disk, and resource limits allow them.
-- SHA-backed jobs run in a detached worktree. Each result records `tested_sha`.
-- BitCI keeps each recorded SHA reachable with a private Git ref while it keeps its job record.
+- SHA-backed jobs run in a detached checkout with independent Git metadata.
+  The checkout reads source objects through Git alternates.
+  Its Git commands cannot change source refs or config.
+  Each result records `tested_sha`.
+- BitCI keeps each recorded SHA reachable with a private Git ref until its batch finishes.
 - `status`, `logs`, `cancel`, and `retry` inspect or control the queue.
+
+`max_retries` caps manual reruns for that task. BitCI never retries jobs
+automatically. Status records each attempt, prior exit code, queue wait,
+duration, and terminal result.
 
 `cancel` affects queued work only. Retry only after reading logs. Never print
 secrets from tasks.
 
+If a running task process disappears, `serve` marks the job failed after a
+short grace period and releases its resources. Use `bitci recover <job-id>` for
+the same bounded check on one running job. Recovery never kills a process.
+
 Use literal `redact` values to hide known secrets from BitCI log reads. It does
 not change the retained files. Use `log_retention` to keep the newest N
-finished job logs; `0` removes every older log before the next job starts.
+finished job logs; omit it or use `0` to keep all finished logs.
 
 ### Task environment
 
 Use `env` for fixed, task-specific values. BitCI inherits the controller
 environment, then applies these values. Agents cannot supply environment values.
-Do not put secrets in `bitci.json` or task output.
+BitCI sets `PWD` and `OLDPWD` to the job directory. Do not put secrets in
+`bitci.json` or task output.
+
+Use direct argv commands. SHA-backed jobs reject shell and language evaluator
+flags such as `sh -c` and `node -e` because they bypass path checks.
 
 ```json
 "unit": {
@@ -104,32 +129,24 @@ Do not put secrets in `bitci.json` or task output.
 }
 ```
 
-If a recorded task process group disappears, `serve` fails the job after a short
-grace period and releases its resources. `bitci recover <job-id>` performs the
-same bounded check for one running job. It never kills a process.
-
 ## Keep it running on macOS
 
 Install BitCI once in a permanent location. Use `go install` above, or keep a
 Release binary at a permanent path.
 
-From the project root, this one command installs and starts the local service:
+From the project root, these commands install and start the local service:
 
 ```sh
-bitci service --max-workers 2 install
+mkdir -p "$HOME/.local/bin"
+go build -o "$HOME/.local/bin/bitci" ./cmd/bitci
+"$HOME/.local/bin/bitci" start --max-workers 2 --http 127.0.0.1:8787
+"$HOME/.local/bin/bitci" service status
 ```
 
-Run this only once per project. Running it again safely replaces the same
-service; it does not create a second controller.
-
-```sh
-bitci service status
-bitci service uninstall
-```
-
-`launchd` starts BitCI at sign-in and restarts it after exit. Use `uninstall`
-to stop and remove it. BitCI refuses service changes while jobs run. Do not use
-`go run` for the service because its binary is temporary.
+`start` creates one `launchd` job per absolute config path. Run it again and it
+reports the existing job without starting another controller. `launchd` starts
+BitCI at sign-in and restarts it after exit. Run `bitci stop` to remove it.
+BitCI refuses service changes while jobs run.
 
 ## Agents: skill + MCP
 
@@ -152,14 +169,16 @@ Start `serve`, then add this local MCP server to the agent client:
 ```
 
 Without `--allow-runs`, MCP only reads `status`, `plan`, logs, and disk health.
-With it, agents may submit, cancel, or retry configured tasks. The agent flow is:
+With it, agents may submit, cancel, retry, or recover configured tasks. The agent flow is:
 
 ```text
 skill -> plan -> submit configured IDs -> status -> read_logs(cursor) -> retry only if needed
 ```
 
-`read_logs` returns capped complete lines and a cursor. Pass that cursor to the
-next call while a job runs. Use `tail_logs` for the final context.
+`read_logs` returns capped complete lines and a cursor. A finished job may return
+one final line without a newline. Oversized lines are skipped through bounded
+reads. Pass the cursor to the next call while a job runs. Use `tail_logs` for
+the final context.
 
 CLI fallback: `bitci logs --cursor 0 <job-id>` returns the same lines, cursor,
 and state.
@@ -190,7 +209,7 @@ Copy an example for a [Go backend](examples/go-backend.bitci.json),
 [Nx monorepo](examples/nx-monorepo.bitci.json). BitCI runs configured argv; it
 does not require a framework preset. SHA-isolated jobs start with tracked files
 only. Use `prepare` for a safe, configured bootstrap that BitCI runs in each
-job worktree before its task; the Node and Nx examples use `npm ci`.
+job checkout before its task; the Node and Nx examples use `npm ci`.
 
 Alpha tags use `v0.0.1-alpha.N`. Each tag builds macOS and Linux archives with
 checksums. See [SECURITY.md](SECURITY.md) before exposing a controller.

@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "tasks": {
+    "test": { "run": ["go", "test", "./..."], "paths": ["**"] },
+    "build": { "run": ["go", "build", "./cmd/bitci"], "needs": ["test"], "paths": ["**"] },
+    "race": { "run": ["go", "test", "-race", "./..."], "needs": ["test"], "paths": ["**"] },
+    "vet": { "run": ["go", "vet", "./..."], "needs": ["test"], "paths": ["**"] }
+  }
+}

@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -96,6 +97,34 @@ func (listener *socketListener) Close() error {
 }
 
 func (controller *Controller) ServeRPC(ctx context.Context, listener net.Listener) error {
+	var handlers sync.WaitGroup
+	connections := map[net.Conn]struct{}{}
+	var connectionsMu sync.Mutex
+	stopCloser := make(chan struct{})
+	closerDone := make(chan struct{})
+	defer func() {
+		close(stopCloser)
+		connectionsMu.Lock()
+		for connection := range connections {
+			_ = connection.Close()
+		}
+		connectionsMu.Unlock()
+		<-closerDone
+		handlers.Wait()
+	}()
+	go func() {
+		defer close(closerDone)
+		select {
+		case <-ctx.Done():
+			_ = listener.Close()
+			connectionsMu.Lock()
+			for connection := range connections {
+				_ = connection.Close()
+			}
+			connectionsMu.Unlock()
+		case <-stopCloser:
+		}
+	}()
 	for {
 		connection, err := listener.Accept()
 		if err != nil {
@@ -104,8 +133,27 @@ func (controller *Controller) ServeRPC(ctx context.Context, listener net.Listene
 			}
 			return err
 		}
-		go func() {
-			defer connection.Close()
+		if ctx.Err() != nil {
+			_ = connection.Close()
+			return nil
+		}
+		connectionsMu.Lock()
+		if ctx.Err() != nil {
+			connectionsMu.Unlock()
+			_ = connection.Close()
+			return nil
+		}
+		connections[connection] = struct{}{}
+		connectionsMu.Unlock()
+		handlers.Add(1)
+		go func(connection net.Conn) {
+			defer handlers.Done()
+			defer func() {
+				_ = connection.Close()
+				connectionsMu.Lock()
+				delete(connections, connection)
+				connectionsMu.Unlock()
+			}()
 			_ = connection.SetDeadline(time.Now().Add(10 * time.Second))
 			decoder := json.NewDecoder(connection)
 			encoder := json.NewEncoder(connection)
@@ -114,13 +162,15 @@ func (controller *Controller) ServeRPC(ctx context.Context, listener net.Listene
 				_ = encoder.Encode(RPCResponse{Error: err.Error()})
 				return
 			}
-			response := controller.handleRPC(ctx, request)
-			_ = encoder.Encode(response)
-		}()
+			if ctx.Err() != nil {
+				return
+			}
+			_ = encoder.Encode(controller.handleRPC(ctx, request))
+		}(connection)
 	}
 }
 
-func (controller *Controller) handleRPC(_ context.Context, request RPCRequest) RPCResponse {
+func (controller *Controller) handleRPC(ctx context.Context, request RPCRequest) RPCResponse {
 	result := func(value any, err error) RPCResponse {
 		if err != nil {
 			return RPCResponse{Error: err.Error()}
@@ -165,20 +215,20 @@ func (controller *Controller) handleRPC(_ context.Context, request RPCRequest) R
 		if err := json.Unmarshal(request.Params, &params); err != nil {
 			return RPCResponse{Error: err.Error()}
 		}
-		return result(controller.Submit(params.TaskIDs, params.Ref))
+		return result(controller.SubmitContext(ctx, params.TaskIDs, params.Ref))
 	case "cancel":
 		var params JobParams
 		if err := json.Unmarshal(request.Params, &params); err != nil {
 			return RPCResponse{Error: err.Error()}
 		}
-		cancelled, err := controller.Cancel(params.ID)
+		cancelled, err := controller.CancelContext(ctx, params.ID)
 		return result(map[string]bool{"cancelled": cancelled}, err)
 	case "retry":
 		var params JobParams
 		if err := json.Unmarshal(request.Params, &params); err != nil {
 			return RPCResponse{Error: err.Error()}
 		}
-		return result(controller.Retry(params.ID))
+		return result(controller.RetryContext(ctx, params.ID))
 	case "recover":
 		var params JobParams
 		if err := json.Unmarshal(request.Params, &params); err != nil {

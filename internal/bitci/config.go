@@ -22,12 +22,13 @@ type Config struct {
 }
 
 type Task struct {
-	Run       []string          `json:"run"`
-	Env       map[string]string `json:"env"`
-	Needs     []string          `json:"needs"`
-	Resources []string          `json:"resources"`
-	Paths     []string          `json:"paths"`
-	Timeout   int               `json:"timeout_seconds"`
+	Run        []string          `json:"run"`
+	Env        map[string]string `json:"env"`
+	Needs      []string          `json:"needs"`
+	Resources  []string          `json:"resources"`
+	Paths      []string          `json:"paths"`
+	Timeout    int               `json:"timeout_seconds"`
+	MaxRetries int               `json:"max_retries"`
 }
 
 func LoadConfig(filename string) (Config, error) {
@@ -87,6 +88,9 @@ func (config Config) Validate() error {
 		if task.Timeout < 0 {
 			return fmt.Errorf("task %q timeout_seconds must not be negative", name)
 		}
+		if task.MaxRetries < 0 {
+			return fmt.Errorf("task %q max_retries must not be negative", name)
+		}
 		for variable, value := range task.Env {
 			if !validEnvironmentName(variable) {
 				return fmt.Errorf("task %q has invalid environment variable %q", name, variable)
@@ -100,10 +104,15 @@ func (config Config) Validate() error {
 				return fmt.Errorf("task %q needs unknown task %q", name, need)
 			}
 		}
+		resources := map[string]bool{}
 		for _, resource := range task.Resources {
 			if _, ok := config.Resources[resource]; !ok {
 				return fmt.Errorf("task %q uses unknown resource %q", name, resource)
 			}
+			if resources[resource] {
+				return fmt.Errorf("task %q repeats resource %q", name, resource)
+			}
+			resources[resource] = true
 		}
 	}
 	_, err := config.ordered(config.TaskNames())
