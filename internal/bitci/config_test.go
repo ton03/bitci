@@ -2353,6 +2353,38 @@ func TestSubmitRejectsRequestedSHAWithoutCheckout(t *testing.T) {
 	}
 }
 
+func TestRecordedSHAJobPreservesSourceComparisonRefs(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["sh","runner"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, "runner"), []byte("#!/bin/sh\nset -eu\ngit show-ref --verify --quiet refs/heads/main\ngit show-ref --verify --quiet refs/remotes/origin/main\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "branch", "-M", "main")
+	git(t, checkout, "add", ".")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "main")
+	git(t, checkout, "update-ref", "refs/remotes/origin/main", "HEAD")
+	sha := git(t, checkout, "rev-parse", "HEAD")
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	if _, err := controller.Submit([]string{"unit"}, sha); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := controller.RunOnce(context.Background(), 1); err != nil || !ran {
+		t.Fatalf("run recorded ref = %v, %v", ran, err)
+	}
+	finished, err := controller.Jobs()
+	if err != nil || len(finished) != 1 || finished[0].State != "passed" || finished[0].TestedSHA != sha {
+		t.Fatalf("comparison refs job = %#v, %v", finished, err)
+	}
+}
+
 func TestSubmitNormalizesUppercaseRecordedSHA(t *testing.T) {
 	checkout := t.TempDir()
 	configPath := filepath.Join(checkout, "bitci.json")

@@ -783,6 +783,9 @@ func (controller *Controller) jobCheckout(ctx context.Context, job Job) (string,
 	if _, err := gitAt(ctx, path, "checkout", "--quiet", "--detach", job.Ref); err != nil {
 		return "", cleanup, fmt.Errorf("create job worktree: %w", err)
 	}
+	if err := copyCheckoutRefs(ctx, checkoutRoot, path); err != nil {
+		return "", cleanup, fmt.Errorf("copy checkout refs: %w", err)
+	}
 	sha, err := checkoutSHA(path)
 	if err != nil || !strings.EqualFold(sha, job.Ref) {
 		return "", cleanup, fmt.Errorf("verify job worktree SHA")
@@ -791,6 +794,31 @@ func (controller *Controller) jobCheckout(ctx context.Context, job Job) (string,
 		return "", cleanup, err
 	}
 	return filepath.Join(path, configRelative), cleanup, nil
+}
+
+// copyCheckoutRefs preserves source branch and remote-tracking refs that point
+// at objects in the recorded checkout. Tasks often use origin/main to find
+// their comparison base, while each SHA job intentionally starts with fresh
+// Git metadata.
+func copyCheckoutRefs(ctx context.Context, sourceRoot, worktreeRoot string) error {
+	output, err := gitAt(ctx, sourceRoot, "for-each-ref", "--format=%(refname) %(objectname) %(objecttype)", "refs/heads", "refs/remotes")
+	if err != nil {
+		return err
+	}
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 3 || fields[2] != "commit" {
+			continue
+		}
+		ref, sha := fields[0], fields[1]
+		if _, err := gitAt(ctx, worktreeRoot, "cat-file", "-e", sha+"^{commit}"); err != nil {
+			continue
+		}
+		if _, err := gitAt(ctx, worktreeRoot, "update-ref", ref, sha); err != nil {
+			return fmt.Errorf("update %s: %w", ref, err)
+		}
+	}
+	return nil
 }
 
 func copyRecordedObjects(ctx context.Context, checkoutRoot, ref, stateDir, objectFormat string) (string, error) {
