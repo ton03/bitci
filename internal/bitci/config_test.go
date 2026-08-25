@@ -989,6 +989,38 @@ func TestRecoverOrphanedWithoutTaskProcess(t *testing.T) {
 	}
 }
 
+func TestRecoverOrphanedSkipsFinishingJob(t *testing.T) {
+	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
+	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	jobs, err := controller.Submit([]string{"unit"}, "one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, claimed, err := controller.claim(1); err != nil || !claimed {
+		t.Fatalf("claim = %v, %v", claimed, err)
+	}
+	old := time.Now().Add(-orphanRecoveryGrace - time.Second).UTC().Format(time.RFC3339)
+	if _, err := controller.db.Exec("UPDATE jobs SET started_at = ?, worker_pid = ? WHERE id = ?", old, 999999999, jobs[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	endFinishing := controller.markFinishing(jobs[0].ID)
+	defer endFinishing()
+	if recovered, err := controller.RecoverOrphaned(); err != nil || recovered != 0 {
+		t.Fatalf("recover finishing job = %d, %v", recovered, err)
+	}
+	finished, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finished[0].State != "running" {
+		t.Fatalf("finishing job state = %s, want running", finished[0].State)
+	}
+}
+
 func TestRecoverJobWaitsForMissingTaskProcessGrace(t *testing.T) {
 	configPath := writeConfig(t, `{"version":1,"tasks":{"unit":{"run":["true"]}}}`)
 	controller, err := Open(configPath, filepath.Join(t.TempDir(), "state"))

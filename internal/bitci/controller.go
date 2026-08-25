@@ -45,6 +45,8 @@ type Controller struct {
 	stageGate      chan struct{}
 	recoveryMu     sync.Mutex
 	recovered      bool
+	finishingMu    sync.Mutex
+	finishingJobs  map[int64]struct{}
 	retryMu        sync.Mutex
 }
 
@@ -1163,6 +1165,9 @@ func (controller *Controller) RecoverOrphaned() (int, error) {
 		if err := rows.Scan(&job.ID, &job.Batch, &job.Ref, &job.checkoutRoot, &job.WorkerPID, &job.startedAt); err != nil {
 			return 0, err
 		}
+		if controller.isFinishing(job.ID) {
+			continue
+		}
 		if !orphanGraceExpired(job.startedAt) {
 			continue
 		}
@@ -1217,6 +1222,27 @@ func (controller *Controller) RecoverJob(id int64) (bool, error) {
 func orphanGraceExpired(startedAt string) bool {
 	parsed, err := time.Parse(time.RFC3339, startedAt)
 	return err != nil || time.Since(parsed) >= orphanRecoveryGrace
+}
+
+func (controller *Controller) markFinishing(id int64) func() {
+	controller.finishingMu.Lock()
+	if controller.finishingJobs == nil {
+		controller.finishingJobs = make(map[int64]struct{})
+	}
+	controller.finishingJobs[id] = struct{}{}
+	controller.finishingMu.Unlock()
+	return func() {
+		controller.finishingMu.Lock()
+		delete(controller.finishingJobs, id)
+		controller.finishingMu.Unlock()
+	}
+}
+
+func (controller *Controller) isFinishing(id int64) bool {
+	controller.finishingMu.Lock()
+	_, ok := controller.finishingJobs[id]
+	controller.finishingMu.Unlock()
+	return ok
 }
 
 func (controller *Controller) recoverJobs(jobs []Job, skipChanged bool) (int, error) {
@@ -2514,6 +2540,8 @@ func (controller *Controller) executeCommandWithEnvForJob(parent context.Context
 		}
 	}
 	err := command.Wait()
+	endFinishing := controller.markFinishing(int64(jobID))
+	defer endFinishing()
 	groupErr := syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
 	if persistProcess && (groupErr == nil || errors.Is(groupErr, syscall.ESRCH)) {
 		_ = os.Remove(processPath)
