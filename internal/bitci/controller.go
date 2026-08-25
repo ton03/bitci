@@ -126,6 +126,26 @@ func OpenState(configPath, stateDir string) (*Controller, error) {
 	return controller, nil
 }
 
+// ValidateStateDir returns an absolute state path outside Git metadata.
+func ValidateStateDir(configPath, stateDir string) (string, error) {
+	absoluteConfig, err := canonicalConfigPath(configPath, false)
+	if err != nil {
+		return "", err
+	}
+	stateDir = DefaultStateDir(absoluteConfig, stateDir)
+	absoluteState, err := filepath.Abs(stateDir)
+	if err != nil {
+		return "", err
+	}
+	if gitDirectory, err := gitCommonDirectory(absoluteConfig); err == nil && pathsOverlap(absoluteState, gitDirectory) {
+		return "", fmt.Errorf("state directory must not overlap Git metadata")
+	}
+	if stateInsideGitMetadata(resolvedPathForComparison(absoluteState)) || pathHasGitMetadataAncestor(absoluteState) {
+		return "", fmt.Errorf("state directory must not overlap Git metadata")
+	}
+	return absoluteState, nil
+}
+
 func DefaultStateDir(configPath, stateDir string) string {
 	if stateDir != "" {
 		return stateDir

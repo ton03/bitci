@@ -2,14 +2,17 @@ package bitci
 
 import (
 	"crypto/sha256"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"html"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 )
 
 type Service struct {
@@ -21,6 +24,7 @@ type Service struct {
 	BinaryPath  string
 	PathEnv     string
 	PlistPath   string
+	LockPath    string
 	Domain      string
 }
 
@@ -29,29 +33,11 @@ func NewService(configPath, stateDir string, maxWorkers int) (Service, error) {
 }
 
 func NewServiceWithHTTP(configPath, stateDir string, maxWorkers int, httpAddress string) (Service, error) {
-	if runtime.GOOS != "darwin" {
-		return Service{}, fmt.Errorf("managed service currently requires macOS")
-	}
-	config, err := LoadConfig(configPath)
+	service, err := serviceIdentity(configPath, stateDir)
 	if err != nil {
 		return Service{}, err
 	}
-	absoluteConfig, err := canonicalConfigPath(configPath, true)
-	if err != nil {
-		return Service{}, err
-	}
-	if stateDir == "" {
-		stateDir = DefaultStateDir(absoluteConfig, "")
-	}
-	absoluteState, err := filepath.Abs(stateDir)
-	if err != nil {
-		return Service{}, err
-	}
-	binary, err := os.Executable()
-	if err != nil {
-		return Service{}, err
-	}
-	home, err := os.UserHomeDir()
+	config, err := LoadConfig(service.ConfigPath)
 	if err != nil {
 		return Service{}, err
 	}
@@ -63,22 +49,73 @@ func NewServiceWithHTTP(configPath, stateDir string, maxWorkers int, httpAddress
 			return Service{}, err
 		}
 	}
+	service.MaxWorkers = maxWorkers
+	service.HTTPAddress = httpAddress
+	service.PathEnv, err = servicePath(config, filepath.Dir(service.ConfigPath))
+	if err != nil {
+		return Service{}, err
+	}
+	return service, nil
+}
+
+func NewServiceForStop(configPath, stateDir string) (Service, error) {
+	return serviceIdentity(configPath, stateDir)
+}
+
+// NewServiceForStart identifies a service without reading bitci.json. Start can
+// therefore remain idempotent when the service already runs.
+func NewServiceForStart(configPath, stateDir string, maxWorkers int, httpAddress string) (Service, error) {
+	service, err := serviceIdentity(configPath, stateDir)
+	if err != nil {
+		return Service{}, err
+	}
+	if maxWorkers < 1 {
+		return Service{}, fmt.Errorf("max-workers must be positive")
+	}
+	if httpAddress != "" {
+		if err := validateDashboardAddress(httpAddress); err != nil {
+			return Service{}, err
+		}
+	}
+	service.MaxWorkers = maxWorkers
+	service.HTTPAddress = httpAddress
+	return service, nil
+}
+
+func serviceIdentity(configPath, stateDir string) (Service, error) {
+	if runtime.GOOS != "darwin" {
+		return Service{}, fmt.Errorf("managed service currently requires macOS")
+	}
+	absoluteConfig, err := filepath.Abs(configPath)
+	if err != nil {
+		return Service{}, err
+	}
+	if stateDir == "" {
+		stateDir = DefaultStateDir(absoluteConfig, "")
+	}
+	absoluteState, err := filepath.Abs(stateDir)
+	if err != nil {
+		return Service{}, err
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return Service{}, err
+	}
+	binary, err := os.Executable()
+	if err != nil {
+		return Service{}, err
+	}
 	digest := sha256.Sum256([]byte(absoluteConfig))
 	label := fmt.Sprintf("com.bitci.%x", digest[:6])
 	service := Service{
-		Label:       label,
-		ConfigPath:  absoluteConfig,
-		StateDir:    absoluteState,
-		MaxWorkers:  maxWorkers,
-		HTTPAddress: httpAddress,
-		BinaryPath:  binary,
-		PathEnv:     "",
-		PlistPath:   filepath.Join(home, "Library", "LaunchAgents", label+".plist"),
-		Domain:      fmt.Sprintf("gui/%d", os.Getuid()),
-	}
-	service.PathEnv, err = servicePath(config, filepath.Dir(absoluteConfig))
-	if err != nil {
-		return Service{}, err
+		Label:      label,
+		ConfigPath: absoluteConfig,
+		StateDir:   absoluteState,
+		BinaryPath: binary,
+		PathEnv:    "",
+		PlistPath:  filepath.Join(home, "Library", "LaunchAgents", label+".plist"),
+		LockPath:   filepath.Join(home, ".local", "state", "bitci", "services", label+".lock"),
+		Domain:     fmt.Sprintf("gui/%d", os.Getuid()),
 	}
 	return service, nil
 }
@@ -167,8 +204,19 @@ func servicePath(config Config, checkout string) (string, error) {
 }
 
 func (service Service) Install() error {
-	if err := service.ensureNoActiveJobs(); err != nil {
+	stateDir, err := ValidateStateDir(service.ConfigPath, service.StateDir)
+	if err != nil {
 		return err
+	}
+	service.StateDir = stateDir
+	return service.withLifecycleLock(func() error { return service.install(true) })
+}
+
+func (service Service) install(checkActiveJobs bool) error {
+	if checkActiveJobs {
+		if err := service.ensureNoActiveJobs(); err != nil {
+			return err
+		}
 	}
 	if err := os.MkdirAll(filepath.Dir(service.PlistPath), 0o700); err != nil {
 		return err
@@ -189,7 +237,70 @@ func (service Service) Install() error {
 	return nil
 }
 
+func (service Service) installAbsent() error {
+	if err := os.MkdirAll(filepath.Dir(service.PlistPath), 0o700); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(service.StateDir, 0o700); err != nil {
+		return err
+	}
+	plist, err := os.OpenFile(service.PlistPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := plist.WriteString(service.plist()); err != nil {
+		_ = plist.Close()
+		_ = os.Remove(service.PlistPath)
+		return err
+	}
+	if err := plist.Close(); err != nil {
+		_ = os.Remove(service.PlistPath)
+		return err
+	}
+	if output, err := exec.Command("launchctl", "bootstrap", service.Domain, service.PlistPath).CombinedOutput(); err != nil {
+		return fmt.Errorf("launchctl bootstrap: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	if output, err := exec.Command("launchctl", "kickstart", "-k", service.Domain+"/"+service.Label).CombinedOutput(); err != nil {
+		return fmt.Errorf("launchctl kickstart: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+// Start creates the managed service when absent. It does not replace a running
+// service, so repeated project-root starts do not interrupt queued work.
+func (service Service) Start() (bool, error) {
+	started := false
+	err := service.withLifecycleLock(func() error {
+		if _, err := service.Status(); err == nil {
+			return nil
+		}
+		if _, err := os.Lstat(service.PlistPath); err == nil {
+			return fmt.Errorf("existing service needs inspection: run bitci service status")
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+		stateDir, err := ValidateStateDir(service.ConfigPath, service.StateDir)
+		if err != nil {
+			return err
+		}
+		configured, err := NewServiceWithHTTP(service.ConfigPath, stateDir, service.MaxWorkers, service.HTTPAddress)
+		if err != nil {
+			return err
+		}
+		if err := configured.installAbsent(); err != nil {
+			return err
+		}
+		started = true
+		return nil
+	})
+	return started, err
+}
+
 func (service Service) ensureNoActiveJobs() error {
+	return service.ensureNoActiveJobsFor("upgrade")
+}
+
+func (service Service) ensureNoActiveJobsFor(operation string) error {
 	controller, err := OpenState(service.ConfigPath, service.StateDir)
 	if err != nil {
 		return err
@@ -200,7 +311,7 @@ func (service Service) ensureNoActiveJobs() error {
 		return err
 	}
 	if active != 0 {
-		return fmt.Errorf("cannot upgrade service while BitCI jobs are queued or running")
+		return fmt.Errorf("cannot %s service while BitCI jobs are queued or running", operation)
 	}
 	return nil
 }
@@ -214,11 +325,118 @@ func (service Service) Status() (string, error) {
 }
 
 func (service Service) Uninstall() error {
-	_ = exec.Command("launchctl", "bootout", service.Domain+"/"+service.Label).Run()
+	return service.withLifecycleLock(service.uninstall)
+}
+
+func (service Service) uninstall() error {
+	if output, err := exec.Command("launchctl", "bootout", service.Domain+"/"+service.Label).CombinedOutput(); err != nil {
+		message := strings.ToLower(string(output) + err.Error())
+		if !strings.Contains(message, "no such process") && !strings.Contains(message, "could not find service") {
+			return fmt.Errorf("launchctl bootout: %w: %s", err, strings.TrimSpace(string(output)))
+		}
+	}
 	if err := os.Remove(service.PlistPath); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	return nil
+}
+
+func (service Service) Stop() error {
+	return service.withLifecycleLock(func() error {
+		service, err := service.withInstalledStateDir()
+		if err != nil {
+			return err
+		}
+		if err := service.ensureNoActiveJobsFor("stop"); err != nil {
+			return err
+		}
+		return service.uninstall()
+	})
+}
+
+func (service Service) withLifecycleLock(run func() error) error {
+	if err := os.MkdirAll(filepath.Dir(service.LockPath), 0o700); err != nil {
+		return err
+	}
+	lock, err := os.OpenFile(service.LockPath, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	return run()
+}
+
+func (service Service) withInstalledStateDir() (Service, error) {
+	plist, err := os.OpenFile(service.PlistPath, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if os.IsNotExist(err) {
+		return service, nil
+	}
+	if err != nil {
+		return Service{}, err
+	}
+	defer plist.Close()
+	stateDir, err := plistStateDir(plist)
+	if err != nil {
+		return Service{}, err
+	}
+	stateDir, err = ValidateStateDir(service.ConfigPath, stateDir)
+	if err != nil {
+		return Service{}, err
+	}
+	service.StateDir = stateDir
+	return service, nil
+}
+
+func plistStateDir(reader io.Reader) (string, error) {
+	decoder := xml.NewDecoder(reader)
+	arguments := false
+	wantArguments := false
+	var values []string
+	for {
+		token, err := decoder.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", err
+		}
+		switch token := token.(type) {
+		case xml.StartElement:
+			switch token.Name.Local {
+			case "key":
+				var key string
+				if err := decoder.DecodeElement(&key, &token); err != nil {
+					return "", err
+				}
+				wantArguments = key == "ProgramArguments"
+			case "array":
+				arguments = wantArguments
+				wantArguments = false
+			case "string":
+				if arguments {
+					var value string
+					if err := decoder.DecodeElement(&value, &token); err != nil {
+						return "", err
+					}
+					values = append(values, value)
+				}
+			}
+		case xml.EndElement:
+			if token.Name.Local == "array" {
+				arguments = false
+			}
+		}
+	}
+	for index, value := range values {
+		if value == "--state-dir" && index+1 < len(values) {
+			return values[index+1], nil
+		}
+	}
+	return "", fmt.Errorf("service plist does not contain --state-dir")
 }
 
 func (service Service) plist() string {

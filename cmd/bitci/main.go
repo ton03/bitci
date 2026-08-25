@@ -24,7 +24,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("use version, validate, plan, submit, worker, serve, service, status, cancel, retry, logs, doctor, mcp, or stage-pr")
+		return fmt.Errorf("use version, validate, plan, submit, worker, serve, start, stop, service, status, cancel, retry, logs, doctor, mcp, or stage-pr")
 	}
 	command := args[0]
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
@@ -36,7 +36,7 @@ func run(args []string) error {
 	maxWorkers := flags.Int("max-workers", 1, "maximum running tasks")
 	interval := flags.Duration("interval", time.Second, "queue poll interval")
 	socketPath := flags.String("socket", "", "owner Unix socket path")
-	httpAddress := flags.String("http", "", "dashboard address (must be 127.0.0.1:PORT)")
+	httpAddress := flags.String("http", "", "loopback dashboard address")
 	allowRuns := flags.Bool("allow-runs", false, "enable MCP run-control tools")
 	jsonOutput := flags.Bool("json", false, "JSON output")
 	logLimit := flags.Int("tail", 80, "maximum log lines, capped at 80")
@@ -58,6 +58,12 @@ func run(args []string) error {
 	}
 	if command == "service" {
 		return runService(flags.Args(), *configPath, *stateDir, *maxWorkers, *httpAddress)
+	}
+	if command == "start" || command == "stop" {
+		if flags.NArg() != 0 {
+			return fmt.Errorf("%s takes no arguments", command)
+		}
+		return runService([]string{command}, *configPath, *stateDir, *maxWorkers, *httpAddress)
 	}
 	if command == "mcp" {
 		if flags.NArg() != 0 {
@@ -183,7 +189,34 @@ func run(args []string) error {
 
 func runService(args []string, configPath, stateDir string, maxWorkers int, httpAddress string) error {
 	if len(args) != 1 {
-		return fmt.Errorf("service needs install, status, or uninstall")
+		return fmt.Errorf("service needs install, start, stop, status, or uninstall")
+	}
+	if args[0] == "stop" {
+		service, err := bitci.NewServiceForStop(configPath, stateDir)
+		if err != nil {
+			return err
+		}
+		if err := service.Stop(); err != nil {
+			return err
+		}
+		fmt.Println("stopped", service.Label)
+		return nil
+	}
+	if args[0] == "start" {
+		service, err := bitci.NewServiceForStart(configPath, stateDir, maxWorkers, httpAddress)
+		if err != nil {
+			return err
+		}
+		started, err := service.Start()
+		if err != nil {
+			return err
+		}
+		if started {
+			fmt.Println("started", service.Label)
+		} else {
+			fmt.Println("already running", service.Label)
+		}
+		return nil
 	}
 	service, err := bitci.NewServiceWithHTTP(configPath, stateDir, maxWorkers, httpAddress)
 	if err != nil {
