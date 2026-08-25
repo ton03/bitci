@@ -66,6 +66,33 @@ bitci logs --tail 80 1
 `serve` owns the queue. It starts only submitted tasks. Use the macOS service
 below when this project needs an always-on controller.
 
+### Concurrent jobs
+
+Set `--max-workers` to the number of jobs the host can safely run:
+
+```sh
+bitci serve --max-workers 2
+```
+
+Recorded-SHA jobs use separate disposable worktrees, so independent unit and
+typecheck tasks can overlap. Declare only real shared services as resources:
+
+```json
+{
+  "resources": { "browser": 1, "supabase": 1 },
+  "tasks": {
+    "unit": { "run": ["go", "test", "./..."] },
+    "browser": {
+      "run": ["npm", "run", "test:browser"],
+      "resources": ["browser", "supabase"]
+    }
+  }
+}
+```
+
+Workers still use one SQLite connection for queue mutations. Jobs run in
+parallel; claims, leases, and cleanup stay serialized and transaction-safe.
+
 Open `http://127.0.0.1:8787` for the local, read-only dashboard. It refreshes
 every three seconds and shows job state, tested SHA, timing, resource leases,
 disk space, capped logs, and the average duration of passing jobs in seven days.

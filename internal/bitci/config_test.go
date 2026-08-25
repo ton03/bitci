@@ -583,6 +583,98 @@ func TestRecordedSHAJobsOverlapWithMultipleWorkers(t *testing.T) {
 	assertJobsPassed(t, controller)
 }
 
+func TestServeRunsRecordedSHAJobsConcurrently(t *testing.T) {
+	controller, events := recordedSHAConcurrentController(t, false)
+	defer controller.Close()
+
+	first, err := controller.Submit([]string{"first"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstSHA := first[0].Ref
+	if err := os.WriteFile(filepath.Join(controller.checkoutRoot, "second-marker"), []byte("second\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, controller.checkoutRoot, "add", "second-marker")
+	git(t, controller.checkoutRoot, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "second")
+	second, err := controller.Submit([]string{"second"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second[0].Ref == firstSHA {
+		t.Fatalf("concurrent jobs did not record separate SHAs: %s", firstSHA)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	serveErr := make(chan error, 1)
+	socketPath := filepath.Join(os.TempDir(), fmt.Sprintf("bitci-test-%d.sock", time.Now().UnixNano()))
+	t.Cleanup(func() { _ = os.Remove(socketPath) })
+	go func() {
+		serveErr <- controller.Serve(ctx, 2, 10*time.Millisecond, socketPath)
+	}()
+	defer func() {
+		cancel()
+		select {
+		case err := <-serveErr:
+			if err != nil {
+				t.Errorf("serve = %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("serve did not stop")
+		}
+	}()
+
+	awaitFile(t, filepath.Join(events, "first.started"))
+	awaitFile(t, filepath.Join(events, "second.started"))
+	jobs, err := controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 2 {
+		t.Fatalf("job count = %d, want 2", len(jobs))
+	}
+	paths := []string{
+		filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", first[0].ID)),
+		filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", second[0].ID)),
+	}
+	if paths[0] == paths[1] {
+		t.Fatalf("concurrent jobs share worktree path %q", paths[0])
+	}
+	for _, job := range jobs {
+		if job.State != "running" || job.TestedSHA == "" || job.TestedSHA != job.Ref || job.LogPath == "" {
+			t.Fatalf("running job snapshot = %#v", job)
+		}
+		if _, err := os.Stat(filepath.Join(controller.stateDir, "worktrees", fmt.Sprintf("job-%d", job.ID))); err != nil {
+			t.Fatalf("job %d worktree = %v", job.ID, err)
+		}
+	}
+
+	if err := os.WriteFile(filepath.Join(events, "release"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		jobs, err = controller.Jobs()
+		if err != nil {
+			t.Fatal(err)
+		}
+		passed := len(jobs) == 2
+		for _, job := range jobs {
+			passed = passed && job.State == "passed"
+		}
+		if passed {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	assertJobsPassed(t, controller)
+	for _, path := range paths {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("finished job worktree %s = %v", path, err)
+		}
+	}
+}
+
 func TestRecordedSHAJobsWithSameResourceSerialize(t *testing.T) {
 	controller, events := recordedSHAConcurrentController(t, true)
 	defer controller.Close()
