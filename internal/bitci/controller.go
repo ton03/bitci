@@ -1307,6 +1307,10 @@ func (controller *Controller) recoverJobs(jobs []Job, skipChanged bool) (int, er
 		if !isCheckoutSHA(job.Ref) {
 			continue
 		}
+		if err := controller.terminateJobProcessGroup(job.ID); err != nil {
+			failures = append(failures, err)
+			continue
+		}
 		if err := controller.removeJobWorktree(job.ID, job.checkoutRoot); err != nil {
 			failures = append(failures, err)
 			continue

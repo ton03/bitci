@@ -1007,6 +1007,61 @@ func TestRecoverOrphanedReleasesLeaseAndCancelsBatch(t *testing.T) {
 	}
 }
 
+func TestRecoverOrphanedStopsRecordedProcessGroup(t *testing.T) {
+	checkout := t.TempDir()
+	configPath := filepath.Join(checkout, "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	git(t, checkout, "init", "-q")
+	git(t, checkout, "add", "bitci.json")
+	git(t, checkout, "-c", "user.name=BitCI", "-c", "user.email=bitci@example.test", "commit", "-qm", "initial")
+	stateDir := filepath.Join(t.TempDir(), "state")
+	controller, err := Open(configPath, stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controller.Close()
+	jobs, err := controller.Submit([]string{"unit"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, claimed, err := controller.claim(1)
+	if err != nil || !claimed {
+		t.Fatalf("claim = %v, %v", claimed, err)
+	}
+	if _, _, err := controller.jobCheckout(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("sleep", "30")
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
+		_ = command.Wait()
+	})
+	processPath := filepath.Join(stateDir, "worktrees", fmt.Sprintf("job-%d", job.ID), "bitci-process-group")
+	if err := os.WriteFile(processPath, []byte(strconv.Itoa(command.Process.Pid)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-orphanRecoveryGrace - time.Second).UTC().Format(time.RFC3339)
+	if _, err := controller.db.Exec("UPDATE jobs SET worker_pid = ?, started_at = ? WHERE id = ?", 999999999, old, jobs[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := controller.RecoverOrphaned()
+	if err != nil || recovered != 1 {
+		t.Fatalf("recover orphaned = %d, %v", recovered, err)
+	}
+	if err := command.Wait(); err == nil {
+		t.Fatal("recorded orphan process group survived recovery")
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "worktrees", fmt.Sprintf("job-%d", job.ID))); !os.IsNotExist(err) {
+		t.Fatalf("orphan worktree remains: %v", err)
+	}
+}
+
 func TestRecoverOrphanedWithoutTaskProcess(t *testing.T) {
 	configPath := writeConfig(t, `{
 		"version":1,
