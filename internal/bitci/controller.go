@@ -24,7 +24,8 @@ import (
 	"syscall"
 	"time"
 
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 type Controller struct {
@@ -1148,6 +1149,9 @@ func (controller *Controller) serveRecovery(ctx context.Context, interval time.D
 			return
 		case <-ticker.C:
 			if _, err := controller.RecoverOrphaned(); err != nil {
+				if isSQLiteBusy(err) {
+					continue
+				}
 				errors <- err
 				return
 			}
@@ -1447,10 +1451,12 @@ func (controller *Controller) serveWorker(ctx context.Context, maxWorkers int, i
 	for {
 		ran, err := controller.runOnce(ctx, maxWorkers)
 		if err != nil {
-			errors <- err
-			return
+			if ran || !isSQLiteBusy(err) {
+				errors <- err
+				return
+			}
 		}
-		if ran {
+		if ran && err == nil {
 			continue
 		}
 		select {
@@ -1459,6 +1465,11 @@ func (controller *Controller) serveWorker(ctx context.Context, maxWorkers int, i
 		case <-time.After(interval):
 		}
 	}
+}
+
+func isSQLiteBusy(err error) bool {
+	var sqliteError *sqlite.Error
+	return errors.As(err, &sqliteError) && sqliteError.Code()&0xff == sqlite3.SQLITE_BUSY
 }
 
 func (controller *Controller) RecoverInterrupted() error {
