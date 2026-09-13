@@ -729,6 +729,87 @@ func TestServeRunsRecordedSHAJobsConcurrently(t *testing.T) {
 	}
 }
 
+func TestServeSurvivesSQLiteBusyDuringStatus(t *testing.T) {
+	controller, events := recordedSHAConcurrentController(t, true)
+	defer controller.Close()
+	if _, err := controller.db.Exec("PRAGMA busy_timeout = 10"); err != nil {
+		t.Fatal(err)
+	}
+	first, err := controller.Submit([]string{"first"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	socketPath := filepath.Join(os.TempDir(), fmt.Sprintf("bitci-busy-%d.sock", time.Now().UnixNano()))
+	t.Cleanup(func() { _ = os.Remove(socketPath) })
+	ctx, cancel := context.WithCancel(context.Background())
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- controller.Serve(ctx, 2, 10*time.Millisecond, socketPath) }()
+	defer func() {
+		_ = os.WriteFile(filepath.Join(events, "release"), nil, 0o600)
+		cancel()
+		select {
+		case err := <-serveErr:
+			if err != nil {
+				t.Errorf("serve = %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("serve did not stop")
+		}
+	}()
+	awaitFile(t, filepath.Join(events, "first.started"))
+	second, err := controller.Submit([]string{"second"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	blocker, err := sql.Open("sqlite", filepath.Join(controller.stateDir, "bitci.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Close()
+	connection, err := blocker.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	if _, err := connection.ExecContext(context.Background(), "BEGIN EXCLUSIVE"); err != nil {
+		t.Fatal(err)
+	}
+	var jobs []Job
+	if err := Call(socketPath, "status", struct{}{}, &jobs); err == nil || !strings.Contains(err.Error(), "SQLITE_BUSY") {
+		t.Fatalf("status during SQLite lock = %v, want SQLITE_BUSY", err)
+	}
+	select {
+	case err := <-serveErr:
+		t.Fatalf("serve stopped after transient SQLite lock: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if _, err := connection.ExecContext(context.Background(), "ROLLBACK"); err != nil {
+		t.Fatal(err)
+	}
+
+	jobs, err = controller.Jobs()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 2 || jobs[0].ID != first[0].ID || jobs[0].State != "running" || jobs[1].ID != second[0].ID || jobs[1].State != "queued" {
+		t.Fatalf("jobs after transient SQLite lock = %#v", jobs)
+	}
+	if err := os.WriteFile(filepath.Join(events, "release"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	awaitFile(t, filepath.Join(events, "second.started"))
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		jobs, err = controller.Jobs()
+		if err == nil && len(jobs) == 2 && jobs[0].State == "passed" && jobs[1].State == "passed" {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("jobs did not finish after SQLite lock cleared: %#v, %v", jobs, err)
+}
+
 func TestServeRunsThreeRecordedSHAJobsConcurrently(t *testing.T) {
 	controller, events := recordedSHAConcurrentController(t, false)
 	defer controller.Close()
