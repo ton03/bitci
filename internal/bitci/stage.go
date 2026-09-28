@@ -72,6 +72,36 @@ func (controller *Controller) StageMain(ctx context.Context) (Stage, error) {
 	return Stage{Ref: "main", SHA: sha}, nil
 }
 
+// StageBranch pins a same-repository origin branch for CI without requiring a
+// pull request. The remote SHA is read first and checked again after fetch so
+// a branch update during staging cannot change the submitted candidate.
+func (controller *Controller) StageBranch(ctx context.Context, branch string) (Stage, error) {
+	if branch == "" || strings.TrimSpace(branch) != branch || strings.HasPrefix(branch, "refs/") {
+		return Stage{}, fmt.Errorf("branch must be a short remote branch name")
+	}
+	sourceRef := "refs/heads/" + branch
+	if _, err := controller.git(ctx, "check-ref-format", sourceRef); err != nil {
+		return Stage{}, fmt.Errorf("invalid remote branch name")
+	}
+	repository, err := controller.githubRepository()
+	if err != nil {
+		return Stage{}, err
+	}
+	output, err := controller.git(ctx, "ls-remote", "--exit-code", "--refs", "origin", sourceRef)
+	if err != nil {
+		return Stage{}, fmt.Errorf("read remote branch: %w", err)
+	}
+	fields := strings.Fields(strings.TrimSpace(output))
+	if len(fields) != 2 || fields[1] != sourceRef || !isCheckoutSHA(fields[0]) {
+		return Stage{}, fmt.Errorf("remote branch did not resolve to one commit")
+	}
+	sha := strings.ToLower(fields[0])
+	if _, err := controller.stageTrustedRef(ctx, 0, sourceRef, "refs/bitci/staged/branch", sha, "branch ref", repository); err != nil {
+		return Stage{}, err
+	}
+	return Stage{Ref: branch, SHA: sha}, nil
+}
+
 func (controller *Controller) stageTrustedRef(ctx context.Context, pullRequest int, sourceRef, stageRef, expectedSHA, sourceName, expectedRepository string) (sha string, returnErr error) {
 	release, err := controller.acquireStageLock(ctx)
 	if err != nil {

@@ -252,6 +252,17 @@ bitci stage-main --config /srv/project-ci/bitci.json --state-dir /var/lib/bitci/
 bitci submit --config /srv/project-ci/bitci.json --state-dir /var/lib/bitci/project --ref <stage.SHA> unit
 ```
 
+For direct-main workflows that gate a pushed candidate before merging, `stage-branch`
+pins a branch from the configured same-repository `origin`. It rejects dirty
+checkouts and queued or running jobs, verifies the fetched SHA against the exact
+remote branch SHA, and records that trusted SHA for submission. It does not need
+a GitHub token or a pull request.
+
+```sh
+bitci stage-branch --config /srv/project-ci/bitci.json --state-dir /var/lib/bitci/project codex/example
+bitci submit --config /srv/project-ci/bitci.json --state-dir /var/lib/bitci/project --ref <stage.SHA> unit
+```
+
 ## Examples and releases
 
 Copy an example for a [Go backend](examples/go-backend.bitci.json),

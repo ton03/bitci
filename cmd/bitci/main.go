@@ -24,7 +24,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("use version, validate, plan, submit, worker, serve, start, stop, service, status, cancel, retry, recover, logs, doctor, mcp, stage-pr, or stage-main")
+		return fmt.Errorf("use version, validate, plan, submit, worker, serve, start, stop, service, status, cancel, retry, recover, logs, doctor, mcp, stage-pr, stage-branch, or stage-main")
 	}
 	command := args[0]
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
@@ -116,6 +116,15 @@ func run(args []string) error {
 			return fmt.Errorf("stage-main takes no arguments")
 		}
 		stage, err := controller.StageMain(context.Background())
+		if err != nil {
+			return err
+		}
+		return printValue(stage, *jsonOutput)
+	case "stage-branch":
+		if flags.NArg() != 1 {
+			return fmt.Errorf("stage-branch needs one remote branch name")
+		}
+		stage, err := controller.StageBranch(context.Background(), flags.Arg(0))
 		if err != nil {
 			return err
 		}

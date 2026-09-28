@@ -45,6 +45,20 @@ func TestStageMainCommandRejectsArguments(t *testing.T) {
 	}
 }
 
+func TestStageBranchCommandRequiresOneBranchName(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stateDir := filepath.Join(t.TempDir(), "state")
+	for _, args := range [][]string{{}, {"feature", "extra"}} {
+		command := append([]string{"stage-branch", "--config", configPath, "--state-dir", stateDir}, args...)
+		if err := run(command); err == nil || err.Error() != "stage-branch needs one remote branch name" {
+			t.Fatalf("stage-branch args %q error = %v", args, err)
+		}
+	}
+}
+
 func TestExternalConfigAndStateDir(t *testing.T) {
 	checkout := t.TempDir()
 	configPath := filepath.Join(checkout, "bitci.json")
