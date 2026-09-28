@@ -34,6 +34,17 @@ func TestVersionCommand(t *testing.T) {
 	}
 }
 
+func TestStageMainCommandRejectsArguments(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "bitci.json")
+	if err := os.WriteFile(configPath, []byte(`{"version":1,"tasks":{"unit":{"run":["true"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := run([]string{"stage-main", "--config", configPath, "--state-dir", filepath.Join(t.TempDir(), "state"), "unexpected"})
+	if err == nil || err.Error() != "stage-main takes no arguments" {
+		t.Fatalf("stage-main argument error = %v", err)
+	}
+}
+
 func TestExternalConfigAndStateDir(t *testing.T) {
 	checkout := t.TempDir()
 	configPath := filepath.Join(checkout, "bitci.json")

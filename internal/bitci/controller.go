@@ -275,11 +275,24 @@ func (controller *Controller) migrate() error {
 		CREATE TABLE IF NOT EXISTS staged_checkouts (
 			id INTEGER PRIMARY KEY CHECK (id = 1),
 			pull_request INTEGER NOT NULL,
+			source_ref TEXT NOT NULL DEFAULT '',
 			sha TEXT NOT NULL,
 			staged_at TEXT NOT NULL
 		);
 	`)
 	if err != nil {
+		return err
+	}
+	if err := controller.addStagedCheckoutColumn("source_ref", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
+	if _, err := controller.db.Exec(`
+		UPDATE staged_checkouts
+		SET source_ref = CASE WHEN pull_request > 0
+			THEN 'refs/pull/' || pull_request || '/head'
+			ELSE 'refs/heads/main' END
+		WHERE source_ref = ''
+	`); err != nil {
 		return err
 	}
 	if err := controller.addJobColumn("tested_sha", "TEXT"); err != nil {
@@ -357,6 +370,20 @@ func (controller *Controller) addBatchRefColumn(name, definition string) error {
 	}
 	if _, err := controller.db.Exec("ALTER TABLE batch_refs ADD COLUMN " + name + " " + definition); err != nil {
 		if _, checkErr := controller.db.Exec("SELECT " + name + " FROM batch_refs LIMIT 0"); checkErr != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (controller *Controller) addStagedCheckoutColumn(name, definition string) error {
+	if _, err := controller.db.Exec("SELECT " + name + " FROM staged_checkouts LIMIT 0"); err == nil {
+		return nil
+	} else if !strings.Contains(err.Error(), "no such column: "+name) {
+		return err
+	}
+	if _, err := controller.db.Exec("ALTER TABLE staged_checkouts ADD COLUMN " + name + " " + definition); err != nil {
+		if _, checkErr := controller.db.Exec("SELECT " + name + " FROM staged_checkouts LIMIT 0"); checkErr != nil {
 			return err
 		}
 	}

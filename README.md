@@ -242,6 +242,16 @@ bitci stage-pr --config /srv/project-ci/bitci.json --state-dir /var/lib/bitci/pr
 bitci submit --config /srv/project-ci/bitci.json --state-dir /var/lib/bitci/project --ref <stage.SHA> unit
 ```
 
+For direct-main CI, `stage-main` fetches only `origin/main`, rejects dirty
+checkouts and queued or running jobs, cleans only the configured generated
+`.next` directory, verifies the fetched and checked-out SHA, then records that
+trusted SHA for submission. It does not need a GitHub token.
+
+```sh
+bitci stage-main --config /srv/project-ci/bitci.json --state-dir /var/lib/bitci/project
+bitci submit --config /srv/project-ci/bitci.json --state-dir /var/lib/bitci/project --ref <stage.SHA> unit
+```
+
 ## Examples and releases
 
 Copy an example for a [Go backend](examples/go-backend.bitci.json),

@@ -15,7 +15,8 @@ import (
 )
 
 type Stage struct {
-	PR  int    `json:"pr"`
+	PR  int    `json:"pr,omitempty"`
+	Ref string `json:"ref,omitempty"`
 	SHA string `json:"sha"`
 }
 
@@ -42,17 +43,54 @@ func (controller *Controller) StagePR(ctx context.Context, number int, token str
 	if token == "" {
 		return Stage{}, fmt.Errorf("stage-pr requires BITCI_GITHUB_TOKEN")
 	}
+	repository, err := controller.githubRepository()
+	if err != nil {
+		return Stage{}, err
+	}
+	pull, err := controller.githubPull(ctx, repository, number, token)
+	if err != nil {
+		return Stage{}, err
+	}
+	if pull.Head.Repo.FullName != repository || pull.Base.Repo.FullName != repository || !isCheckoutSHA(pull.Head.SHA) {
+		return Stage{}, fmt.Errorf("pull request must have a verified same-repository head")
+	}
+	sourceRef := fmt.Sprintf("refs/pull/%d/head", number)
+	sha, err := controller.stageTrustedRef(ctx, number, sourceRef, fmt.Sprintf("refs/bitci/staged/%d", number), pull.Head.SHA, "pull request", repository)
+	if err != nil {
+		return Stage{}, err
+	}
+	return Stage{PR: number, SHA: sha}, nil
+}
+
+// StageMain fetches and verifies only origin/main before detaching the
+// dedicated checkout at that exact commit.
+func (controller *Controller) StageMain(ctx context.Context) (Stage, error) {
+	sha, err := controller.stageTrustedRef(ctx, 0, "refs/heads/main", "refs/bitci/staged/main", "", "main ref", "")
+	if err != nil {
+		return Stage{}, err
+	}
+	return Stage{Ref: "main", SHA: sha}, nil
+}
+
+func (controller *Controller) stageTrustedRef(ctx context.Context, pullRequest int, sourceRef, stageRef, expectedSHA, sourceName, expectedRepository string) (sha string, returnErr error) {
 	release, err := controller.acquireStageLock(ctx)
 	if err != nil {
-		return Stage{}, fmt.Errorf("lock checkout for staging: %w", err)
+		return "", fmt.Errorf("lock checkout for staging: %w", err)
 	}
 	defer release()
 	if err := controller.noActiveJobs(); err != nil {
-		return Stage{}, err
+		return "", err
+	}
+	repository, err := controller.githubRepository()
+	if err != nil {
+		return "", err
+	}
+	if expectedRepository != "" && repository != expectedRepository {
+		return "", fmt.Errorf("origin repository changed before staging")
 	}
 	originalSHA, err := controller.checkoutSHA()
 	if err != nil {
-		return Stage{}, fmt.Errorf("read current checkout SHA: %w", err)
+		return "", fmt.Errorf("read current checkout SHA: %w", err)
 	}
 	originalConfig := controller.configSnapshot()
 	targetCheckedOut := false
@@ -69,56 +107,45 @@ func (controller *Controller) StagePR(ctx context.Context, number int, token str
 		controller.configMu.Unlock()
 	}()
 	if err := controller.clearStagedCheckout(); err != nil {
-		return Stage{}, err
-	}
-	repository, err := controller.githubRepository()
-	if err != nil {
-		return Stage{}, err
-	}
-	pull, err := controller.githubPull(ctx, repository, number, token)
-	if err != nil {
-		return Stage{}, err
-	}
-	if pull.Head.Repo.FullName != repository || pull.Base.Repo.FullName != repository || !isCheckoutSHA(pull.Head.SHA) {
-		return Stage{}, fmt.Errorf("pull request must have a verified same-repository head")
+		return "", err
 	}
 	if err := controller.cleanGeneratedNext(ctx); err != nil {
-		return Stage{}, err
+		return "", err
 	}
 	if err := controller.cleanCheckout(ctx); err != nil {
-		return Stage{}, err
+		return "", err
 	}
-	stageRef := fmt.Sprintf("refs/bitci/staged/%d", number)
-	if _, err := controller.git(ctx, "fetch", "--no-tags", "origin", fmt.Sprintf("+refs/pull/%d/head:%s", number, stageRef)); err != nil {
-		return Stage{}, fmt.Errorf("fetch trusted pull request: %w", err)
+	if _, err := controller.git(ctx, "fetch", "--no-tags", "origin", fmt.Sprintf("+%s:%s", sourceRef, stageRef)); err != nil {
+		return "", fmt.Errorf("fetch trusted %s: %w", sourceName, err)
 	}
 	fetched, err := controller.git(ctx, "rev-parse", "--verify", stageRef+"^{commit}")
-	if err != nil || strings.TrimSpace(fetched) != pull.Head.SHA {
-		return Stage{}, fmt.Errorf("fetched pull request SHA does not match GitHub")
+	fetched = strings.ToLower(strings.TrimSpace(fetched))
+	if err != nil || !isCheckoutSHA(fetched) || expectedSHA != "" && !strings.EqualFold(fetched, expectedSHA) {
+		return "", fmt.Errorf("fetched %s SHA does not match its trusted source", sourceName)
 	}
-	if err := controller.protectStateFromTarget(ctx, pull.Head.SHA); err != nil {
-		return Stage{}, err
+	if err := controller.protectStateFromTarget(ctx, fetched); err != nil {
+		return "", err
 	}
-	if _, err := controller.git(ctx, "checkout", "--detach", pull.Head.SHA); err != nil {
-		return Stage{}, fmt.Errorf("checkout trusted pull request: %w", err)
+	if _, err := controller.git(ctx, "checkout", "--detach", fetched); err != nil {
+		return "", fmt.Errorf("checkout trusted %s: %w", sourceName, err)
 	}
 	targetCheckedOut = true
-	sha, err := controller.checkoutSHA()
-	if err != nil || sha != pull.Head.SHA {
-		return Stage{}, fmt.Errorf("checked out SHA does not match GitHub")
+	sha, err = controller.checkoutSHA()
+	if err != nil || !strings.EqualFold(sha, fetched) {
+		return "", fmt.Errorf("checked out SHA does not match trusted %s", sourceName)
 	}
 	stagedConfig, err := LoadConfig(controller.configPath)
 	if err != nil {
-		return Stage{}, fmt.Errorf("load staged BitCI configuration: %w", err)
+		return "", fmt.Errorf("load staged BitCI configuration: %w", err)
 	}
 	controller.configMu.Lock()
 	controller.config = stagedConfig
 	controller.configMu.Unlock()
-	if err := controller.recordStagedCheckout(number, sha); err != nil {
-		return Stage{}, err
+	if err := controller.recordStagedCheckout(sourceRef, pullRequest, sha); err != nil {
+		return "", err
 	}
 	staged = true
-	return Stage{PR: number, SHA: sha}, nil
+	return sha, nil
 }
 
 func (controller *Controller) stagedCheckoutSHA() (string, error) {
@@ -143,11 +170,11 @@ func (controller *Controller) clearStagedCheckout() error {
 	return nil
 }
 
-func (controller *Controller) recordStagedCheckout(number int, sha string) error {
-	if !isCheckoutSHA(sha) {
+func (controller *Controller) recordStagedCheckout(sourceRef string, number int, sha string) error {
+	if !isCheckoutSHA(sha) || sourceRef == "" {
 		return fmt.Errorf("cannot record invalid staged checkout SHA")
 	}
-	if _, err := controller.db.Exec("INSERT INTO staged_checkouts(id, pull_request, sha, staged_at) VALUES (1, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET pull_request = excluded.pull_request, sha = excluded.sha, staged_at = excluded.staged_at", number, strings.ToLower(sha), timestamp()); err != nil {
+	if _, err := controller.db.Exec("INSERT INTO staged_checkouts(id, pull_request, source_ref, sha, staged_at) VALUES (1, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET pull_request = excluded.pull_request, source_ref = excluded.source_ref, sha = excluded.sha, staged_at = excluded.staged_at", number, sourceRef, strings.ToLower(sha), timestamp()); err != nil {
 		return fmt.Errorf("record staged checkout: %w", err)
 	}
 	return nil
@@ -166,7 +193,7 @@ func (controller *Controller) protectStateFromTarget(ctx context.Context, sha st
 		return err
 	}
 	if conflict {
-		return fmt.Errorf("staged pull request must not contain tracked BitCI state files")
+		return fmt.Errorf("staged checkout must not contain tracked BitCI state files")
 	}
 	return nil
 }

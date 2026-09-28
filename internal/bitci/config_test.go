@@ -4451,6 +4451,10 @@ func TestStagePRChecksTrustAndCleansNext(t *testing.T) {
 	if staged, err := controller.stagedCheckoutSHA(); err != nil || staged != prSHA {
 		t.Fatalf("staged checkout record = %q, %v", staged, err)
 	}
+	var sourceRef string
+	if err := controller.db.QueryRow("SELECT source_ref FROM staged_checkouts WHERE id = 1").Scan(&sourceRef); err != nil || sourceRef != "refs/pull/7/head" {
+		t.Fatalf("staged source ref = %q, %v", sourceRef, err)
+	}
 	jobs, err := controller.Submit([]string{"unit"}, "")
 	if err != nil || len(jobs) != 1 || jobs[0].Ref != prSHA || jobs[0].SubmittedRef != prSHA {
 		t.Fatalf("submit staged SHA = %#v, %v", jobs, err)

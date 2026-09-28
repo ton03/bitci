@@ -24,7 +24,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("use version, validate, plan, submit, worker, serve, start, stop, service, status, cancel, retry, recover, logs, doctor, mcp, or stage-pr")
+		return fmt.Errorf("use version, validate, plan, submit, worker, serve, start, stop, service, status, cancel, retry, recover, logs, doctor, mcp, stage-pr, or stage-main")
 	}
 	command := args[0]
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
@@ -107,6 +107,15 @@ func run(args []string) error {
 			return err
 		}
 		stage, err := controller.StagePR(context.Background(), number, os.Getenv("BITCI_GITHUB_TOKEN"))
+		if err != nil {
+			return err
+		}
+		return printValue(stage, *jsonOutput)
+	case "stage-main":
+		if flags.NArg() != 0 {
+			return fmt.Errorf("stage-main takes no arguments")
+		}
+		stage, err := controller.StageMain(context.Background())
 		if err != nil {
 			return err
 		}
